@@ -21,6 +21,14 @@ APP_VERSION = "0.4.1"
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
+@app.get("/")  # optional, avoids 404 on "/"
+def root():
+    return {"ok": True}
+
 # --- CORS (adjust as needed for lovable.dev) ---
 app.add_middleware(
     CORSMiddleware,
