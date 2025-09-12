@@ -1,0 +1,5 @@
+﻿fastapi==0.111.0
+uvicorn[standard]==0.30.0
+jsonschema==4.22.0
+openai>=1.107.0
+python-dotenv==1.0.1
