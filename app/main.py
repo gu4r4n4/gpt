@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 try:
-    # Supabase client (optional, but expected in prod with proper RLS)
+    # Supabase client (optional, expected in prod with RLS configured)
     from supabase import create_client, Client  # type: ignore
 except Exception:  # pragma: no cover
     create_client = None  # type: ignore
@@ -25,7 +25,7 @@ except Exception:  # pragma: no cover
 from app.gpt_extractor import extract_offer_from_pdf_bytes, ExtractionError
 
 APP_NAME = "GPT Offer Extractor"
-APP_VERSION = "0.7.0"
+APP_VERSION = "0.8.0"
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
@@ -56,11 +56,11 @@ if _SUPABASE_URL and _SUPABASE_KEY and create_client is not None:
         _supabase = None
 
 # -------------------------------
-# In-memory helpers (okay on single dyno)
+# In-memory helpers (single process)
 # -------------------------------
-# job_id -> { total, done, errors, docs: [filenames...] }
+# job_id -> { total, done, errors, docs: [doc_ids...] }
 _jobs: Dict[str, Dict[str, Any]] = {}
-# filename -> payload (dev fallback if no Supabase)
+# doc_id -> payload (dev fallback if no Supabase)
 _LAST_RESULTS: Dict[str, Dict[str, Any]] = {}
 # token -> stored share row (dev fallback if no Supabase)
 _SHARES_FALLBACK: Dict[str, Dict[str, Any]] = {}
@@ -101,8 +101,9 @@ def _rows_for_offers_table(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Convert one normalized extractor payload (with .programs list)
     into rows for public.offers (one row per program).
+    Uses payload['document_id'] as the 'filename' (unique per batch/job).
     """
-    filename = payload.get("document_id") or payload.get("source_file") or "uploaded.pdf"
+    doc_id = payload.get("document_id") or payload.get("source_file") or "uploaded.pdf"
     inquiry_id = payload.get("inquiry_id")  # may be None
     company_name = payload.get("company_name")
     employee_count = payload.get("employee_count")
@@ -114,13 +115,13 @@ def _rows_for_offers_table(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             "company_hint": payload.get("insurer_hint") or None,
             "program_code": prog.get("program_code"),
             "source": "api",
-            "filename": filename,
-            "inquiry_id": inquiry_id,  # nullable
+            "filename": doc_id,           # <— UNIQUE, no collisions with old runs
+            "inquiry_id": inquiry_id,     # nullable
             "base_sum_eur": prog.get("base_sum_eur"),
             "premium_eur": prog.get("premium_eur"),
             "payment_method": prog.get("payment_method"),
             "features": prog.get("features") or {},
-            "raw_json": payload,  # provenance/debug
+            "raw_json": payload,          # provenance/debug
             "status": "parsed",
             "error": None,
             "company_name": company_name,
@@ -133,7 +134,7 @@ def _rows_for_offers_table(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             "company_hint": payload.get("insurer_hint"),
             "program_code": None,
             "source": "api",
-            "filename": filename,
+            "filename": doc_id,
             "inquiry_id": inquiry_id,
             "base_sum_eur": None,
             "premium_eur": None,
@@ -153,8 +154,8 @@ def save_to_supabase(payload: Dict[str, Any]) -> None:
     No-op if Supabase is not configured (stores to in-memory fallback).
     """
     if not _supabase:
-        fname = payload.get("document_id") or payload.get("source_file") or "uploaded.pdf"
-        _LAST_RESULTS[fname] = payload
+        doc_id = payload.get("document_id") or payload.get("source_file") or "uploaded.pdf"
+        _LAST_RESULTS[doc_id] = payload
         return
     try:
         rows = _rows_for_offers_table(payload)
@@ -187,9 +188,10 @@ def _aggregate_offers_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         grouped[source_file]["programs"].append(program)
     return list(grouped.values())
 
-def _offers_by_filenames(doc_ids: List[str]) -> List[Dict[str, Any]]:
+def _offers_by_document_ids(doc_ids: List[str]) -> List[Dict[str, Any]]:
     """
-    Resolve offers by filename list and return FE-friendly grouped shape.
+    Resolve offers by exact document_id list and return FE-friendly grouped shape.
+    We store document_id into 'filename' column, so we filter by filename IN ...
     """
     if not doc_ids:
         return []
@@ -206,7 +208,6 @@ def _offers_by_filenames(doc_ids: List[str]) -> List[Dict[str, Any]]:
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Supabase error: {e}")
     else:
-        # dev fallback
         rows = []
         for p in _LAST_RESULTS.values():
             for r in _rows_for_offers_table(p):
@@ -228,18 +229,22 @@ async def extract_pdf(
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=415, detail="PDF required")
 
+    # For single-file, generate a unique doc_id too (no collisions with prior runs)
+    batch_id = str(uuid.uuid4())
+    doc_id = f"{batch_id}::1::{file.filename or 'uploaded.pdf'}"
+
     data = await file.read()
     t0 = time.monotonic()
     try:
-        payload = extract_offer_from_pdf_bytes(data, document_id=file.filename or "uploaded.pdf")
+        payload = extract_offer_from_pdf_bytes(data, document_id=doc_id)
         _inject_meta(payload, insurer=insurer, company=company, insured_count=insured_count, inquiry_id=inquiry_id)
         save_to_supabase(payload)
 
-        fname = payload.get("document_id") or file.filename or "uploaded.pdf"
-        _LAST_RESULTS[fname] = payload  # dev fallback
+        _LAST_RESULTS[doc_id] = payload  # dev fallback
 
         payload["_timings"] = {"total_s": round(time.monotonic() - t0, 3)}
-        return JSONResponse(payload)
+        # Return doc_id so FE can read via /offers/by-documents if it wants
+        return JSONResponse({"document_id": doc_id, "result": payload})
     except ExtractionError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
@@ -253,29 +258,33 @@ async def extract_multiple(
     insured_count: int = Form(0),
     inquiry_id: str = Form(""),
 ):
-    """Sequential (blocking) version."""
+    """Sequential (blocking) version — also uses unique doc_ids."""
     if not files:
         raise HTTPException(status_code=400, detail="No files uploaded")
 
+    batch_id = str(uuid.uuid4())
     results: List[Dict[str, Any]] = []
-    for f in files:
+    doc_ids: List[str] = []
+
+    for idx, f in enumerate(files, start=1):
         if not f.filename.lower().endswith(".pdf"):
             results.append({"document_id": f.filename, "error": "Unsupported file type (only PDF)"})
             continue
         try:
+            doc_id = f"{batch_id}::{idx}::{f.filename or 'uploaded.pdf'}"
             data = await f.read()
-            payload = extract_offer_from_pdf_bytes(data, document_id=f.filename or "uploaded.pdf")
+            payload = extract_offer_from_pdf_bytes(data, document_id=doc_id)
             _inject_meta(payload, insurer=insurer, company=company, insured_count=insured_count, inquiry_id=inquiry_id)
             save_to_supabase(payload)
             results.append(payload)
-
-            fname = payload.get("document_id") or f.filename or "uploaded.pdf"
-            _LAST_RESULTS[fname] = payload
+            doc_ids.append(doc_id)
+            _LAST_RESULTS[doc_id] = payload
         except ExtractionError as e:
             results.append({"document_id": f.filename, "error": str(e)})
         except Exception as e:
             results.append({"document_id": f.filename, "error": f"Unexpected error: {e}"})
-    return JSONResponse(results)
+    # Return both the legacy results and the doc_ids (so FE can switch to doc-based polling)
+    return JSONResponse({"documents": doc_ids, "results": results})
 
 @app.post("/extract/multiple-async", status_code=202)
 async def extract_multiple_async(
@@ -287,38 +296,41 @@ async def extract_multiple_async(
     inquiry_id: str = Form(""),
 ):
     """
-    Asynchronous version: returns a job_id immediately.
-    FE can poll:
-      - GET /jobs/{job_id} for progress, and
-      - GET /offers/by-job/{job_id} or POST /offers/by-documents to read results as they arrive.
+    Asynchronous version: returns a job_id and a list of unique document_ids immediately.
+    FE should poll:
+      - GET /jobs/{job_id} for progress (optional; may 404 if the process restarts), and
+      - POST /offers/by-documents with the returned document_ids to read results as they arrive.
     """
     if not files:
         raise HTTPException(status_code=400, detail="No files uploaded")
 
     job_id = str(uuid.uuid4())
-    # We do NOT require inquiry_id here; job tracks filenames
     _jobs[job_id] = {"total": len(files), "done": 0, "errors": [], "docs": []}
 
-    # Read file bytes now and queue background tasks
-    docs: List[str] = []
-    for f in files:
+    # Pre-assign unique doc_ids and enqueue background tasks
+    doc_ids: List[str] = []
+    for idx, f in enumerate(files, start=1):
         filename = f.filename or "uploaded.pdf"
-        docs.append(filename)
+        doc_id = f"{job_id}::{idx}::{filename}"
+        doc_ids.append(doc_id)
         data = await f.read()
         background_tasks.add_task(
             _process_pdf_bytes,
-            data, filename, insurer, company,
-            int(insured_count) if insured_count else 0,
-            job_id,
-            str(inquiry_id or ""),  # optional, may be non-numeric or empty
+            data=data,
+            doc_id=doc_id,
+            insurer=insurer,
+            company=company,
+            insured_count=int(insured_count) if insured_count else 0,
+            job_id=job_id,
+            inquiry_id_raw=str(inquiry_id or ""),  # optional, may be empty
         )
-    _jobs[job_id]["docs"] = docs
 
-    return {"job_id": job_id, "accepted": len(files), "documents": docs}
+    _jobs[job_id]["docs"] = doc_ids
+    return {"job_id": job_id, "accepted": len(files), "documents": doc_ids}
 
 def _process_pdf_bytes(
     data: bytes,
-    filename: str,
+    doc_id: str,
     insurer: str,
     company: str,
     insured_count: int,
@@ -326,14 +338,14 @@ def _process_pdf_bytes(
     inquiry_id_raw: str,
 ):
     try:
-        payload = extract_offer_from_pdf_bytes(data, document_id=filename)
+        payload = extract_offer_from_pdf_bytes(data, document_id=doc_id)
         _inject_meta(payload, insurer=insurer, company=company, insured_count=insured_count, inquiry_id=inquiry_id_raw)
         save_to_supabase(payload)
-        _LAST_RESULTS[filename] = payload  # dev fallback
+        _LAST_RESULTS[doc_id] = payload  # dev fallback
     except Exception as e:
         rec = _jobs.get(job_id)
         if rec is not None:
-            rec["errors"].append({"document_id": filename, "error": str(e)})
+            rec["errors"].append({"document_id": doc_id, "error": str(e)})
     finally:
         rec = _jobs.get(job_id)
         if rec is not None:
@@ -343,18 +355,19 @@ def _process_pdf_bytes(
 def job_status(job_id: str):
     job = _jobs.get(job_id)
     if not job:
+        # On multi-worker or restarts this can be missing. FE should keep polling by documents.
         raise HTTPException(status_code=404, detail="job not found")
     return job
 
 # -------------------------------
-# Read offers (no inquiry_id required)
+# Read offers (document-id based)
 # -------------------------------
 class DocsBody(BaseModel):
     document_ids: List[str]
 
 @app.post("/offers/by-documents")
 def offers_by_documents(body: DocsBody):
-    return _offers_by_filenames(body.document_ids)
+    return _offers_by_document_ids(body.document_ids)
 
 @app.get("/offers/by-job/{job_id}")
 def offers_by_job(job_id: str):
@@ -362,9 +375,9 @@ def offers_by_job(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
     doc_ids = job.get("docs") or []
-    return _offers_by_filenames(doc_ids)
+    return _offers_by_document_ids(doc_ids)
 
-# (Kept for compatibility if you still use inquiry flows somewhere)
+# (Optional legacy; still available)
 @app.get("/offers/by-inquiry/{inquiry_id}")
 def offers_by_inquiry(inquiry_id: int):
     if _supabase:
@@ -394,7 +407,7 @@ class ShareCreateBody(BaseModel):
     """
     Create a token that represents either:
       A) a frozen snapshot ('results'), or
-      B) a dynamic view by filenames ('document_ids').
+      B) a dynamic view by document_ids ('document_ids').
     If both provided, snapshot takes precedence.
     """
     title: Optional[str] = None
@@ -485,7 +498,7 @@ def get_share_token_only(token: str):
         resp["offers"] = payload["results"]
     elif mode == "by-documents":
         doc_ids = payload.get("document_ids") or []
-        resp["offers"] = _offers_by_filenames(doc_ids)
+        resp["offers"] = _offers_by_document_ids(doc_ids)
     else:
         resp["offers"] = []
 
