@@ -25,7 +25,7 @@ except Exception:  # pragma: no cover
 from app.gpt_extractor import extract_offer_from_pdf_bytes, ExtractionError
 
 APP_NAME = "GPT Offer Extractor"
-APP_VERSION = "0.8.0"
+APP_VERSION = "0.9.0"
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
@@ -107,21 +107,23 @@ def _rows_for_offers_table(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     inquiry_id = payload.get("inquiry_id")  # may be None
     company_name = payload.get("company_name")
     employee_count = payload.get("employee_count")
+    hint = payload.get("insurer_hint") or None
 
     rows: List[Dict[str, Any]] = []
     for prog in payload.get("programs", []) or []:
+        insurer_val = prog.get("insurer") or hint  # fallback to user-selected hint
         rows.append({
-            "insurer": prog.get("insurer"),
-            "company_hint": payload.get("insurer_hint") or None,
+            "insurer": insurer_val,
+            "company_hint": hint,             # store the dropdown hint
             "program_code": prog.get("program_code"),
             "source": "api",
-            "filename": doc_id,           # <— UNIQUE, no collisions with old runs
-            "inquiry_id": inquiry_id,     # nullable
+            "filename": doc_id,               # UNIQUE per run
+            "inquiry_id": inquiry_id,         # nullable
             "base_sum_eur": prog.get("base_sum_eur"),
             "premium_eur": prog.get("premium_eur"),
             "payment_method": prog.get("payment_method"),
             "features": prog.get("features") or {},
-            "raw_json": payload,          # provenance/debug
+            "raw_json": payload,              # provenance/debug
             "status": "parsed",
             "error": None,
             "company_name": company_name,
@@ -130,8 +132,8 @@ def _rows_for_offers_table(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     # If no programs, store an error row so the FE can show something
     if not rows:
         rows.append({
-            "insurer": payload.get("insurer_hint"),
-            "company_hint": payload.get("insurer_hint"),
+            "insurer": hint,
+            "company_hint": hint,
             "program_code": None,
             "source": "api",
             "filename": doc_id,
@@ -252,15 +254,32 @@ async def extract_pdf(
 
 @app.post("/extract/multiple")
 async def extract_multiple(
+    request: Request,
     files: List[UploadFile] = File(...),
-    insurer: str = Form(""),
+    insurers: Optional[List[str]] = Form(None),  # NEW: repeated field aligned to files
     company: str = Form(""),
     insured_count: int = Form(0),
     inquiry_id: str = Form(""),
+    insurer: str = Form(""),  # fallback single hint (if FE still sends only one)
 ):
-    """Sequential (blocking) version — also uses unique doc_ids."""
+    """Sequential (blocking) version — uses unique doc_ids and per-file insurer hints."""
     if not files:
         raise HTTPException(status_code=400, detail="No files uploaded")
+
+    # Fallback for legacy FE: read file_{i}_insurer if needed
+    if insurers is None:
+        form = await request.form()
+        insurers = []
+        for i, _ in enumerate(files):
+            insurers.append(form.get(f"file_{i}_insurer", ""))
+
+    # Normalize insurers list to files length (fallback to single 'insurer' if provided)
+    insurers = insurers or []
+    if len(insurers) < len(files):
+        pad_with = insurer or ""
+        insurers += [pad_with] * (len(files) - len(insurers))
+    elif len(insurers) > len(files):
+        insurers = insurers[:len(files)]
 
     batch_id = str(uuid.uuid4())
     results: List[Dict[str, Any]] = []
@@ -274,7 +293,7 @@ async def extract_multiple(
             doc_id = f"{batch_id}::{idx}::{f.filename or 'uploaded.pdf'}"
             data = await f.read()
             payload = extract_offer_from_pdf_bytes(data, document_id=doc_id)
-            _inject_meta(payload, insurer=insurer, company=company, insured_count=insured_count, inquiry_id=inquiry_id)
+            _inject_meta(payload, insurer=insurers[idx - 1] or "", company=company, insured_count=insured_count, inquiry_id=inquiry_id)
             save_to_supabase(payload)
             results.append(payload)
             doc_ids.append(doc_id)
@@ -288,12 +307,14 @@ async def extract_multiple(
 
 @app.post("/extract/multiple-async", status_code=202)
 async def extract_multiple_async(
+    request: Request,
     background_tasks: BackgroundTasks,
     files: List[UploadFile] = File(...),
-    insurer: str = Form(""),
+    insurers: Optional[List[str]] = Form(None),  # NEW: repeated field aligned to files
     company: str = Form(""),
     insured_count: int = Form(0),
     inquiry_id: str = Form(""),
+    insurer: str = Form(""),  # fallback single hint (if FE still sends only one)
 ):
     """
     Asynchronous version: returns a job_id and a list of unique document_ids immediately.
@@ -303,6 +324,21 @@ async def extract_multiple_async(
     """
     if not files:
         raise HTTPException(status_code=400, detail="No files uploaded")
+
+    # Fallback for legacy FE: read file_{i}_insurer if needed
+    if insurers is None:
+        form = await request.form()
+        insurers = []
+        for i, _ in enumerate(files):
+            insurers.append(form.get(f"file_{i}_insurer", ""))
+
+    # Normalize insurers list to files length (fallback to single 'insurer' if provided)
+    insurers = insurers or []
+    if len(insurers) < len(files):
+        pad_with = insurer or ""
+        insurers += [pad_with] * (len(files) - len(insurers))
+    elif len(insurers) > len(files):
+        insurers = insurers[:len(files)]
 
     job_id = str(uuid.uuid4())
     _jobs[job_id] = {"total": len(files), "done": 0, "errors": [], "docs": []}
@@ -318,7 +354,7 @@ async def extract_multiple_async(
             _process_pdf_bytes,
             data=data,
             doc_id=doc_id,
-            insurer=insurer,
+            insurer=insurers[idx - 1] or "",
             company=company,
             insured_count=int(insured_count) if insured_count else 0,
             job_id=job_id,
