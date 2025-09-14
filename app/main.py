@@ -25,7 +25,7 @@ except Exception:  # pragma: no cover
 from app.gpt_extractor import extract_offer_from_pdf_bytes, ExtractionError
 
 APP_NAME = "GPT Offer Extractor"
-APP_VERSION = "0.6.0"
+APP_VERSION = "0.7.0"
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
@@ -52,9 +52,9 @@ if _SUPABASE_URL and _SUPABASE_KEY and create_client is not None:
         _supabase = None
 
 # --- In-memory helpers (okay on single dyno/Render instance) ---
-_jobs: Dict[str, Dict[str, Any]] = {}              # job_id -> {inquiry_id,total,done,errors}
+_jobs: Dict[str, Dict[str, Any]] = {}              # job_id -> {total, done, errors}
 _LAST_RESULTS: Dict[str, Dict[str, Any]] = {}      # filename -> payload (dev fallback)
-_SHARES_FALLBACK: Dict[str, Dict[str, Any]] = {}   # token -> {inquiry_id,payload}
+_SHARES_FALLBACK: Dict[str, Dict[str, Any]] = {}   # token -> {payload, expires_at}
 
 # =========================
 # Health & root
@@ -79,7 +79,7 @@ def root():
 # Utilities
 # =========================
 def _inject_meta(payload: Dict[str, Any], *, insurer: str, company: str, insured_count: int, inquiry_id: str) -> None:
-    """Attach meta so we can save it later."""
+    """Attach meta so we can save it later (inquiry_id is optional and may be None)."""
     payload["insurer_hint"] = insurer or payload.get("insurer_hint") or "-"
     payload["company_name"] = company or payload.get("company_name") or "-"
     payload["employee_count"] = (
@@ -90,7 +90,7 @@ def _inject_meta(payload: Dict[str, Any], *, insurer: str, company: str, insured
 def _rows_for_offers_table(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Convert one normalized extractor payload (with .programs list) into
-    rows for public.offers, one row per program (schema you shared).
+    rows for public.offers, one row per program (your schema).
     """
     filename = payload.get("document_id") or payload.get("source_file") or "uploaded.pdf"
     inquiry_id = payload.get("inquiry_id")
@@ -101,11 +101,11 @@ def _rows_for_offers_table(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     for prog in payload.get("programs", []) or []:
         rows.append({
             "insurer": prog.get("insurer"),
-            "company_hint": payload.get("insurer_hint") or None,  # optional helper
+            "company_hint": payload.get("insurer_hint") or None,
             "program_code": prog.get("program_code"),
             "source": "api",
             "filename": filename,
-            "inquiry_id": inquiry_id,
+            "inquiry_id": inquiry_id,  # may be NULL; that's fine
             "base_sum_eur": prog.get("base_sum_eur"),
             "premium_eur": prog.get("premium_eur"),
             "payment_method": prog.get("payment_method"),
@@ -116,7 +116,6 @@ def _rows_for_offers_table(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             "company_name": company_name,
             "employee_count": employee_count,
         })
-    # If no programs (error case), still store one row with error/status
     if not rows:
         rows.append({
             "insurer": payload.get("insurer_hint"),
@@ -139,17 +138,15 @@ def _rows_for_offers_table(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 def save_to_supabase(payload: Dict[str, Any]) -> None:
     """
-    Insert one row per program into public.offers (your schema).
+    Insert one row per program into public.offers.
     No-op if Supabase is not configured.
     """
     if not _supabase:
-        # dev fallback, just keep in memory
         fname = payload.get("document_id") or payload.get("source_file") or "uploaded.pdf"
         _LAST_RESULTS[fname] = payload
         return
     try:
         rows = _rows_for_offers_table(payload)
-        # Supabase Python client accepts list of dicts
         _supabase.table(_OFFERS_TABLE).insert(rows).execute()
     except Exception as e:
         print(f"[warn] Supabase insert failed: {e}")
@@ -178,6 +175,33 @@ def _aggregate_offers_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             }
         grouped[source_file]["programs"].append(program)
     return list(grouped.values())
+
+def _offers_by_filenames(doc_ids: List[str]) -> List[Dict[str, Any]]:
+    """
+    Query offers by filename list and return FE-friendly grouped shape.
+    """
+    if not doc_ids:
+        return []
+    if _supabase:
+        try:
+            res = (
+                _supabase.table(_OFFERS_TABLE)
+                .select("*")
+                .in_("filename", doc_ids)
+                .order("created_at", desc=False)
+                .execute()
+            )
+            rows = res.data or []
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Supabase error: {e}")
+    else:
+        # dev fallback: group from memory
+        rows = []
+        for p in _LAST_RESULTS.values():
+            for r in _rows_for_offers_table(p):
+                if r.get("filename") in doc_ids:
+                    rows.append(r)
+    return _aggregate_offers_rows(rows)
 
 # =========================
 # Extract endpoints
@@ -212,202 +236,4 @@ async def extract_pdf(
 
 @app.post("/extract/multiple")
 async def extract_multiple(
-    files: List[UploadFile] = File(...),
-    insurer: str = Form(""),
-    company: str = Form(""),
-    insured_count: int = Form(0),
-    inquiry_id: str = Form(""),
-):
-    """Sequential (blocking) version."""
-    if not files:
-        raise HTTPException(status_code=400, detail="No files uploaded")
-
-    results: List[Dict[str, Any]] = []
-    for f in files:
-        if not f.filename.lower().endswith(".pdf"):
-            results.append({"document_id": f.filename, "error": "Unsupported file type (only PDF)"})
-            continue
-        try:
-            data = await f.read()
-            payload = extract_offer_from_pdf_bytes(data, document_id=f.filename or "uploaded.pdf")
-            _inject_meta(payload, insurer=insurer, company=company, insured_count=insured_count, inquiry_id=inquiry_id)
-            save_to_supabase(payload)
-            results.append(payload)
-
-            fname = payload.get("document_id") or f.filename or "uploaded.pdf"
-            _LAST_RESULTS[fname] = payload
-        except ExtractionError as e:
-            results.append({"document_id": f.filename, "error": str(e)})
-        except Exception as e:
-            results.append({"document_id": f.filename, "error": f"Unexpected error: {e}"})
-    return JSONResponse(results)
-
-@app.post("/extract/multiple-async", status_code=202)
-async def extract_multiple_async(
-    background_tasks: BackgroundTasks,
-    files: List[UploadFile] = File(...),
-    insurer: str = Form(""),
-    company: str = Form(""),
-    insured_count: int = Form(0),
-    inquiry_id: str = Form(""),
-):
-    """
-    Asynchronous version: returns a job_id immediately.
-    Use GET /jobs/{job_id} for progress and GET /offers/by-inquiry/{inquiry_id} to read results as they arrive.
-    """
-    if not files:
-        raise HTTPException(status_code=400, detail="No files uploaded")
-
-    job_id = str(uuid.uuid4())
-    job_inquiry_id = int(inquiry_id) if str(inquiry_id).isdigit() else None
-    _jobs[job_id] = {"inquiry_id": job_inquiry_id, "total": len(files), "done": 0, "errors": []}
-
-    # Read file bytes now and enqueue background tasks
-    for f in files:
-        filename = f.filename or "uploaded.pdf"
-        data = await f.read()
-        background_tasks.add_task(
-            _process_pdf_bytes,
-            data, filename, insurer, company,
-            int(insured_count) if insured_count else 0,
-            job_inquiry_id, job_id,
-        )
-
-    return {"job_id": job_id, "accepted": len(files), "inquiry_id": job_inquiry_id}
-
-def _process_pdf_bytes(
-    data: bytes,
-    filename: str,
-    insurer: str,
-    company: str,
-    insured_count: int,
-    inquiry_id: Optional[int],
-    job_id: str,
-):
-    try:
-        payload = extract_offer_from_pdf_bytes(data, document_id=filename)
-        _inject_meta(payload, insurer=insurer, company=company, insured_count=insured_count, inquiry_id=str(inquiry_id or ""))
-        save_to_supabase(payload)
-        _LAST_RESULTS[filename] = payload  # dev fallback
-    except Exception as e:
-        rec = _jobs.get(job_id)
-        if rec is not None:
-            rec["errors"].append({"document_id": filename, "error": str(e)})
-    finally:
-        rec = _jobs.get(job_id)
-        if rec is not None:
-            rec["done"] += 1
-
-@app.get("/jobs/{job_id}")
-def job_status(job_id: str):
-    job = _jobs.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="job not found")
-    return job
-
-# =========================
-# Read offers (for UI & share pages)
-# =========================
-@app.get("/offers/by-inquiry/{inquiry_id}")
-def offers_by_inquiry(inquiry_id: int):
-    """
-    Returns FE-friendly shape grouped by filename.
-    """
-    if _supabase:
-        try:
-            res = (
-                _supabase.table(_OFFERS_TABLE)
-                .select("*")
-                .eq("inquiry_id", inquiry_id)
-                .order("created_at", desc=False)
-                .execute()
-            )
-            rows = res.data or []
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Supabase error: {e}")
-    else:
-        # dev fallback: group from in-memory last results (no true inquiry mapping)
-        rows = []
-        for p in _LAST_RESULTS.values():
-            for r in _rows_for_offers_table(p):
-                if r.get("inquiry_id") == inquiry_id:
-                    rows.append(r)
-
-    return _aggregate_offers_rows(rows)
-
-@app.get("/public/offers/by-inquiry/{inquiry_id}")
-def public_offers_by_inquiry(inquiry_id: int):
-    return offers_by_inquiry(inquiry_id)
-
-# =========================
-# Share links (public.share_links)
-# =========================
-class ShareCreateBody(BaseModel):
-    inquiry_id: int = Field(..., description="Inquiry id to share")
-    title: Optional[str] = None
-    payload: Optional[Dict[str, Any]] = None
-    expires_in_hours: Optional[int] = Field(720, description="Defaults to 30 days")
-
-def _gen_token() -> str:
-    return secrets.token_urlsafe(16)
-
-@app.post("/shares")
-def create_share(body: ShareCreateBody, request: Request):
-    token = _gen_token()
-    expires_at = (
-        datetime.utcnow() + timedelta(hours=body.expires_in_hours or 720)
-        if (body.expires_in_hours or 0) > 0
-        else None
-    )
-    row = {
-        "token": token,
-        "inquiry_id": body.inquiry_id,
-        "payload": body.payload or {"mode": "inquiry-live"},
-        "expires_at": expires_at.isoformat() + "Z" if expires_at else None,
-    }
-
-    if _supabase:
-        try:
-            _supabase.table(_SHARE_TABLE).insert(row).execute()
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Share create failed: {e}")
-    else:
-        _SHARES_FALLBACK[token] = row
-
-    # Build a copyable URL (prefer SHARE_BASE_URL env for your public UI)
-    base = os.getenv("SHARE_BASE_URL")
-    if base:
-        url = f"{base.rstrip('/')}/share/{token}"
-    else:
-        try:
-            url = str(request.url_for("get_share", token=token))
-        except Exception:
-            url = f"/shares/{token}"
-
-    return {"ok": True, "token": token, "url": url, "inquiry_id": body.inquiry_id, "title": body.title}
-
-@app.get("/shares/{token}", name="get_share")
-def get_share(token: str):
-    """
-    Returns the share record and current offers for its inquiry.
-    The viewer can poll this endpoint or /public/offers/by-inquiry/{id}.
-    """
-    share: Optional[Dict[str, Any]] = None
-    if _supabase:
-        try:
-            res = _supabase.table(_SHARE_TABLE).select("*").eq("token", token).limit(1).execute()
-            rows = res.data or []
-            if rows:
-                share = rows[0]
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Share fetch failed: {e}")
-    else:
-        share = _SHARES_FALLBACK.get(token)
-
-    if not share:
-        raise HTTPException(status_code=404, detail="Share token not found")
-
-    inquiry_id = share.get("inquiry_id")
-    offers = offers_by_inquiry(int(inquiry_id)) if inquiry_id is not None else []
-
-    return {"ok": True, "token": token, "inquiry_id": inquiry_id, "payload": share.get("payload") or {}, "offers": offers}
+    files: List[Upload
