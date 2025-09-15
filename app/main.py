@@ -25,7 +25,7 @@ except Exception:  # pragma: no cover
 from app.gpt_extractor import extract_offer_from_pdf_bytes, ExtractionError
 
 APP_NAME = "GPT Offer Extractor"
-APP_VERSION = "0.9.5"
+APP_VERSION = "0.9.6"
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
@@ -433,7 +433,7 @@ async def extract_multiple_async(request: Request, background_tasks: BackgroundT
     inquiry_id: str = parsed["inquiry_id"]
 
     job_id = str(uuid.uuid4())
-    _jobs[job_id] = {"total": len(files), "done": 0, "errors": [], "docs": []}
+    _jobs[job_id] = {"total": len(files), "done": 0, "errors": [], "docs": [], "timings": {}}
 
     doc_ids: List[str] = []
     for idx, f in enumerate(files, start=1):
@@ -451,6 +451,7 @@ async def extract_multiple_async(request: Request, background_tasks: BackgroundT
             job_id=job_id,
             inquiry_id_raw=inquiry_id,
             original_name=filename,
+            enq_ts=time.monotonic(),
         )
 
     _jobs[job_id]["docs"] = doc_ids
@@ -466,30 +467,58 @@ def _process_pdf_bytes(
     job_id: str,
     inquiry_id_raw: str,
     original_name: str,
+    enq_ts: float,
 ):
+    t_start = time.monotonic()
+    rec = _jobs.get(job_id)
+    if rec is not None:
+        try:
+            rec.setdefault("timings", {})
+            rec["timings"].setdefault(doc_id, {})["queue_s"] = round(t_start - float(enq_ts), 3)
+        except Exception:
+            pass
+
     try:
+        # LLM extraction timing
+        t_llm0 = time.monotonic()
         payload = extract_offer_from_pdf_bytes(data, document_id=doc_id)
+        t_llm = time.monotonic() - t_llm0
+
+        # DB timing (including meta injection)
+        t_db0 = time.monotonic()
         payload["original_filename"] = original_name
         _inject_meta(payload, insurer=insurer, company=company, insured_count=insured_count, inquiry_id=inquiry_id_raw)
         ok, err = save_to_supabase(payload)
-        if not ok:
-            rec = _jobs.get(job_id)
-            if rec is not None:
+        t_db = time.monotonic() - t_db0
+
+        payload["_timings"] = {
+            "llm_s": round(t_llm, 3),
+            "db_s": round(t_db, 3),
+            "total_s": round(time.monotonic() - t_start, 3),
+        }
+        # Keep a latest copy for debug/fallback
+        _LAST_RESULTS[doc_id] = payload
+
+        if rec is not None:
+            rec["timings"].setdefault(doc_id, {}).update(payload["_timings"]) 
+            if not ok:
                 rec["errors"].append({"document_id": doc_id, "error": f"supabase_insert: {err}"})
     except Exception as e:
-        rec = _jobs.get(job_id)
+        # record extraction failure
         if rec is not None:
             rec["errors"].append({"document_id": doc_id, "error": f"extract: {e}"})
+            rec["timings"].setdefault(doc_id, {})["total_s"] = round(time.monotonic() - t_start, 3)
+        # store minimal error payload for fallback visibility
         payload = {
             "document_id": doc_id,
             "original_filename": original_name,
             "programs": [],
             "_error": f"extract: {e}",
+            "_timings": {"total_s": round(time.monotonic() - t_start, 3)},
         }
         _inject_meta(payload, insurer=insurer, company=company, insured_count=insured_count, inquiry_id=inquiry_id_raw)
         _LAST_RESULTS[doc_id] = payload
     finally:
-        rec = _jobs.get(job_id)
         if rec is not None:
             rec["done"] += 1
 
