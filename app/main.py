@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any, Tuple
 
 from fastapi import (
-    FastAPI, File, UploadFile, HTTPException, Form, Request, BackgroundTasks
+    FastAPI, File, UploadFile, HTTPException, Form, Request
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -27,7 +27,7 @@ except Exception:  # pragma: no cover
 from app.gpt_extractor import extract_offer_from_pdf_bytes, ExtractionError
 
 APP_NAME = "GPT Offer Extractor"
-APP_VERSION = "0.9.7"
+APP_VERSION = "0.9.8"
 
 # -------------------------------
 # Concurrency (faster than BackgroundTasks)
@@ -70,6 +70,7 @@ if _SUPABASE_URL and _SUPABASE_KEY and create_client is not None:
 _jobs: Dict[str, Dict[str, Any]] = {}            # job_id -> { total, done, errors, docs: [doc_ids...], timings: {doc_id: {...}} }
 _LAST_RESULTS: Dict[str, Dict[str, Any]] = {}    # doc_id -> payload (dev + supabase-fallback)
 _SHARES_FALLBACK: Dict[str, Dict[str, Any]] = {} # token -> row
+_INSERTED_IDS: Dict[str, List[int]] = {}         # doc_id -> [row ids] (to expose row_id even if we fall back)
 
 # -------------------------------
 # Health & root
@@ -255,7 +256,19 @@ def save_to_supabase(payload: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
 
     try:
         rows = _rows_for_offers_table(payload)
-        _supabase.table(_OFFERS_TABLE).insert(rows).execute()
+        # Ask PostgREST to return the inserted IDs explicitly
+        res = _supabase.table(_OFFERS_TABLE).insert(rows).select("id").execute()
+        # Remember inserted ids so fallback can still expose row_id
+        try:
+            ids = [r["id"] for r in (res.data or []) if isinstance(r, dict) and "id" in r]
+            if not ids:
+                # Fallback: fetch by filename if needed
+                q = _supabase.table(_OFFERS_TABLE).select("id").eq("filename", doc_id).execute()
+                ids = [r["id"] for r in (q.data or []) if "id" in r]
+            if ids:
+                _INSERTED_IDS[doc_id] = ids
+        except Exception:
+            pass
         return True, None
     except Exception as e:
         payload["_error"] = f"supabase_insert: {e}"
@@ -270,7 +283,16 @@ def _rows_from_fallback(doc_ids: List[str]) -> List[Dict[str, Any]]:
         p = _LAST_RESULTS.get(doc_id)
         if not p:
             continue
-        rows.extend(_rows_for_offers_table(p))
+        rs = _rows_for_offers_table(p)
+        # Stitch DB ids we cached at insert time (best-effort order)
+        ids = _INSERTED_IDS.get(doc_id) or []
+        if ids:
+            k = 0
+            for r in rs:
+                if r.get("status") != "error" and k < len(ids):
+                    r["id"] = ids[k]
+                    k += 1
+        rows.extend(rs)
     return rows
 
 
@@ -435,7 +457,7 @@ async def extract_multiple(request: Request):
 
 
 @app.post("/extract/multiple-async", status_code=202)
-async def extract_multiple_async(request: Request, background_tasks: BackgroundTasks):
+async def extract_multiple_async(request: Request):
     parsed = await _parse_upload_form(request)
     files: List[UploadFile] = parsed["files"]
     insurers: List[str] = parsed["insurers"]
