@@ -1,4 +1,3 @@
-# app/main.py
 from __future__ import annotations
 
 import os
@@ -110,6 +109,7 @@ def _make_doc_id(prefix: str, idx: int, filename: str) -> str:
 # -------------------------------
 # Utilities
 # -------------------------------
+
 def _inject_meta(payload: Dict[str, Any], *, insurer: str, company: str, insured_count: int, inquiry_id: str) -> None:
     """Attach meta to payload; inquiry_id is optional/nullable."""
     payload["insurer_hint"] = insurer or payload.get("insurer_hint") or "-"
@@ -174,6 +174,7 @@ def _rows_for_offers_table(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         })
     return rows
 
+
 def _aggregate_offers_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     FE shape per source_file:
@@ -197,7 +198,8 @@ def _aggregate_offers_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "status": r.get("status") or "parsed",
                 "error": r.get("error"),
                 "company_hint": r.get("company_hint"),
-                "insurer_hint": r.get("company_hint"),  # kept for FE convenience
+                # FIX: prefer explicit insurer_hint (if present), then parsed insurer, then company_hint
+                "insurer_hint": r.get("insurer_hint") or r.get("insurer") or r.get("company_hint"),
                 "company_name": r.get("company_name"),
                 "employee_count": r.get("employee_count"),
             }
@@ -223,6 +225,7 @@ def _aggregate_offers_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             g["error"] = "no programs"
     return list(grouped.values())
 
+
 def save_to_supabase(payload: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     """
     Insert one row per program into public.offers (or keep in memory if no Supabase).
@@ -245,6 +248,7 @@ def save_to_supabase(payload: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
         print(f"[warn] Supabase insert failed for {doc_id}: {e}")
         return False, str(e)
 
+
 def _rows_from_fallback(doc_ids: List[str]) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for doc_id in doc_ids:
@@ -253,6 +257,7 @@ def _rows_from_fallback(doc_ids: List[str]) -> List[Dict[str, Any]]:
             continue
         rows.extend(_rows_for_offers_table(p))
     return rows
+
 
 def _offers_by_document_ids(doc_ids: List[str]) -> List[Dict[str, Any]]:
     """Query offers by exact document_id list (stored in 'filename'). Falls back to memory if empty/error."""
@@ -392,6 +397,7 @@ async def _parse_upload_form(request: Request) -> Dict[str, Any]:
         "inquiry_id": inquiry_id,
     }
 
+
 @app.post("/extract/multiple")
 async def extract_multiple(request: Request):
     """Sequential (blocking) — unique doc_ids and per-file insurer hints. No 422 on single file."""
@@ -437,6 +443,7 @@ async def extract_multiple(request: Request):
 
     return JSONResponse({"documents": doc_ids, "results": results})
 
+
 @app.post("/extract/multiple-async", status_code=202)
 async def extract_multiple_async(request: Request, background_tasks: BackgroundTasks):
     """
@@ -476,6 +483,7 @@ async def extract_multiple_async(request: Request, background_tasks: BackgroundT
     _jobs[job_id]["docs"] = doc_ids
     return {"job_id": job_id, "accepted": len(files), "documents": doc_ids}
 
+
 def _process_pdf_bytes(
     data: bytes,
     doc_id: str,
@@ -514,6 +522,7 @@ def _process_pdf_bytes(
         if rec is not None:
             rec["done"] += 1
 
+
 @app.get("/jobs/{job_id}")
 def job_status(job_id: str):
     job = _jobs.get(job_id)
@@ -527,9 +536,11 @@ def job_status(job_id: str):
 class DocsBody(BaseModel):
     document_ids: List[str]
 
+
 @app.post("/offers/by-documents")
 def offers_by_documents(body: DocsBody):
     return _offers_by_document_ids(body.document_ids)
+
 
 @app.get("/offers/by-job/{job_id}")
 def offers_by_job(job_id: str):
@@ -538,6 +549,7 @@ def offers_by_job(job_id: str):
         raise HTTPException(status_code=404, detail="job not found")
     doc_ids = job.get("docs") or []
     return _offers_by_document_ids(doc_ids)
+
 
 # (legacy — still available)
 @app.get("/offers/by-inquiry/{inquiry_id}")
@@ -565,6 +577,7 @@ def offers_by_inquiry(inquiry_id: int):
                 rows.append(r)
     return _aggregate_offers_rows(rows)
 
+
 # -------------------------------
 # Token-only Share links (public.share_links)
 # -------------------------------
@@ -584,6 +597,7 @@ class ShareCreateBody(BaseModel):
 
 def _gen_token() -> str:
     return secrets.token_urlsafe(16)
+
 
 @app.post("/shares")
 def create_share_token_only(body: ShareCreateBody, request: Request):
@@ -629,6 +643,7 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
 
     return {"ok": True, "token": token, "url": url, "title": body.title}
 
+
 @app.get("/shares/{token}", name="get_share_token_only")
 def get_share_token_only(token: str):
     """
@@ -665,6 +680,7 @@ def get_share_token_only(token: str):
 
     return resp
 
+
 # -------------------------------
 # Debug helpers
 # -------------------------------
@@ -684,6 +700,7 @@ def debug_last_results():
             "employee_count": p.get("employee_count"),
         })
     return out
+
 
 @app.get("/debug/doc/{doc_id}")
 def debug_doc(doc_id: str):
