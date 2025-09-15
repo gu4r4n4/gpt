@@ -110,6 +110,31 @@ def _make_doc_id(prefix: str, idx: int, filename: str) -> str:
 # Utilities
 # -------------------------------
 
+def _num(v: Any) -> Optional[float]:
+    """Best-effort numeric coercion. Returns None for blanks, dashes, N/A, etc."""
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        s = v.strip()
+        if s in {"", "-", "–", "—", "n/a", "N/A", "NA"}:
+            return None
+        # normalize European decimals and remove spaces
+        s = s.replace(" ", "").replace(",", ".")
+        # drop thousand separators like 1.234.567,89 -> 1234567.89 (keep the last dot as decimal if any)
+        # simple heuristic: if more than one '.', remove all but the last
+        if s.count('.') > 1:
+            head, _, tail = s.rpartition('.')
+            head = head.replace('.', '')
+            s = f"{head}.{tail}"
+        try:
+            return float(s)
+        except Exception:
+            return None
+    return None
+
+
 def _inject_meta(payload: Dict[str, Any], *, insurer: str, company: str, insured_count: int, inquiry_id: str) -> None:
     """Attach meta to payload; inquiry_id is optional/nullable."""
     payload["insurer_hint"] = insurer or payload.get("insurer_hint") or "-"
@@ -144,15 +169,15 @@ def _rows_for_offers_table(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "source": "api",
                 "filename": doc_id,               # UNIQUE per run (sanitized)
                 "inquiry_id": inquiry_id,         # nullable
-                "base_sum_eur": prog.get("base_sum_eur"),
-                "premium_eur": prog.get("premium_eur"),
+                "base_sum_eur": _num(prog.get("base_sum_eur")),
+                "premium_eur": _num(prog.get("premium_eur")),
                 "payment_method": prog.get("payment_method"),
                 "features": prog.get("features") or {},
                 "raw_json": payload,              # provenance/debug (includes original_filename)
                 "status": "parsed",
                 "error": None,
                 "company_name": company_name,
-                "employee_count": employee_count,
+                "employee_count": int(employee_count) if isinstance(employee_count, (int, float)) else None,
             })
     else:
         rows.append({
@@ -170,7 +195,7 @@ def _rows_for_offers_table(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             "status": "error",
             "error": payload.get("_error") or "no programs",
             "company_name": company_name,
-            "employee_count": employee_count,
+            "employee_count": int(employee_count) if isinstance(employee_count, (int, float)) else None,
         })
     return rows
 
