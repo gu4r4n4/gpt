@@ -25,7 +25,7 @@ except Exception:  # pragma: no cover
 from app.gpt_extractor import extract_offer_from_pdf_bytes, ExtractionError
 
 APP_NAME = "GPT Offer Extractor"
-APP_VERSION = "0.9.0"
+APP_VERSION = "0.9.1"
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
@@ -255,8 +255,9 @@ async def extract_pdf(
 @app.post("/extract/multiple")
 async def extract_multiple(
     request: Request,
-    files: List[UploadFile] = File(...),
-    insurers: Optional[List[str]] = Form(None),  # NEW: repeated field aligned to files
+    # make files optional to avoid FastAPI's pre-validation 422
+    files: Optional[List[UploadFile]] = File(None),
+    insurers: Optional[List[str]] = Form(None),  # repeated field aligned to files
     company: str = Form(""),
     insured_count: int = Form(0),
     inquiry_id: str = Form(""),
@@ -309,8 +310,9 @@ async def extract_multiple(
 async def extract_multiple_async(
     request: Request,
     background_tasks: BackgroundTasks,
-    files: List[UploadFile] = File(...),
-    insurers: Optional[List[str]] = Form(None),  # NEW: repeated field aligned to files
+    # make files optional to avoid FastAPI's pre-validation 422
+    files: Optional[List[UploadFile]] = File(None),
+    insurers: Optional[List[str]] = Form(None),  # repeated field aligned to files
     company: str = Form(""),
     insured_count: int = Form(0),
     inquiry_id: str = Form(""),
