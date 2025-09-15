@@ -5,7 +5,9 @@ import re
 import time
 import uuid
 import secrets
+import threading
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any, Tuple
 
@@ -25,7 +27,14 @@ except Exception:  # pragma: no cover
 from app.gpt_extractor import extract_offer_from_pdf_bytes, ExtractionError
 
 APP_NAME = "GPT Offer Extractor"
-APP_VERSION = "0.9.6"
+APP_VERSION = "0.9.7"
+
+# -------------------------------
+# Concurrency (faster than BackgroundTasks)
+# -------------------------------
+EXTRACT_WORKERS = int(os.getenv("EXTRACT_WORKERS", "4"))
+EXEC: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=EXTRACT_WORKERS)
+_JOBS_LOCK = threading.Lock()
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
@@ -58,7 +67,7 @@ if _SUPABASE_URL and _SUPABASE_KEY and create_client is not None:
 # -------------------------------
 # In-memory helpers (single process)
 # -------------------------------
-_jobs: Dict[str, Dict[str, Any]] = {}            # job_id -> { total, done, errors, docs: [doc_ids...] }
+_jobs: Dict[str, Dict[str, Any]] = {}            # job_id -> { total, done, errors, docs: [doc_ids...], timings: {doc_id: {...}} }
 _LAST_RESULTS: Dict[str, Dict[str, Any]] = {}    # doc_id -> payload (dev + supabase-fallback)
 _SHARES_FALLBACK: Dict[str, Dict[str, Any]] = {} # token -> row
 
@@ -75,6 +84,7 @@ def healthz():
         "supabase": bool(_supabase),
         "offers_table": _OFFERS_TABLE,
         "share_table": _SHARE_TABLE,
+        "workers": EXTRACT_WORKERS,
     }
 
 @app.get("/")
@@ -276,8 +286,7 @@ def _offers_by_document_ids(doc_ids: List[str]) -> List[Dict[str, Any]]:
                 _supabase.table(_OFFERS_TABLE)
                 .select("*")
                 .in_("filename", doc_ids)
-                .order("created_at", desc=False)
-                .execute()
+                .execute()  # removed ORDER BY created_at for speed
             )
             rows = res.data or []
         except Exception as e:
@@ -400,11 +409,13 @@ async def extract_multiple(request: Request):
             doc_id = _make_doc_id(batch_id, idx, filename)
             original_name = filename
             data = await f.read()
+            t0 = time.monotonic()
             payload = extract_offer_from_pdf_bytes(data, document_id=doc_id)
             payload["original_filename"] = original_name
             _inject_meta(payload, insurer=insurers[idx - 1] or "", company=company, insured_count=insured_count, inquiry_id=inquiry_id)
             ok, err = save_to_supabase(payload)
             payload["_persist"] = "supabase" if ok else f"fallback: {err}"
+            payload["_timings"] = {"total_s": round(time.monotonic() - t0, 3)}
             results.append(payload)
             doc_ids.append(doc_id)
         except ExtractionError as e:
@@ -433,15 +444,17 @@ async def extract_multiple_async(request: Request, background_tasks: BackgroundT
     inquiry_id: str = parsed["inquiry_id"]
 
     job_id = str(uuid.uuid4())
-    _jobs[job_id] = {"total": len(files), "done": 0, "errors": [], "docs": [], "timings": {}}
+    with _JOBS_LOCK:
+        _jobs[job_id] = {"total": len(files), "done": 0, "errors": [], "docs": [], "timings": {}}
 
     doc_ids: List[str] = []
+    # Enqueue each file to thread-pool workers
     for idx, f in enumerate(files, start=1):
         filename = f.filename or "uploaded.pdf"
         doc_id = _make_doc_id(job_id, idx, filename)
         doc_ids.append(doc_id)
         data = await f.read()
-        background_tasks.add_task(
+        EXEC.submit(
             _process_pdf_bytes,
             data=data,
             doc_id=doc_id,
@@ -454,7 +467,8 @@ async def extract_multiple_async(request: Request, background_tasks: BackgroundT
             enq_ts=time.monotonic(),
         )
 
-    _jobs[job_id]["docs"] = doc_ids
+    with _JOBS_LOCK:
+        _jobs[job_id]["docs"] = doc_ids
     return {"job_id": job_id, "accepted": len(files), "documents": doc_ids}
 
 
@@ -470,13 +484,11 @@ def _process_pdf_bytes(
     enq_ts: float,
 ):
     t_start = time.monotonic()
-    rec = _jobs.get(job_id)
-    if rec is not None:
-        try:
+    with _JOBS_LOCK:
+        rec = _jobs.get(job_id)
+        if rec is not None:
             rec.setdefault("timings", {})
             rec["timings"].setdefault(doc_id, {})["queue_s"] = round(t_start - float(enq_ts), 3)
-        except Exception:
-            pass
 
     try:
         # LLM extraction timing
@@ -499,15 +511,18 @@ def _process_pdf_bytes(
         # Keep a latest copy for debug/fallback
         _LAST_RESULTS[doc_id] = payload
 
-        if rec is not None:
-            rec["timings"].setdefault(doc_id, {}).update(payload["_timings"]) 
-            if not ok:
-                rec["errors"].append({"document_id": doc_id, "error": f"supabase_insert: {err}"})
+        with _JOBS_LOCK:
+            rec = _jobs.get(job_id)
+            if rec is not None:
+                rec["timings"].setdefault(doc_id, {}).update(payload["_timings"]) 
+                if not ok:
+                    rec["errors"].append({"document_id": doc_id, "error": f"supabase_insert: {err}"})
     except Exception as e:
-        # record extraction failure
-        if rec is not None:
-            rec["errors"].append({"document_id": doc_id, "error": f"extract: {e}"})
-            rec["timings"].setdefault(doc_id, {})["total_s"] = round(time.monotonic() - t_start, 3)
+        with _JOBS_LOCK:
+            rec = _jobs.get(job_id)
+            if rec is not None:
+                rec["errors"].append({"document_id": doc_id, "error": f"extract: {e}"})
+                rec["timings"].setdefault(doc_id, {})["total_s"] = round(time.monotonic() - t_start, 3)
         # store minimal error payload for fallback visibility
         payload = {
             "document_id": doc_id,
@@ -519,16 +534,19 @@ def _process_pdf_bytes(
         _inject_meta(payload, insurer=insurer, company=company, insured_count=insured_count, inquiry_id=inquiry_id_raw)
         _LAST_RESULTS[doc_id] = payload
     finally:
-        if rec is not None:
-            rec["done"] += 1
+        with _JOBS_LOCK:
+            rec = _jobs.get(job_id)
+            if rec is not None:
+                rec["done"] += 1
 
 
 @app.get("/jobs/{job_id}")
 def job_status(job_id: str):
-    job = _jobs.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="job not found")
-    return job
+    with _JOBS_LOCK:
+        job = _jobs.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="job not found")
+        return job
 
 # -------------------------------
 # Read/Update offers
@@ -544,7 +562,8 @@ def offers_by_documents(body: DocsBody):
 
 @app.get("/offers/by-job/{job_id}")
 def offers_by_job(job_id: str):
-    job = _jobs.get(job_id)
+    with _JOBS_LOCK:
+        job = _jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
     doc_ids = job.get("docs") or []
@@ -607,8 +626,7 @@ def offers_by_inquiry(inquiry_id: int):
                 _supabase.table(_OFFERS_TABLE)
                 .select("*")
                 .eq("inquiry_id", inquiry_id)
-                .order("created_at", desc=False)
-                .execute()
+                .execute()  # removed ORDER BY created_at for speed
             )
             rows = res.data or []
         except Exception as e:
