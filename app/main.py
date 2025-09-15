@@ -8,7 +8,7 @@ import uuid
 import secrets
 import unicodedata
 from datetime import datetime, timedelta
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
 from fastapi import (
     FastAPI, File, UploadFile, HTTPException, Form, Request, BackgroundTasks
@@ -26,7 +26,7 @@ except Exception:  # pragma: no cover
 from app.gpt_extractor import extract_offer_from_pdf_bytes, ExtractionError
 
 APP_NAME = "GPT Offer Extractor"
-APP_VERSION = "0.9.4"  # <- bumped
+APP_VERSION = "0.9.4"
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
@@ -60,7 +60,7 @@ if _SUPABASE_URL and _SUPABASE_KEY and create_client is not None:
 # In-memory helpers (single process)
 # -------------------------------
 _jobs: Dict[str, Dict[str, Any]] = {}            # job_id -> { total, done, errors, docs: [doc_ids...] }
-_LAST_RESULTS: Dict[str, Dict[str, Any]] = {}    # doc_id -> payload (dev fallback)
+_LAST_RESULTS: Dict[str, Dict[str, Any]] = {}    # doc_id -> payload (dev + supabase-fallback)
 _SHARES_FALLBACK: Dict[str, Dict[str, Any]] = {} # token -> row
 
 # -------------------------------
@@ -124,7 +124,7 @@ def _rows_for_offers_table(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     Convert one normalized extractor payload (with .programs list)
     into rows for public.offers (one row per program).
     Uses payload['document_id'] as the 'filename' (unique per batch/job).
-    If payload['status']=="error" or programs==[], we insert a single error row so FE can render a visible card.
+    For "no programs", emits a single error row so the UI can show a failure card.
     """
     doc_id = payload.get("document_id") or payload.get("source_file") or "uploaded.pdf"
     inquiry_id = payload.get("inquiry_id")  # may be None
@@ -134,9 +134,7 @@ def _rows_for_offers_table(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     rows: List[Dict[str, Any]] = []
     programs = payload.get("programs", []) or []
-    is_error_payload = (payload.get("status") == "error")
-
-    if programs and not is_error_payload:
+    if programs:
         for prog in programs:
             insurer_val = prog.get("insurer") or hint  # fallback to user-selected hint
             rows.append({
@@ -169,62 +167,100 @@ def _rows_for_offers_table(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             "payment_method": None,
             "features": {},
             "raw_json": payload,
-            "status": payload.get("status") or "error",
-            "error": payload.get("error") or "no programs",
+            "status": "error",
+            "error": payload.get("_error") or "no programs",
             "company_name": company_name,
             "employee_count": employee_count,
         })
     return rows
 
-def save_to_supabase(payload: Dict[str, Any]) -> None:
-    """Insert one row per program into public.offers (or keep in memory if no Supabase)."""
-    if not _supabase:
-        doc_id = payload.get("document_id") or payload.get("source_file") or "uploaded.pdf"
-        _LAST_RESULTS[doc_id] = payload
-        return
-    try:
-        rows = _rows_for_offers_table(payload)
-        if rows:
-            _supabase.table(_OFFERS_TABLE).insert(rows).execute()
-    except Exception as e:
-        print(f"[warn] Supabase insert failed: {e}")
-
 def _aggregate_offers_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    FE shape (now includes status/error if present):
-    [
-      { source_file, programs: [...], inquiry_id, status?, error? }
-    ]
+    FE shape per source_file:
+      {
+        source_file,
+        inquiry_id,
+        programs: [ ... ],
+        status: "parsed" | "error",
+        error: str | None,
+        company_hint, insurer_hint, company_name, employee_count
+      }
     """
     grouped: Dict[str, Dict[str, Any]] = {}
     for r in rows:
         src = r.get("filename") or "-"
         if src not in grouped:
-            grouped[src] = {"source_file": src, "programs": [], "inquiry_id": r.get("inquiry_id")}
-        # propagate error/status to group so FE can show an error card even if programs==[]
-        if r.get("status") == "error":
-            grouped[src]["status"] = "error"
-            grouped[src]["error"] = r.get("error")
-        else:
-            grouped[src].setdefault("status", "parsed")
-
-        # Only add a program entry if the row represents a program
-        if r.get("program_code") is not None or r.get("base_sum_eur") is not None or r.get("premium_eur") is not None:
-            prog = {
+            grouped[src] = {
+                "source_file": src,
+                "programs": [],
+                "inquiry_id": r.get("inquiry_id"),
+                "status": r.get("status") or "parsed",
+                "error": r.get("error"),
+                "company_hint": r.get("company_hint"),
+                "insurer_hint": r.get("company_hint"),  # kept for FE convenience
+                "company_name": r.get("company_name"),
+                "employee_count": r.get("employee_count"),
+            }
+        # If this row has a program, collect it
+        if (r.get("status") or "parsed") != "error":
+            grouped[src]["programs"].append({
                 "insurer": r.get("insurer"),
                 "program_code": r.get("program_code"),
                 "base_sum_eur": r.get("base_sum_eur"),
                 "premium_eur": r.get("premium_eur"),
                 "payment_method": r.get("payment_method"),
                 "features": r.get("features") or {},
-            }
-            grouped[src]["programs"].append(prog)
+            })
+        # Prefer parsed status if any row parsed successfully
+        if grouped[src]["status"] == "error" and (r.get("status") or "parsed") == "parsed":
+            grouped[src]["status"] = "parsed"
+            grouped[src]["error"] = None
+
+    # If a group has 0 programs and no explicit error, flag it
+    for g in grouped.values():
+        if not g["programs"] and not g.get("error"):
+            g["status"] = "error"
+            g["error"] = "no programs"
     return list(grouped.values())
 
+def save_to_supabase(payload: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+    """
+    Insert one row per program into public.offers (or keep in memory if no Supabase).
+    Returns (ok, error_message). Always writes _LAST_RESULTS to keep FE unblocked.
+    """
+    doc_id = payload.get("document_id") or payload.get("source_file") or "uploaded.pdf"
+    _LAST_RESULTS[doc_id] = payload  # keep a fallback copy regardless of DB
+
+    if not _supabase:
+        return True, None
+
+    try:
+        rows = _rows_for_offers_table(payload)
+        _supabase.table(_OFFERS_TABLE).insert(rows).execute()
+        return True, None
+    except Exception as e:
+        # Make the error visible in payload for fallback
+        payload["_error"] = f"supabase_insert: {e}"
+        _LAST_RESULTS[doc_id] = payload
+        print(f"[warn] Supabase insert failed for {doc_id}: {e}")
+        return False, str(e)
+
+def _rows_from_fallback(doc_ids: List[str]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for doc_id in doc_ids:
+        p = _LAST_RESULTS.get(doc_id)
+        if not p:
+            continue
+        rows.extend(_rows_for_offers_table(p))
+    return rows
+
 def _offers_by_document_ids(doc_ids: List[str]) -> List[Dict[str, Any]]:
-    """Query offers by exact document_id list (stored in 'filename')."""
+    """Query offers by exact document_id list (stored in 'filename'). Falls back to memory if empty/error."""
     if not doc_ids:
         return []
+    # Try Supabase first (if configured)
+    rows: List[Dict[str, Any]] = []
+    used_fallback = False
     if _supabase:
         try:
             res = (
@@ -236,41 +272,26 @@ def _offers_by_document_ids(doc_ids: List[str]) -> List[Dict[str, Any]]:
             )
             rows = res.data or []
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Supabase error: {e}")
+            print(f"[warn] Supabase select failed: {e}")
+            used_fallback = True
+    # If Supabase returned nothing (or errored), use in-memory fallback
+    if not rows:
+        fb_rows = _rows_from_fallback(doc_ids)
+        if fb_rows:
+            rows = fb_rows
+            used_fallback = True
+    agg = _aggregate_offers_rows(rows)
+    # Stamp a hint in each response object so FE can log it if needed
+    if used_fallback:
+        for obj in agg:
+            if not obj.get("error"):
+                # don't overwrite real parsing errors
+                obj["error"] = None
+            obj["_source"] = "fallback"
     else:
-        rows = []
-        for p in _LAST_RESULTS.values():
-            for r in _rows_for_offers_table(p):
-                if r.get("filename") in doc_ids:
-                    rows.append(r)
-    return _aggregate_offers_rows(rows)
-
-# -------------------------------
-# Error payload constructor (used on failures)
-# -------------------------------
-def _make_error_payload(
-    *,
-    doc_id: str,
-    insurer: str,
-    company: str,
-    insured_count: int,
-    inquiry_id_raw: str,
-    original_name: str,
-    err: str,
-) -> Dict[str, Any]:
-    return {
-        "document_id": doc_id,
-        "source_file": doc_id,
-        "original_filename": original_name,
-        "programs": [],            # no programs parsed
-        "status": "error",
-        "error": err,
-        "insurer_hint": insurer or None,
-        "company_name": company or None,
-        "employee_count": insured_count if isinstance(insured_count, int) else None,
-        "inquiry_id": int(inquiry_id_raw) if str(inquiry_id_raw).isdigit() else None,
-        "_timings": {},
-    }
+        for obj in agg:
+            obj["_source"] = "supabase"
+    return agg
 
 # -------------------------------
 # Extract endpoints
@@ -296,38 +317,23 @@ async def extract_pdf(
         payload = extract_offer_from_pdf_bytes(data, document_id=doc_id)
         payload["original_filename"] = original_name  # for display in UI
         _inject_meta(payload, insurer=insurer, company=company, insured_count=insured_count, inquiry_id=inquiry_id)
-        save_to_supabase(payload)
-
-        _LAST_RESULTS[doc_id] = payload  # dev fallback
+        ok, err = save_to_supabase(payload)
         payload["_timings"] = {"total_s": round(time.monotonic() - t0, 3)}
+        payload["_persist"] = "supabase" if ok else f"fallback: {err}"
         return JSONResponse({"document_id": doc_id, "result": payload})
     except ExtractionError as e:
-        # Save an error row so the FE can still resolve by document_id
-        err_payload = _make_error_payload(
-            doc_id=doc_id,
-            insurer=insurer,
-            company=company,
-            insured_count=insured_count,
-            inquiry_id_raw=inquiry_id,
-            original_name=original_name,
-            err=str(e),
-        )
-        save_to_supabase(err_payload)
-        _LAST_RESULTS[doc_id] = err_payload
-        raise HTTPException(status_code=422, detail={"document_id": doc_id, "error": str(e)})
+        # keep a minimal error payload so fallback can still report it
+        payload = {
+            "document_id": doc_id,
+            "original_filename": original_name,
+            "programs": [],
+            "_error": f"ExtractionError: {e}",
+        }
+        _inject_meta(payload, insurer=insurer, company=company, insured_count=insured_count, inquiry_id=inquiry_id)
+        _LAST_RESULTS[doc_id] = payload
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
-        err_payload = _make_error_payload(
-            doc_id=doc_id,
-            insurer=insurer,
-            company=company,
-            insured_count=insured_count,
-            inquiry_id_raw=inquiry_id,
-            original_name=original_name,
-            err=f"Unexpected error: {e}",
-        )
-        save_to_supabase(err_payload)
-        _LAST_RESULTS[doc_id] = err_payload
-        raise HTTPException(status_code=500, detail={"document_id": doc_id, "error": f"Unexpected error: {e}"})
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
 
 # ---- Helper to parse multipart safely (no Pydantic validation for files) ----
 async def _parse_upload_form(request: Request) -> Dict[str, Any]:
@@ -347,18 +353,14 @@ async def _parse_upload_form(request: Request) -> Dict[str, Any]:
     """
     form = await request.form()
 
-    # files can be repeated; Starlette FormData supports getlist
     files: List[UploadFile] = form.getlist("files")
     if not files:
-        # Some clients send a single 'files'; get() returns one UploadFile
         single = form.get("files")
         if isinstance(single, UploadFile):
             files = [single]
-
     if not files:
         raise HTTPException(status_code=400, detail="No files uploaded")
 
-    # company / insured_count / inquiry
     company = (form.get("company") or "").strip()
     insured_raw = (form.get("insured_count") or "0").strip()
     try:
@@ -367,22 +369,16 @@ async def _parse_upload_form(request: Request) -> Dict[str, Any]:
         insured_cnt = 0
     inquiry_id = (form.get("inquiry_id") or "").strip()
 
-    # insurers: prefer repeated list
     insurers: List[str] = [str(x or "").strip() for x in form.getlist("insurers")]
-
-    # if not provided, check file_{i}_insurer
     if not insurers:
         tmp: List[str] = []
         for i in range(len(files)):
             tmp.append(str(form.get(f"file_{i}_insurer", "") or "").strip())
         insurers = tmp
-
-    # final fallback: single 'insurer' fanned out
     if not insurers or len([x for x in insurers if x]) == 0:
         single_ins = str(form.get("insurer", "") or "").strip()
         insurers = [single_ins for _ in range(len(files))]
 
-    # pad/trim to files length
     if len(insurers) < len(files):
         insurers += [""] * (len(files) - len(insurers))
     elif len(insurers) > len(files):
@@ -398,7 +394,7 @@ async def _parse_upload_form(request: Request) -> Dict[str, Any]:
 
 @app.post("/extract/multiple")
 async def extract_multiple(request: Request):
-    """Sequential (blocking) — unique doc_ids and per-file insurer hints. Returns per-file errors; also saves error rows."""
+    """Sequential (blocking) — unique doc_ids and per-file insurer hints. No 422 on single file."""
     parsed = await _parse_upload_form(request)
     files: List[UploadFile] = parsed["files"]
     insurers: List[str] = parsed["insurers"]
@@ -415,47 +411,29 @@ async def extract_multiple(request: Request):
         if not filename.lower().endswith(".pdf"):
             results.append({"document_id": filename, "error": "Unsupported file type (only PDF)"})
             continue
-
-        doc_id = _make_doc_id(batch_id, idx, filename)
-        original_name = filename
-        data = await f.read()
-
         try:
+            doc_id = _make_doc_id(batch_id, idx, filename)
+            original_name = filename
+            data = await f.read()
             payload = extract_offer_from_pdf_bytes(data, document_id=doc_id)
             payload["original_filename"] = original_name
             _inject_meta(payload, insurer=insurers[idx - 1] or "", company=company, insured_count=insured_count, inquiry_id=inquiry_id)
-            save_to_supabase(payload)
+            ok, err = save_to_supabase(payload)
+            payload["_persist"] = "supabase" if ok else f"fallback: {err}"
             results.append(payload)
             doc_ids.append(doc_id)
-            _LAST_RESULTS[doc_id] = payload
         except ExtractionError as e:
-            err_payload = _make_error_payload(
-                doc_id=doc_id,
-                insurer=insurers[idx - 1] or "",
-                company=company,
-                insured_count=insured_count,
-                inquiry_id_raw=inquiry_id,
-                original_name=original_name,
-                err=str(e),
-            )
-            save_to_supabase(err_payload)
-            _LAST_RESULTS[doc_id] = err_payload
-            results.append({"document_id": filename, "error": str(e)})
-            doc_ids.append(doc_id)
+            payload = {
+                "document_id": filename,
+                "original_filename": filename,
+                "programs": [],
+                "_error": f"ExtractionError: {e}",
+            }
+            _inject_meta(payload, insurer=insurers[idx - 1] or "", company=company, insured_count=insured_count, inquiry_id=inquiry_id)
+            _LAST_RESULTS[doc_id] = payload
+            results.append(payload)
         except Exception as e:
-            err_payload = _make_error_payload(
-                doc_id=doc_id,
-                insurer=insurers[idx - 1] or "",
-                company=company,
-                insured_count=insured_count,
-                inquiry_id_raw=inquiry_id,
-                original_name=original_name,
-                err=f"Unexpected error: {e}",
-            )
-            save_to_supabase(err_payload)
-            _LAST_RESULTS[doc_id] = err_payload
             results.append({"document_id": filename, "error": f"Unexpected error: {e}"})
-            doc_ids.append(doc_id)
 
     return JSONResponse({"documents": doc_ids, "results": results})
 
@@ -464,9 +442,8 @@ async def extract_multiple_async(request: Request, background_tasks: BackgroundT
     """
     Asynchronous: returns a job_id + document_ids immediately.
     FE should poll:
-      - GET /jobs/{job_id}   (optional; may 404 on restarts)
+      - GET /jobs/{job_id}
       - POST /offers/by-documents with returned document_ids
-    On extractor failure, we still insert a visible 'error' row into offers and record job.errors[].
     """
     parsed = await _parse_upload_form(request)
     files: List[UploadFile] = parsed["files"]
@@ -509,47 +486,29 @@ def _process_pdf_bytes(
     inquiry_id_raw: str,
     original_name: str,
 ):
-    """
-    Background worker for async extraction.
-    On success: inserts parsed rows.
-    On failure: inserts a single 'error' row for this document and records job.errors[].
-    """
     try:
         payload = extract_offer_from_pdf_bytes(data, document_id=doc_id)
         payload["original_filename"] = original_name
         _inject_meta(payload, insurer=insurer, company=company, insured_count=insured_count, inquiry_id=inquiry_id_raw)
-        save_to_supabase(payload)
-        _LAST_RESULTS[doc_id] = payload  # dev fallback
-    except ExtractionError as e:
-        err_payload = _make_error_payload(
-            doc_id=doc_id,
-            insurer=insurer,
-            company=company,
-            insured_count=insured_count,
-            inquiry_id_raw=inquiry_id_raw,
-            original_name=original_name,
-            err=str(e),
-        )
-        save_to_supabase(err_payload)
-        _LAST_RESULTS[doc_id] = err_payload
-        rec = _jobs.get(job_id)
-        if rec is not None:
-            rec["errors"].append({"document_id": doc_id, "error": str(e)})
+        ok, err = save_to_supabase(payload)
+        if not ok:
+            rec = _jobs.get(job_id)
+            if rec is not None:
+                rec["errors"].append({"document_id": doc_id, "error": f"supabase_insert: {err}"})
     except Exception as e:
-        err_payload = _make_error_payload(
-            doc_id=doc_id,
-            insurer=insurer,
-            company=company,
-            insured_count=insured_count,
-            inquiry_id_raw=inquiry_id_raw,
-            original_name=original_name,
-            err=f"Unexpected error: {e}",
-        )
-        save_to_supabase(err_payload)
-        _LAST_RESULTS[doc_id] = err_payload
+        # record extraction failure
         rec = _jobs.get(job_id)
         if rec is not None:
-            rec["errors"].append({"document_id": doc_id, "error": f"{e.__class__.__name__}: {e}"})
+            rec["errors"].append({"document_id": doc_id, "error": f"extract: {e}"})
+        # store minimal error payload for fallback visibility
+        payload = {
+            "document_id": doc_id,
+            "original_filename": original_name,
+            "programs": [],
+            "_error": f"extract: {e}",
+        }
+        _inject_meta(payload, insurer=insurer, company=company, insured_count=insured_count, inquiry_id=inquiry_id_raw)
+        _LAST_RESULTS[doc_id] = payload
     finally:
         rec = _jobs.get(job_id)
         if rec is not None:
@@ -594,13 +553,16 @@ def offers_by_inquiry(inquiry_id: int):
             )
             rows = res.data or []
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Supabase error: {e}")
+            # fallback to memory if DB fails
+            print(f"[warn] Supabase by-inquiry failed: {e}")
+            rows = []
     else:
         rows = []
-        for p in _LAST_RESULTS.values():
-            for r in _rows_for_offers_table(p):
-                if r.get("inquiry_id") == inquiry_id:
-                    rows.append(r)
+    # also scan fallback
+    for p in _LAST_RESULTS.values():
+        for r in _rows_for_offers_table(p):
+            if r.get("inquiry_id") == inquiry_id:
+                rows.append(r)
     return _aggregate_offers_rows(rows)
 
 # -------------------------------
@@ -691,11 +653,7 @@ def get_share_token_only(token: str):
 
     payload = share.get("payload") or {}
     mode = payload.get("mode") or "snapshot"
-    resp: Dict[str, Any] = {
-        "ok": True,
-        "token": token,
-        "payload": payload,
-    }
+    resp: Dict[str, Any] = {"ok": True, "token": token, "payload": payload}
 
     if mode == "snapshot" and payload.get("results"):
         resp["offers"] = payload["results"]
@@ -706,3 +664,30 @@ def get_share_token_only(token: str):
         resp["offers"] = []
 
     return resp
+
+# -------------------------------
+# Debug helpers
+# -------------------------------
+@app.get("/debug/last-results")
+def debug_last_results():
+    """List doc_ids held in memory and their basic status."""
+    out = []
+    for doc_id, p in _LAST_RESULTS.items():
+        status = "parsed" if (p.get("programs") or []) else "error"
+        out.append({
+            "document_id": doc_id,
+            "original_filename": p.get("original_filename"),
+            "status": status,
+            "error": p.get("_error"),
+            "insurer_hint": p.get("insurer_hint"),
+            "company_name": p.get("company_name"),
+            "employee_count": p.get("employee_count"),
+        })
+    return out
+
+@app.get("/debug/doc/{doc_id}")
+def debug_doc(doc_id: str):
+    p = _LAST_RESULTS.get(doc_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="not found")
+    return p
