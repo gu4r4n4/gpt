@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 import uuid
 import secrets
+import unicodedata
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 
@@ -24,7 +26,7 @@ except Exception:  # pragma: no cover
 from app.gpt_extractor import extract_offer_from_pdf_bytes, ExtractionError
 
 APP_NAME = "GPT Offer Extractor"
-APP_VERSION = "0.9.2"
+APP_VERSION = "0.9.3"
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
@@ -57,9 +59,9 @@ if _SUPABASE_URL and _SUPABASE_KEY and create_client is not None:
 # -------------------------------
 # In-memory helpers (single process)
 # -------------------------------
-_jobs: Dict[str, Dict[str, Any]] = {}        # job_id -> { total, done, errors, docs: [doc_ids...] }
-_LAST_RESULTS: Dict[str, Dict[str, Any]] = {}  # doc_id -> payload (dev fallback)
-_SHARES_FALLBACK: Dict[str, Dict[str, Any]] = {}  # token -> row
+_jobs: Dict[str, Dict[str, Any]] = {}            # job_id -> { total, done, errors, docs: [doc_ids...] }
+_LAST_RESULTS: Dict[str, Dict[str, Any]] = {}    # doc_id -> payload (dev fallback)
+_SHARES_FALLBACK: Dict[str, Dict[str, Any]] = {} # token -> row
 
 # -------------------------------
 # Health & root
@@ -79,6 +81,31 @@ def healthz():
 @app.get("/")
 def root():
     return {"ok": True}
+
+# -------------------------------
+# Filename sanitization (SAFE doc_id)
+# -------------------------------
+_SAFE_DOC_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
+
+def _safe_filename(name: str) -> str:
+    """
+    Convert user filename to a safe ASCII variant so doc_ids are stable and queryable.
+    Keeps extension; normalizes diacritics; replaces runs of bad chars with '_'.
+    """
+    name = unicodedata.normalize("NFKD", name or "").encode("ascii", "ignore").decode("ascii")
+    base = os.path.basename(name or "uploaded.pdf")
+    root, ext = os.path.splitext(base)
+    root = _SAFE_DOC_CHARS.sub("_", root).strip("._")
+    root = re.sub(r"_+", "_", root)
+    root = root[:100] or "uploaded"
+    ext = ext if ext else ".pdf"
+    return f"{root}{ext}"
+
+def _make_doc_id(prefix: str, idx: int, filename: str) -> str:
+    """
+    Build the unique document_id used across the system and saved in offers.filename.
+    """
+    return f"{prefix}::{idx}::{_safe_filename(filename)}"
 
 # -------------------------------
 # Utilities
@@ -112,13 +139,13 @@ def _rows_for_offers_table(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             "company_hint": hint,             # dropdown hint
             "program_code": prog.get("program_code"),
             "source": "api",
-            "filename": doc_id,               # UNIQUE per run
+            "filename": doc_id,               # UNIQUE per run (sanitized)
             "inquiry_id": inquiry_id,         # nullable
             "base_sum_eur": prog.get("base_sum_eur"),
             "premium_eur": prog.get("premium_eur"),
             "payment_method": prog.get("payment_method"),
             "features": prog.get("features") or {},
-            "raw_json": payload,              # provenance/debug
+            "raw_json": payload,              # provenance/debug (includes original_filename)
             "status": "parsed",
             "error": None,
             "company_name": company_name,
@@ -209,16 +236,18 @@ async def extract_pdf(
     insured_count: int = Form(0),
     inquiry_id: str = Form(""),
 ):
-    if not file.filename.lower().endswith(".pdf"):
+    if not (file.filename or "").lower().endswith(".pdf"):
         raise HTTPException(status_code=415, detail="PDF required")
 
     batch_id = str(uuid.uuid4())
-    doc_id = f"{batch_id}::1::{file.filename or 'uploaded.pdf'}"
+    doc_id = _make_doc_id(batch_id, 1, file.filename or "uploaded.pdf")
+    original_name = file.filename or "uploaded.pdf"
 
     data = await file.read()
     t0 = time.monotonic()
     try:
         payload = extract_offer_from_pdf_bytes(data, document_id=doc_id)
+        payload["original_filename"] = original_name  # for display in UI
         _inject_meta(payload, insurer=insurer, company=company, insured_count=insured_count, inquiry_id=inquiry_id)
         save_to_supabase(payload)
 
@@ -251,7 +280,7 @@ async def _parse_upload_form(request: Request) -> Dict[str, Any]:
     # files can be repeated; Starlette FormData supports getlist
     files: List[UploadFile] = form.getlist("files")
     if not files:
-        # Some clients send a single 'files' once; get() returns one UploadFile
+        # Some clients send a single 'files'; get() returns one UploadFile
         single = form.get("files")
         if isinstance(single, UploadFile):
             files = [single]
@@ -316,9 +345,11 @@ async def extract_multiple(request: Request):
             results.append({"document_id": f.filename, "error": "Unsupported file type (only PDF)"})
             continue
         try:
-            doc_id = f"{batch_id}::{idx}::{f.filename or 'uploaded.pdf'}"
+            doc_id = _make_doc_id(batch_id, idx, f.filename or "uploaded.pdf")
+            original_name = f.filename or "uploaded.pdf"
             data = await f.read()
             payload = extract_offer_from_pdf_bytes(data, document_id=doc_id)
+            payload["original_filename"] = original_name
             _inject_meta(payload, insurer=insurers[idx - 1] or "", company=company, insured_count=insured_count, inquiry_id=inquiry_id)
             save_to_supabase(payload)
             results.append(payload)
@@ -337,7 +368,7 @@ async def extract_multiple_async(request: Request, background_tasks: BackgroundT
     Asynchronous: returns a job_id + document_ids immediately.
     FE should poll:
       - GET /jobs/{job_id}   (optional; may 404 on restarts)
-      - POST /offers/by-documents   with returned document_ids
+      - POST /offers/by-documents with returned document_ids
     """
     parsed = await _parse_upload_form(request)
     files: List[UploadFile] = parsed["files"]
@@ -352,7 +383,7 @@ async def extract_multiple_async(request: Request, background_tasks: BackgroundT
     doc_ids: List[str] = []
     for idx, f in enumerate(files, start=1):
         filename = f.filename or "uploaded.pdf"
-        doc_id = f"{job_id}::{idx}::{filename}"
+        doc_id = _make_doc_id(job_id, idx, filename)
         doc_ids.append(doc_id)
         data = await f.read()
         background_tasks.add_task(
@@ -364,6 +395,7 @@ async def extract_multiple_async(request: Request, background_tasks: BackgroundT
             insured_count=insured_count,
             job_id=job_id,
             inquiry_id_raw=inquiry_id,
+            original_name=filename,
         )
 
     _jobs[job_id]["docs"] = doc_ids
@@ -377,9 +409,11 @@ def _process_pdf_bytes(
     insured_count: int,
     job_id: str,
     inquiry_id_raw: str,
+    original_name: str,
 ):
     try:
         payload = extract_offer_from_pdf_bytes(data, document_id=doc_id)
+        payload["original_filename"] = original_name
         _inject_meta(payload, insurer=insurer, company=company, insured_count=insured_count, inquiry_id=inquiry_id_raw)
         save_to_supabase(payload)
         _LAST_RESULTS[doc_id] = payload  # dev fallback
