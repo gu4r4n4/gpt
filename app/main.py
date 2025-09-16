@@ -27,7 +27,7 @@ except Exception:  # pragma: no cover
 from app.gpt_extractor import extract_offer_from_pdf_bytes, ExtractionError
 
 APP_NAME = "GPT Offer Extractor"
-APP_VERSION = "0.9.8"
+APP_VERSION = "0.9.9"
 
 # -------------------------------
 # Concurrency (faster than BackgroundTasks)
@@ -247,7 +247,8 @@ def _aggregate_offers_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def save_to_supabase(payload: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
-    """Insert one row per program into public.offers (or keep in memory if no Supabase)."""
+    """Insert one row per program into public.offers (or keep in memory if no Supabase).
+       Compatible with older supabase-py (no .select() after insert)."""
     doc_id = payload.get("document_id") or payload.get("source_file") or "uploaded.pdf"
     _LAST_RESULTS[doc_id] = payload  # keep a fallback copy regardless of DB
 
@@ -256,19 +257,22 @@ def save_to_supabase(payload: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
 
     try:
         rows = _rows_for_offers_table(payload)
-        # Ask PostgREST to return the inserted IDs explicitly
-        res = _supabase.table(_OFFERS_TABLE).insert(rows).select("id").execute()
-        # Remember inserted ids so fallback can still expose row_id
+        # 1) Plain insert (no .select() chaining)
+        res = _supabase.table(_OFFERS_TABLE).insert(rows).execute()
+
+        # 2) Collect inserted ids if the client returned them; otherwise, fetch by filename
+        ids: List[int] = []
         try:
             ids = [r["id"] for r in (res.data or []) if isinstance(r, dict) and "id" in r]
             if not ids:
-                # Fallback: fetch by filename if needed
-                q = _supabase.table(_OFFERS_TABLE).select("id").eq("filename", doc_id).execute()
-                ids = [r["id"] for r in (q.data or []) if "id" in r]
-            if ids:
-                _INSERTED_IDS[doc_id] = ids
+                q = _supabase.table(_OFFERS_TABLE).select("id,filename").eq("filename", doc_id).execute()
+                ids = [r["id"] for r in (q.data or []) if r.get("filename") == doc_id]
         except Exception:
-            pass
+            ids = []
+
+        if ids:
+            _INSERTED_IDS[doc_id] = ids  # lets fallback responses expose row_id
+
         return True, None
     except Exception as e:
         payload["_error"] = f"supabase_insert: {e}"
