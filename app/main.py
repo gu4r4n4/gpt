@@ -247,8 +247,10 @@ def _aggregate_offers_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def save_to_supabase(payload: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
-    """Insert one row per program into public.offers (or keep in memory if no Supabase).
-       Compatible with older supabase-py (no .select() after insert)."""
+    """
+    Insert one row per program into public.offers (or keep in memory if no Supabase).
+    Compatible with older supabase-py that doesn't support .insert(...).select(...).
+    """
     doc_id = payload.get("document_id") or payload.get("source_file") or "uploaded.pdf"
     _LAST_RESULTS[doc_id] = payload  # keep a fallback copy regardless of DB
 
@@ -257,23 +259,28 @@ def save_to_supabase(payload: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
 
     try:
         rows = _rows_for_offers_table(payload)
-        # 1) Plain insert (no .select() chaining)
-        res = _supabase.table(_OFFERS_TABLE).insert(rows).execute()
 
-        # 2) Collect inserted ids if the client returned them; otherwise, fetch by filename
-        ids: List[int] = []
+        # 1) INSERT without chaining .select()  (older supabase-py)
+        _supabase.table(_OFFERS_TABLE).insert(rows).execute()
+
+        # 2) Fetch inserted ids by filename so FE can PATCH using row_id
         try:
-            ids = [r["id"] for r in (res.data or []) if isinstance(r, dict) and "id" in r]
-            if not ids:
-                q = _supabase.table(_OFFERS_TABLE).select("id,filename").eq("filename", doc_id).execute()
-                ids = [r["id"] for r in (q.data or []) if r.get("filename") == doc_id]
+            q = (
+                _supabase.table(_OFFERS_TABLE)
+                .select("id")
+                .eq("filename", doc_id)
+                .order("id", desc=False)
+                .execute()
+            )
+            ids = [r["id"] for r in (q.data or []) if isinstance(r, dict) and "id" in r]
+            if ids:
+                _INSERTED_IDS[doc_id] = ids
         except Exception:
-            ids = []
-
-        if ids:
-            _INSERTED_IDS[doc_id] = ids  # lets fallback responses expose row_id
+            # best-effort; edits will still work because /offers/by-documents pulls from DB with ids
+            pass
 
         return True, None
+
     except Exception as e:
         payload["_error"] = f"supabase_insert: {e}"
         _LAST_RESULTS[doc_id] = payload
