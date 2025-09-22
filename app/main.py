@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any, Tuple
 
 from fastapi import (
-    FastAPI, File, UploadFile, HTTPException, Form, Request
+    FastAPI, File, UploadFile, HTTPException, Form, Request, Body
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -202,7 +202,7 @@ def _rows_for_offers_table(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "error": None,
                 "company_name": company_name,
                 "employee_count": int(employee_count) if isinstance(employee_count, (int, float)) else None,
-                # NEW multi-tenant fields (make sure columns exist)
+                # multi-tenant fields (ensure DB columns exist)
                 "org_id": org_id,
                 "created_by_user_id": created_by_user_id,
             })
@@ -223,7 +223,7 @@ def _rows_for_offers_table(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             "error": payload.get("_error") or "no programs",
             "company_name": company_name,
             "employee_count": int(employee_count) if isinstance(employee_count, (int, float)) else None,
-            # NEW multi-tenant fields
+            # multi-tenant fields
             "org_id": org_id,
             "created_by_user_id": created_by_user_id,
         })
@@ -251,7 +251,7 @@ def _aggregate_offers_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         # If this row has a program, collect it
         if (r.get("status") or "parsed") != "error":
             grouped[src]["programs"].append({
-                "row_id": r.get("id"),  # <-- needed for edits
+                "row_id": r.get("id"),  # <-- used by FE for edits
                 "insurer": r.get("insurer"),
                 "program_code": r.get("program_code"),
                 "base_sum_eur": r.get("base_sum_eur"),
@@ -633,6 +633,104 @@ def job_status(job_id: str):
         return job
 
 # -------------------------------
+# Templates API (create/list/instantiate)
+# -------------------------------
+@app.post("/templates")
+def create_template(
+    request: Request,
+    insurer: str = Form(""),
+    program_code: str = Form(""),
+    label: str = Form(""),
+    employees_bucket: int = Form(0),
+    defaults: Dict[str, Any] = Body({}, embed=True),  # { premium_eur, base_sum_eur, payment_method, features:{} }
+):
+    org_id, user_id = _ctx_ids(request)
+    if not _supabase:
+        raise HTTPException(status_code=503, detail="DB not configured")
+
+    row = {
+        "org_id": org_id,
+        "created_by_user_id": user_id,
+        "insurer": insurer or None,
+        "program_code": program_code or None,
+        "label": label or None,
+        "employees_bucket": int(employees_bucket) if employees_bucket else None,
+        "defaults": defaults or {},
+    }
+    res = _supabase.table("offer_templates").insert(row).execute()
+    return {"ok": True, "template": (res.data or [row])[0]}
+
+
+@app.get("/templates")
+def list_templates(request: Request, insurer: str = "", employees_bucket: int = 0, limit: int = 20):
+    org_id, _ = _ctx_ids(request)
+    if not _supabase:
+        return []
+    q = _supabase.table("offer_templates").select("*").eq("org_id", org_id)
+    if insurer:
+        q = q.eq("insurer", insurer)
+    if employees_bucket:
+        q = q.eq("employees_bucket", employees_bucket)
+    q = q.order("usage_count", desc=True).limit(limit)
+    res = q.execute()
+    return res.data or []
+
+
+@app.post("/templates/{template_id}/instantiate")
+def instantiate_template(template_id: int, request: Request, company: str = Form(""), insured_count: int = Form(0)):
+    """
+    Create an 'offers' group from a template (source='template', status='draft').
+    Returns a 'document_id' (so the FE can use offers/by-documents exactly like PDFs).
+    """
+    org_id, user_id = _ctx_ids(request)
+    if not _supabase:
+        raise HTTPException(status_code=503, detail="DB not configured")
+
+    t = _supabase.table("offer_templates").select("*").eq("id", template_id).limit(1).execute()
+    if not t.data:
+        raise HTTPException(status_code=404, detail="template not found")
+    tpl = t.data[0]
+
+    batch_id = str(uuid.uuid4())
+    doc_id = _make_doc_id(
+        batch_id,
+        1,
+        f"{tpl.get('insurer','template')}-{tpl.get('program_code') or 'DRAFT'}.tmpl.json"
+    )
+    defaults = tpl.get("defaults") or {}
+
+    # Insert one program row in public.offers
+    row = {
+        "insurer": tpl.get("insurer"),
+        "company_hint": tpl.get("insurer"),
+        "program_code": tpl.get("program_code"),
+        "source": "template",
+        "filename": doc_id,
+        "inquiry_id": None,
+        "base_sum_eur": _num(defaults.get("base_sum_eur")),
+        "premium_eur": _num(defaults.get("premium_eur")),
+        "payment_method": defaults.get("payment_method"),
+        "features": defaults.get("features") or {},
+        "raw_json": {"template_id": template_id, "template_label": tpl.get("label")},
+        "status": "draft",
+        "error": None,
+        "company_name": company or "-",
+        "employee_count": int(insured_count) if insured_count else None,
+        # multi-tenant stamps
+        "org_id": org_id,
+        "created_by_user_id": user_id,
+    }
+    _supabase.table(_OFFERS_TABLE).insert(row).execute()
+
+    # bump usage (optional RPC; ignore if not present)
+    try:
+        _supabase.rpc("increment_template_usage", {"t_id": template_id}).execute()
+    except Exception:
+        pass
+
+    return {"ok": True, "document_id": doc_id}
+
+# -------------------------------
 # Read/Update offers
 # -------------------------------
 class DocsBody(BaseModel):
@@ -735,6 +833,11 @@ class ShareCreateBody(BaseModel):
     document_ids: Optional[List[str]] = None
     results: Optional[List[Dict[str, Any]]] = None
     expires_in_hours: Optional[int] = Field(720, ge=0, description="0 = never expires")
+    # optional flags for role/permissions and insurer filtering
+    editable: Optional[bool] = None
+    role: Optional[str] = None
+    allow_edit_fields: Optional[List[str]] = None
+    insurer_only: Optional[str] = None
 
 def _gen_token() -> str:
     return secrets.token_urlsafe(16)
@@ -752,6 +855,11 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
         "employees_count": body.employees_count,
         "document_ids": body.document_ids or [],
         "results": body.results if mode == "snapshot" else None,
+        # pass-through flags
+        "editable": body.editable,
+        "role": body.role,
+        "allow_edit_fields": body.allow_edit_fields,
+        "insurer_only": body.insurer_only,
     }
 
     expires_at = None
@@ -787,7 +895,7 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
 
 @app.get("/shares/{token}", name="get_share_token_only")
 def get_share_token_only(token: str):
-    """Return snapshot results or dynamic offers for a token."""
+    """Return snapshot results or dynamic offers for a token (with optional insurer-only filtering)."""
     share: Optional[Dict[str, Any]] = None
     if _supabase:
         try:
@@ -808,13 +916,23 @@ def get_share_token_only(token: str):
     resp: Dict[str, Any] = {"ok": True, "token": token, "payload": payload}
 
     if mode == "snapshot" and payload.get("results"):
-        resp["offers"] = payload["results"]
+        offers = payload["results"]
     elif mode == "by-documents":
         doc_ids = payload.get("document_ids") or []
-        resp["offers"] = _offers_by_document_ids(doc_ids)
+        offers = _offers_by_document_ids(doc_ids)
     else:
-        resp["offers"] = []
+        offers = []
 
+    # Optional: filter to a single insurer for insurer-confirmation links
+    insurer_only = (payload.get("insurer_only") or "").strip()
+    if insurer_only:
+        for g in offers:
+            g["programs"] = [p for p in (g.get("programs") or []) if (p.get("insurer") or "") == insurer_only]
+
+    resp["offers"] = offers
+    resp["editable"] = bool(payload.get("editable"))
+    resp["role"] = payload.get("role") or "broker"
+    resp["allow_edit_fields"] = payload.get("allow_edit_fields") or []
     return resp
 
 # -------------------------------
