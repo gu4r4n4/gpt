@@ -27,7 +27,7 @@ except Exception:  # pragma: no cover
 from app.gpt_extractor import extract_offer_from_pdf_bytes, ExtractionError
 
 APP_NAME = "GPT Offer Extractor"
-APP_VERSION = "0.9.9"
+APP_VERSION = "0.9.10"
 
 # -------------------------------
 # Concurrency (faster than BackgroundTasks)
@@ -73,6 +73,24 @@ _SHARES_FALLBACK: Dict[str, Dict[str, Any]] = {} # token -> row
 _INSERTED_IDS: Dict[str, List[int]] = {}         # doc_id -> [row ids] (to expose row_id even if we fall back)
 
 # -------------------------------
+# Context helpers: org/user from headers
+# -------------------------------
+def _ctx_ids(request: Optional[Request]) -> Tuple[Optional[int], Optional[int]]:
+    if not request:
+        return None, None
+    org = request.headers.get("X-Org-Id")
+    usr = request.headers.get("X-User-Id")
+    try:
+        org_id = int(org) if org is not None and str(org).isdigit() else None
+    except Exception:
+        org_id = None
+    try:
+        user_id = int(usr) if usr is not None and str(usr).isdigit() else None
+    except Exception:
+        user_id = None
+    return org_id, user_id
+
+# -------------------------------
 # Health & root
 # -------------------------------
 @app.get("/healthz")
@@ -115,7 +133,6 @@ def _make_doc_id(prefix: str, idx: int, filename: str) -> str:
 # -------------------------------
 # Utilities
 # -------------------------------
-
 def _num(v: Any) -> Optional[float]:
     """Best-effort numeric coercion. Returns None for blanks, dashes, N/A, etc."""
     if v is None:
@@ -137,7 +154,6 @@ def _num(v: Any) -> Optional[float]:
             return None
     return None
 
-
 def _inject_meta(payload: Dict[str, Any], *, insurer: str, company: str, insured_count: int, inquiry_id: str) -> None:
     """Attach meta to payload; inquiry_id is optional/nullable."""
     payload["insurer_hint"] = insurer or payload.get("insurer_hint") or "-"
@@ -146,7 +162,6 @@ def _inject_meta(payload: Dict[str, Any], *, insurer: str, company: str, insured
         insured_count if isinstance(insured_count, int) else payload.get("employee_count")
     )
     payload["inquiry_id"] = int(inquiry_id) if str(inquiry_id).isdigit() else None
-
 
 def _rows_for_offers_table(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
@@ -160,6 +175,8 @@ def _rows_for_offers_table(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     company_name = payload.get("company_name")
     employee_count = payload.get("employee_count")
     hint = payload.get("insurer_hint") or None
+    org_id = payload.get("_org_id")
+    created_by_user_id = payload.get("_user_id")
 
     rows: List[Dict[str, Any]] = []
     programs = payload.get("programs", []) or []
@@ -182,6 +199,9 @@ def _rows_for_offers_table(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "error": None,
                 "company_name": company_name,
                 "employee_count": int(employee_count) if isinstance(employee_count, (int, float)) else None,
+                # ownership
+                "org_id": org_id,
+                "created_by_user_id": created_by_user_id,
             })
     else:
         rows.append({
@@ -200,9 +220,11 @@ def _rows_for_offers_table(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             "error": payload.get("_error") or "no programs",
             "company_name": company_name,
             "employee_count": int(employee_count) if isinstance(employee_count, (int, float)) else None,
+            # ownership
+            "org_id": org_id,
+            "created_by_user_id": created_by_user_id,
         })
     return rows
-
 
 def _aggregate_offers_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Aggregate DB rows to the FE shape grouped by source_file (document_id)."""
@@ -245,7 +267,6 @@ def _aggregate_offers_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             g["error"] = "no programs"
     return list(grouped.values())
 
-
 def save_to_supabase(payload: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     """
     Insert one row per program into public.offers (or keep in memory if no Supabase).
@@ -287,7 +308,6 @@ def save_to_supabase(payload: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
         print(f"[warn] Supabase insert failed for {doc_id}: {e}")
         return False, str(e)
 
-
 def _rows_from_fallback(doc_ids: List[str]) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for doc_id in doc_ids:
@@ -306,8 +326,7 @@ def _rows_from_fallback(doc_ids: List[str]) -> List[Dict[str, Any]]:
         rows.extend(rs)
     return rows
 
-
-def _offers_by_document_ids(doc_ids: List[str]) -> List[Dict[str, Any]]:
+def _offers_by_document_ids(doc_ids: List[str], *, org_id: Optional[int]) -> List[Dict[str, Any]]:
     """Query offers by exact document_id list (stored in 'filename'). Falls back to memory if empty/error."""
     if not doc_ids:
         return []
@@ -315,12 +334,10 @@ def _offers_by_document_ids(doc_ids: List[str]) -> List[Dict[str, Any]]:
     used_fallback = False
     if _supabase:
         try:
-            res = (
-                _supabase.table(_OFFERS_TABLE)
-                .select("*")
-                .in_("filename", doc_ids)
-                .execute()  # removed ORDER BY created_at for speed
-            )
+            q = _supabase.table(_OFFERS_TABLE).select("*").in_("filename", doc_ids)
+            if org_id is not None:
+                q = q.eq("org_id", org_id)
+            res = q.execute()  # removed ORDER BY created_at for speed
             rows = res.data or []
         except Exception as e:
             print(f"[warn] Supabase select failed: {e}")
@@ -340,6 +357,7 @@ def _offers_by_document_ids(doc_ids: List[str]) -> List[Dict[str, Any]]:
 # -------------------------------
 @app.post("/extract/pdf")
 async def extract_pdf(
+    request: Request,
     file: UploadFile = File(...),
     insurer: str = Form(""),
     company: str = Form(""),
@@ -348,6 +366,8 @@ async def extract_pdf(
 ):
     if not (file.filename or "").lower().endswith(".pdf"):
         raise HTTPException(status_code=415, detail="PDF required")
+
+    org_id, user_id = _ctx_ids(request)
 
     batch_id = str(uuid.uuid4())
     doc_id = _make_doc_id(batch_id, 1, file.filename or "uploaded.pdf")
@@ -358,6 +378,9 @@ async def extract_pdf(
     try:
         payload = extract_offer_from_pdf_bytes(data, document_id=doc_id)
         payload["original_filename"] = original_name
+        # ownership into payload
+        payload["_org_id"] = org_id
+        payload["_user_id"] = user_id
         _inject_meta(payload, insurer=insurer, company=company, insured_count=insured_count, inquiry_id=inquiry_id)
         ok, err = save_to_supabase(payload)
         payload["_timings"] = {"total_s": round(time.monotonic() - t0, 3)}
@@ -369,6 +392,8 @@ async def extract_pdf(
             "original_filename": original_name,
             "programs": [],
             "_error": f"ExtractionError: {e}",
+            "_org_id": org_id,
+            "_user_id": user_id,
         }
         _inject_meta(payload, insurer=insurer, company=company, insured_count=insured_count, inquiry_id=inquiry_id)
         _LAST_RESULTS[doc_id] = payload
@@ -419,7 +444,6 @@ async def _parse_upload_form(request: Request) -> Dict[str, Any]:
         "inquiry_id": inquiry_id,
     }
 
-
 @app.post("/extract/multiple")
 async def extract_multiple(request: Request):
     parsed = await _parse_upload_form(request)
@@ -428,6 +452,8 @@ async def extract_multiple(request: Request):
     company: str = parsed["company"]
     insured_count: int = parsed["insured_count"]
     inquiry_id: str = parsed["inquiry_id"]
+
+    org_id, user_id = _ctx_ids(request)
 
     batch_id = str(uuid.uuid4())
     results: List[Dict[str, Any]] = []
@@ -445,6 +471,8 @@ async def extract_multiple(request: Request):
             t0 = time.monotonic()
             payload = extract_offer_from_pdf_bytes(data, document_id=doc_id)
             payload["original_filename"] = original_name
+            payload["_org_id"] = org_id
+            payload["_user_id"] = user_id
             _inject_meta(payload, insurer=insurers[idx - 1] or "", company=company, insured_count=insured_count, inquiry_id=inquiry_id)
             ok, err = save_to_supabase(payload)
             payload["_persist"] = "supabase" if ok else f"fallback: {err}"
@@ -457,6 +485,8 @@ async def extract_multiple(request: Request):
                 "original_filename": filename,
                 "programs": [],
                 "_error": f"ExtractionError: {e}",
+                "_org_id": org_id,
+                "_user_id": user_id,
             }
             _inject_meta(payload, insurer=insurers[idx - 1] or "", company=company, insured_count=insured_count, inquiry_id=inquiry_id)
             _LAST_RESULTS[doc_id] = payload
@@ -466,7 +496,6 @@ async def extract_multiple(request: Request):
 
     return JSONResponse({"documents": doc_ids, "results": results})
 
-
 @app.post("/extract/multiple-async", status_code=202)
 async def extract_multiple_async(request: Request):
     parsed = await _parse_upload_form(request)
@@ -475,6 +504,8 @@ async def extract_multiple_async(request: Request):
     company: str = parsed["company"]
     insured_count: int = parsed["insured_count"]
     inquiry_id: str = parsed["inquiry_id"]
+
+    org_id, user_id = _ctx_ids(request)
 
     job_id = str(uuid.uuid4())
     with _JOBS_LOCK:
@@ -498,12 +529,13 @@ async def extract_multiple_async(request: Request):
             inquiry_id_raw=inquiry_id,
             original_name=filename,
             enq_ts=time.monotonic(),
+            org_id=org_id,
+            user_id=user_id,
         )
 
     with _JOBS_LOCK:
         _jobs[job_id]["docs"] = doc_ids
     return {"job_id": job_id, "accepted": len(files), "documents": doc_ids}
-
 
 def _process_pdf_bytes(
     data: bytes,
@@ -515,6 +547,8 @@ def _process_pdf_bytes(
     inquiry_id_raw: str,
     original_name: str,
     enq_ts: float,
+    org_id: Optional[int],
+    user_id: Optional[int],
 ):
     t_start = time.monotonic()
     with _JOBS_LOCK:
@@ -532,6 +566,8 @@ def _process_pdf_bytes(
         # DB timing (including meta injection)
         t_db0 = time.monotonic()
         payload["original_filename"] = original_name
+        payload["_org_id"] = org_id
+        payload["_user_id"] = user_id
         _inject_meta(payload, insurer=insurer, company=company, insured_count=insured_count, inquiry_id=inquiry_id_raw)
         ok, err = save_to_supabase(payload)
         t_db = time.monotonic() - t_db0
@@ -547,7 +583,7 @@ def _process_pdf_bytes(
         with _JOBS_LOCK:
             rec = _jobs.get(job_id)
             if rec is not None:
-                rec["timings"].setdefault(doc_id, {}).update(payload["_timings"]) 
+                rec["timings"].setdefault(doc_id, {}).update(payload["_timings"])
                 if not ok:
                     rec["errors"].append({"document_id": doc_id, "error": f"supabase_insert: {err}"})
     except Exception as e:
@@ -563,6 +599,8 @@ def _process_pdf_bytes(
             "programs": [],
             "_error": f"extract: {e}",
             "_timings": {"total_s": round(time.monotonic() - t_start, 3)},
+            "_org_id": org_id,
+            "_user_id": user_id,
         }
         _inject_meta(payload, insurer=insurer, company=company, insured_count=insured_count, inquiry_id=inquiry_id_raw)
         _LAST_RESULTS[doc_id] = payload
@@ -571,7 +609,6 @@ def _process_pdf_bytes(
             rec = _jobs.get(job_id)
             if rec is not None:
                 rec["done"] += 1
-
 
 @app.get("/jobs/{job_id}")
 def job_status(job_id: str):
@@ -587,21 +624,20 @@ def job_status(job_id: str):
 class DocsBody(BaseModel):
     document_ids: List[str]
 
-
 @app.post("/offers/by-documents")
-def offers_by_documents(body: DocsBody):
-    return _offers_by_document_ids(body.document_ids)
-
+def offers_by_documents(body: DocsBody, request: Request):
+    org_id, _ = _ctx_ids(request)
+    return _offers_by_document_ids(body.document_ids, org_id=org_id)
 
 @app.get("/offers/by-job/{job_id}")
-def offers_by_job(job_id: str):
+def offers_by_job(job_id: str, request: Request):
     with _JOBS_LOCK:
         job = _jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
     doc_ids = job.get("docs") or []
-    return _offers_by_document_ids(doc_ids)
-
+    org_id, _ = _ctx_ids(request)
+    return _offers_by_document_ids(doc_ids, org_id=org_id)
 
 class OfferUpdateBody(BaseModel):
     premium_eur: Optional[Any] = None
@@ -611,11 +647,13 @@ class OfferUpdateBody(BaseModel):
     insurer: Optional[str] = None
     program_code: Optional[str] = None
 
-
 @app.patch("/offers/{offer_id}")
-def update_offer(offer_id: int, body: OfferUpdateBody):
+def update_offer(offer_id: int, body: OfferUpdateBody, request: Request):
     if not _supabase:
         raise HTTPException(status_code=503, detail="DB not configured")
+
+    # optional safety: scope update to org if provided
+    org_id, _ = _ctx_ids(request)
 
     updates: Dict[str, Any] = {}
     if body.premium_eur is not None:
@@ -641,7 +679,10 @@ def update_offer(offer_id: int, body: OfferUpdateBody):
         raise HTTPException(status_code=400, detail="no changes provided")
 
     try:
-        res = _supabase.table(_OFFERS_TABLE).update(updates).eq("id", offer_id).execute()
+        q = _supabase.table(_OFFERS_TABLE).update(updates).eq("id", offer_id)
+        if org_id is not None:
+            q = q.eq("org_id", org_id)
+        res = q.execute()
         rows = res.data or []
         if not rows:
             raise HTTPException(status_code=404, detail="offer not found")
@@ -649,18 +690,21 @@ def update_offer(offer_id: int, body: OfferUpdateBody):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"update failed: {e}")
 
-
 # (legacy — still available)
 @app.get("/offers/by-inquiry/{inquiry_id}")
-def offers_by_inquiry(inquiry_id: int):
+def offers_by_inquiry(inquiry_id: int, request: Request):
+    org_id, _ = _ctx_ids(request)
+
     if _supabase:
         try:
-            res = (
+            q = (
                 _supabase.table(_OFFERS_TABLE)
                 .select("*")
                 .eq("inquiry_id", inquiry_id)
-                .execute()  # removed ORDER BY created_at for speed
             )
+            if org_id is not None:
+                q = q.eq("org_id", org_id)
+            res = q.execute()  # removed ORDER BY created_at for speed
             rows = res.data or []
         except Exception as e:
             print(f"[warn] Supabase by-inquiry failed: {e}")
@@ -670,7 +714,9 @@ def offers_by_inquiry(inquiry_id: int):
     for p in _LAST_RESULTS.values():
         for r in _rows_for_offers_table(p):
             if r.get("inquiry_id") == inquiry_id:
-                rows.append(r)
+                # best-effort org filter for fallback rows
+                if org_id is None or r.get("org_id") == org_id:
+                    rows.append(r)
     return _aggregate_offers_rows(rows)
 
 # -------------------------------
@@ -688,10 +734,10 @@ class ShareCreateBody(BaseModel):
 def _gen_token() -> str:
     return secrets.token_urlsafe(16)
 
-
 @app.post("/shares")
 def create_share_token_only(body: ShareCreateBody, request: Request):
     token = _gen_token()
+    org_id, user_id = _ctx_ids(request)
 
     mode = "snapshot" if (body.results and len(body.results) > 0) else "by-documents"
     payload = {
@@ -712,6 +758,9 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
         "inquiry_id": None,
         "payload": payload,
         "expires_at": expires_at,
+        # ownership
+        "org_id": org_id,
+        "created_by_user_id": user_id,
     }
 
     if _supabase:
@@ -732,7 +781,6 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
             url = f"/shares/{token}"
 
     return {"ok": True, "token": token, "url": url, "title": body.title}
-
 
 @app.get("/shares/{token}", name="get_share_token_only")
 def get_share_token_only(token: str):
@@ -760,7 +808,9 @@ def get_share_token_only(token: str):
         resp["offers"] = payload["results"]
     elif mode == "by-documents":
         doc_ids = payload.get("document_ids") or []
-        resp["offers"] = _offers_by_document_ids(doc_ids)
+        # scope by org from share row if present
+        org_id = share.get("org_id")
+        resp["offers"] = _offers_by_document_ids(doc_ids, org_id=org_id)
     else:
         resp["offers"] = []
 
@@ -782,9 +832,10 @@ def debug_last_results():
             "insurer_hint": p.get("insurer_hint"),
             "company_name": p.get("company_name"),
             "employee_count": p.get("employee_count"),
+            "_org_id": p.get("_org_id"),
+            "_user_id": p.get("_user_id"),
         })
     return out
-
 
 @app.get("/debug/doc/{doc_id}")
 def debug_doc(doc_id: str):
