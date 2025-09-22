@@ -915,6 +915,7 @@ def get_share_token_only(token: str):
     mode = payload.get("mode") or "snapshot"
     resp: Dict[str, Any] = {"ok": True, "token": token, "payload": payload}
 
+    # Build offers (snapshot or dynamic)
     if mode == "snapshot" and payload.get("results"):
         offers = payload["results"]
     elif mode == "by-documents":
@@ -924,15 +925,28 @@ def get_share_token_only(token: str):
         offers = []
 
     # Optional: filter to a single insurer for insurer-confirmation links
-    insurer_only = (payload.get("insurer_only") or "").strip()
+    def _norm(s: Optional[str]) -> str:
+        return (s or "").strip().lower()
+
+    insurer_only = _norm(payload.get("insurer_only"))
     if insurer_only:
-        for g in offers:
-            g["programs"] = [p for p in (g.get("programs") or []) if (p.get("insurer") or "") == insurer_only]
+        filtered = []
+        for g in offers or []:
+            progs = [p for p in (g.get("programs") or []) if _norm(p.get("insurer")) == insurer_only]
+            if progs:
+                ng = dict(g)
+                ng["programs"] = progs
+                filtered.append(ng)
+        offers = filtered
 
     resp["offers"] = offers
+    # mirror flags so FE can enforce permissions
     resp["editable"] = bool(payload.get("editable"))
     resp["role"] = payload.get("role") or "broker"
     resp["allow_edit_fields"] = payload.get("allow_edit_fields") or []
+    # helpful for debugging in FE
+    resp["filtered_insurer"] = payload.get("insurer_only") or ""
+
     return resp
 
 # -------------------------------
