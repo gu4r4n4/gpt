@@ -1,16 +1,19 @@
 # app/gpt_extractor.py
 """
 Robust extractor that:
-- Uploads the PDF to OpenAI Files and references it by file_id in Responses API (correct way; fixes 400 invalid file_data).
+- Uses Responses API with PDF as input_file (base64) when available.
 - If the SDK doesn't support response_format, retries without it.
 - If Responses path fails, falls back to Chat Completions with PDF text.
-- Always prunes unknown keys, validates against a strict schema,
-  then runs the normalizer (hard rules + PP folding).
-- If a PDF contains multiple base programs/variants, emits one programs[] item per variant
-  (heuristics for Many_* PDFs included).
+- Always prunes unknown keys, validates against a strict schema, then runs the normalizer (hard rules + PP folding).
+
+- PLUS (safe post-process):
+  If a PDF obviously contains multiple *base* variants inside the PAMATPROGRAMMA section,
+  synthesize one programs[] item per base variant. We explicitly stop before any PAPILD... section,
+  so premiums are never taken from add-ons.
 """
 
 from __future__ import annotations
+import base64
 import io
 import json
 import os
@@ -23,7 +26,7 @@ from jsonschema import Draft202012Validator
 from pypdf import PdfReader
 from openai import OpenAI
 
-from app.normalizer import normalize_offer_json
+from app.normalizer import normalize_offer_json  # <-- ensure normalizer is applied
 
 # =========================
 # STRICT JSON SCHEMA
@@ -131,7 +134,7 @@ FEATURE_NAMES: List[str] = [
 ]
 
 # =========================
-# Prompt
+# Prompts
 # =========================
 def _build_user_instructions(document_id: str) -> str:
     return f"""
@@ -140,9 +143,10 @@ DOCUMENT_ID: {document_id}
 TASK:
 Read the attached PDF (Latvian insurer offer) and return ONE JSON strictly matching the provided schema.
 Top-level keys allowed ONLY: document_id, insurer_code (optional), programs, warnings.
+DO NOT add any other keys like base_program, additional_programs, persons_count, etc.
 
 IMPORTANT:
-If the document contains MORE THAN ONE base program / variant (e.g., multiple rows in one summary table,
+If the document contains MORE THAN ONE base program / variant (e.g. multiple rows in one summary table,
 or sections titled "1. VARIANTS", "2. VARIANTS", etc.), you MUST return one item in programs[] for EACH variant.
 
 PROGRAM SHAPE (minimum per program item):
@@ -155,10 +159,15 @@ FEATURES TO EXTRACT (LV labels exactly as below):
 {chr(10).join(f"- {name}" for name in FEATURE_NAMES)}
 
 STRICT RULES (override inference):
-1) "Pakalpojuma apmaksas veids" MUST be exactly: "Saskaņā ar cenrādi".
-2) "Maksas grūtnieču aprūpe": if mentioned anywhere → "v", else "-".
-3) "Vakcinācija pret ērcēm un gripu": numeric limit → "limits <NUMBER> EUR"; inclusion only → "v"; else "-".
-4) Do NOT create separate Papildprogramma program items. Merge add-ons into base using these fields:
+1) "Pakalpojuma apmaksas veids" MUST be exactly: "Saskaņā ar cenrādi". Do not infer other text.
+2) "Maksas grūtnieču aprūpe":
+   - Search for "Grūtnieču aprūpe" vai "grūtniecības aprūpe".
+   - If mentioned at all → return "v", else return "-".
+3) "Vakcinācija pret ērcēm un gripu":
+   - Search for the keyword "ērču" (e.g., "ērču encefalīta vakcīna").
+   - If a limit is stated, return a textual limit like "limits 70 EUR"; if only inclusion is stated, return "v"; otherwise return "-".
+   - Use the exact label spelling above ("ērcēm", not "ērčiem").
+4) Do NOT create separate Papildprogramma program items. Merge any additional coverage into the base program using these fields:
    - "Zobārstniecība ar 50% atlaidi, apdrošinājuma summa (pp)"
    - "Ambulatorā rehabilitācija (pp)"
    - "Medikamenti ar 50% atlaidi"
@@ -168,6 +177,17 @@ STRICT RULES (override inference):
 5) If a value is not clearly present in the PDF, set "-".
 6) Do not invent "Programmas kods"; if none, use "-".
 7) "Pacientu iemaksa": use "100%" if the document doesn't explicitly state a different value.
+
+FEATURE-SPECIFIC FIND LOGIC (apply these when filling feature values):
+1) "Maksas diagnostika, piem., rentgens, elektrokradiogramma, USG, utml.": search for "diagnostika". If included anywhere in covered services → "v"; otherwise "-".
+2) "Obligātās veselības pārbaudes, limits EUR": search "Obligātās veselības pārbaudes"/"OVP". If included → "100%"; otherwise "-".
+3) "Procedūras": search "Procedūras". If a quantitative/percent limit is present, return it verbatim (e.g., "10 reizes", "80%"). If included without a limit → "v". If absent → "-".
+4) "Vakcinācija, limits EUR": search "Vakcinācija". If a numeric limit is present, return as "limits <NUMBER> EUR". If only inclusion is stated → "v". If absent → "-".
+5) "Vakcinācija pret ērcēm un gripu": per rule (3) above.
+6) "Medikamenti ar 50% atlaidi": search "Medikamenti"/"Medikamentu". If numeric limit present, return "<NUMBER> EUR limits"; else "v" if included; else "-".
+7) "Sports": search "Sports"/"Sporta". If numeric limit present, return "<NUMBER> EUR limits"; else "v" if included; else "-".
+8) "Kritiskās saslimšanas": if an amount is stated return "<NUMBER> EUR limits"; else "v" if included; else "-".
+9) "Maksas stacionārie pakalpojumi, limits EUR (pp)": if ANY of these keywords appears — "Maksas stacionārie pakalpojumi", "MAKSAS STACIONĀRS", "Maksas pakalpojumi stacionārā", "Maksas stacionāra pakalpojumi" — return "ir iekļauts"; otherwise "-".
 
 OUTPUT:
 Return STRICT JSON conforming to the schema. No markdown or prose.
@@ -187,8 +207,8 @@ def _pdf_to_text_pages(pdf_bytes: bytes, max_pages: int = 40) -> List[str]:
         pages.append(txt.replace("\u00A0", " ").replace("\r", "\n")[:20000])
     return pages
 
+# numeric helpers
 _MONEY_RE = re.compile(r"^\s*([0-9]{1,3}(?:[ .][0-9]{3})*|[0-9]+)(?:[.,]([0-9]{1,2}))?\s*(?:eur|€)?\s*$", re.IGNORECASE)
-
 def _parse_money_like(s: str) -> Optional[float]:
     m = _MONEY_RE.match((s or "").strip().replace("\u00A0", " "))
     if not m:
@@ -262,7 +282,7 @@ def _prune_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         if q.get("program_code") and "features" in q:
             norm_programs.append(q)
 
-    # legacy fallback
+    # legacy fallback shape
     if not norm_programs:
         bp = payload.get("base_program")
         if isinstance(bp, dict):
@@ -281,101 +301,114 @@ def _prune_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 # =========================
-# Heuristics: detect multi-variant PDFs from raw text
+# Heuristics: multi-variant detection (BASE ONLY)
 # =========================
-_VARIANTS_SPLIT_RE = re.compile(r"(?mi)^\s*\d+\.\s*VARIANTS?\b.*$", re.MULTILINE)
-_TABLE_HEADER_HINTS = (
+
+# Case-insensitive markers for section boundaries
+_PAMAT_MARK = re.compile(r"\bPAMATPROGRAMMA\b|\bPamatprogramma\b", re.IGNORECASE)
+_PAPILD_MARK = re.compile(r"\bPAPILDPROGRAMMAS?\b|\bPapildprogrammas?\b|\bPapildprogramma\b", re.IGNORECASE)
+
+# Header hints inside the base table block
+_BASE_HEADER_HINTS = (
     "Programmas nosaukums",
-    "Apdrošinājuma summa",
-    "Prēmija",
+    "Apdrošinājuma summa",  # includes "Apdrošinājuma summa vienai personai"
+    "Prēmija",              # includes "Prēmija vienai personai, EUR"
 )
-_ROW_RE = re.compile(
-    r"^\s*(?P<name>[A-Za-zĀČĒĢĪĶĻŅŌŖŠŪŽāčēģīķļņōŗšūž0-9+/\-()., ]{3,})\s+"
-    r"(?:(?P<count>\d+)\s+)?"
+
+# Row pattern: NAME ... BASE_SUM ... PREMIUM (keep permissive for diacritics & symbols)
+_BASE_ROW_RE = re.compile(
+    r"^\s*(?P<name>[A-Za-zĀČĒĢĪĶĻŅŌŖŠŪŽāčēģīķļņōŗšūž0-9+/\-()., ]{3,}?)\s+"
     r"(?P<sum>[0-9]{3,5}(?:[ .][0-9]{3})*(?:[.,][0-9]{2})?)\s+"
     r"(?P<premium>[0-9]{1,4}(?:[.,][0-9]{2})?)"
     r"(?:\s*(?:€|EUR))?\s*$",
     re.MULTILINE
 )
 
-def _pages_to_text(pdf_bytes: bytes) -> Tuple[str, List[str]]:
+def _pdf_pages_text(pdf_bytes: bytes) -> Tuple[str, List[str]]:
     pages = _pdf_to_text_pages(pdf_bytes)
     full = "\n".join(pages)
     return full, pages
 
-def _looks_like_table_block(block: str) -> bool:
+def _looks_like_base_header(block: str) -> bool:
     hit = 0
-    for h in _TABLE_HEADER_HINTS:
+    for h in _BASE_HEADER_HINTS:
         if h.lower() in block.lower():
             hit += 1
     return hit >= 2
 
-def _parse_rows_from_block(block: str) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for m in _ROW_RE.finditer(block):
+def _extract_pamat_block(full_text: str) -> Optional[str]:
+    """
+    Return the text slice from first PAMATPROGRAMMA marker up to the first PAPILD... marker.
+    """
+    m_start = _PAMAT_MARK.search(full_text)
+    if not m_start:
+        return None
+    start = m_start.start()
+    m_end = _PAPILD_MARK.search(full_text, m_start.end())
+    end = m_end.start() if m_end else len(full_text)
+    block = full_text[start:end]
+    return block
+
+def _parse_base_rows(block: str) -> List[Dict[str, Any]]:
+    """
+    Parse rows inside the PAMATPROGRAMMA block only.
+    Requires it to look like a base table by headers.
+    """
+    if not block or not _looks_like_base_header(block):
+        return []
+
+    rows: List[Dict[str, Any]] = []
+    for m in _BASE_ROW_RE.finditer(block):
         name = (m.group("name") or "").strip(" -\u200b")
         base_sum = _parse_money_like(m.group("sum") or "")
         premium = _parse_money_like(m.group("premium") or "")
         if not name or base_sum is None or premium is None:
             continue
-        out.append({"name": name, "base_sum": base_sum, "premium": premium})
-    return out
-
-def _detect_multi_programs_from_text(full_text: str) -> List[Dict[str, Any]]:
-    candidates: List[Dict[str, Any]] = []
-
-    # Table oriented
-    chunks = re.split(r"\n{2,}", full_text)
-    for ch in chunks:
-        if not _looks_like_table_block(ch):
+        # very common false-positive guard: ignore header-like names
+        if "Programmas" in name or "Apdrošinājuma" in name or "Prēmija" in name:
             continue
-        rows = _parse_rows_from_block(ch)
-        if len(rows) >= 2:
-            candidates.extend(rows)
+        rows.append({"name": name, "base_sum": base_sum, "premium": premium})
 
-    # "N. VARIANTS" style
-    if not candidates:
-        parts = _VARIANTS_SPLIT_RE.split(full_text)
-        variant_parts = [p for p in parts if "Programmas nosaukums" in p and ("Prēmija" in p or "Prēmija vienai" in p)]
-        for vp in variant_parts:
-            name = None
-            for line in vp.splitlines():
-                t = line.strip()
-                if len(t) >= 3 and re.search(r"[A-Za-zĀČĒĢĪĶĻŅŌŖŠŪŽāčēģīķļņōŗšūž]", t):
-                    if "Programmas" in t or "Apdrošinājuma" in t or "Prēmija" in t:
-                        continue
-                    name = t
-                    break
-            nums = re.findall(r"([0-9]{3,5}(?:[ .][0-9]{3})*(?:[.,][0-9]{2})?)\s*(?:€|EUR)?", vp)
-            base_sum = _parse_money_like(nums[0]) if nums else None
-            premium = _parse_money_like(nums[1]) if len(nums) > 1 else None
-            if name and base_sum is not None and premium is not None:
-                candidates.append({"name": name, "base_sum": base_sum, "premium": premium})
+    # Return only if we are clearly seeing multiple offers
+    return rows if len(rows) >= 2 else []
 
-    uniq: Dict[Tuple[str, float, float], Dict[str, Any]] = {}
-    for c in candidates:
-        key = (c["name"], float(c["base_sum"]), float(c["premium"]))
-        uniq[key] = c
-    return list(uniq.values())
+def _detect_base_programs_from_text(full_text: str) -> List[Dict[str, Any]]:
+    """
+    Conservative detector that ONLY scans the PAMATPROGRAMMA section and returns
+    a list of base variants (name, base_sum, premium). It stops before any PAPILD... section.
+    """
+    block = _extract_pamat_block(full_text)
+    if not block:
+        return []
+    return _parse_base_rows(block)
 
 def _ensure_features_minimal(prog: Dict[str, Any]) -> Dict[str, Any]:
     feats = prog.get("features") or {}
     if not isinstance(feats, dict) or not feats:
         feats = {}
+    # always ensure Programmas nosaukums present
     name = prog.get("program_code") or "-"
     feats.setdefault("Programmas nosaukums", {"value": name})
+    # optionally attach base sum into features (UI consistency)
     if prog.get("base_sum_eur", "-") != "-":
         feats.setdefault("Apdrošinājuma summa pamatpolisei, EUR", {"value": prog["base_sum_eur"]})
     prog["features"] = feats
     return prog
 
 def _augment_with_detected_variants(pruned_payload: Dict[str, Any], pdf_bytes: bytes) -> Dict[str, Any]:
+    """
+    If GPT returned a single program but the PDF text clearly contains multiple BASE variants
+    (inside PAMATPROGRAMMA), synthesize one programs[] per variant and keep the original features.
+    We explicitly do NOT read from PAPILDPROGRAMMAS to avoid wrong premiums.
+    """
     programs = pruned_payload.get("programs") or []
     if len(programs) >= 2:
-        return pruned_payload
+        return pruned_payload  # already multi-variant
 
-    full_text, _ = _pages_to_text(pdf_bytes)
-    detected = _detect_multi_programs_from_text(full_text)
+    full_text, _ = _pdf_pages_text(pdf_bytes)
+    detected = _detect_base_programs_from_text(full_text)
+
+    # Only intervene when we are confident there are ≥2 distinct base offers
     if len(detected) < 2:
         return pruned_payload
 
@@ -393,7 +426,7 @@ def _augment_with_detected_variants(pruned_payload: Dict[str, Any], pdf_bytes: b
             "program_code": d["name"],
             "base_sum_eur": d["base_sum"] if d["base_sum"] is not None else "-",
             "premium_eur": d["premium"] if d["premium"] is not None else "-",
-            "features": dict(base_features),
+            "features": dict(base_features),  # inherit original features (normalizer will handle PP folding)
         }
         prog = _ensure_features_minimal(prog)
         synthesized.append(prog)
@@ -401,7 +434,7 @@ def _augment_with_detected_variants(pruned_payload: Dict[str, Any], pdf_bytes: b
     out = dict(pruned_payload)
     out["programs"] = synthesized
     ws = list(out.get("warnings") or [])
-    ws.append("postprocess: multiple variants detected from PDF text; synthesized programs from summary table/sections")
+    ws.append("postprocess: multiple base variants detected in PAMATPROGRAMMA; synthesized programs from base table only")
     out["warnings"] = ws
     return out
 
@@ -426,20 +459,14 @@ class ExtractionError(Exception):
     pass
 
 # =========================
-# Core: Responses API path (with file upload → file_id)
+# Core: Responses API path
 # =========================
 def _responses_with_pdf(model: str, document_id: str, pdf_bytes: bytes, allow_schema: bool) -> Dict[str, Any]:
     client = _client_singleton()
-
-    # Upload the PDF first and reference by file_id (correct contract)
-    buf = io.BytesIO(pdf_bytes)
-    buf.name = (document_id or "document.pdf")
-    uploaded = client.files.create(file=buf, purpose="assistants")  # purpose used by Responses as well
-    file_id = uploaded.id
-
     content = [
         {"type": "input_text", "text": _build_user_instructions(document_id)},
-        {"type": "input_file", "file_id": file_id},
+        {"type": "input_file", "filename": document_id or "document.pdf",
+         "file_data": base64.b64encode(pdf_bytes).decode("ascii")},
     ]
 
     kwargs: Dict[str, Any] = {
@@ -454,25 +481,16 @@ def _responses_with_pdf(model: str, document_id: str, pdf_bytes: bytes, allow_sc
 
     resp = client.responses.create(**kwargs)
 
-    # Prefer parsed if present
     payload = getattr(resp, "output_parsed", None)
     if payload is not None:
         return payload
 
-    # Fallback to text
-    raw = None
-    raw = getattr(resp, "output_text", None) or raw
-    if not raw:
-        # very defensive: stitch anything we can find
-        parts: List[str] = []
-        out = getattr(resp, "output", None)
-        if isinstance(out, list):
-            for item in out:
-                t = getattr(item, "content", None)
-                if isinstance(t, str):
-                    parts.append(t)
-        raw = "".join(parts) if parts else "{}"
-    raw = raw.strip() or "{}"
+    texts: List[str] = []
+    for item in getattr(resp, "output", []) or []:
+        t = getattr(item, "content", None)
+        if isinstance(t, str):
+            texts.append(t)
+    raw = "".join(texts).strip() or "{}"
     return json.loads(raw)
 
 # =========================
@@ -507,10 +525,13 @@ def _chat_with_text(model: str, document_id: str, pdf_bytes: bytes) -> Dict[str,
             ],
         )
         raw = resp.choices[0].message.content or "{}"
-        start, end = raw.find("{"), raw.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            return json.loads(raw[start:end + 1])
-        return {}
+        try:
+            return json.loads(raw)
+        except Exception:
+            start, end = raw.find("{"), raw.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                return json.loads(raw[start:end + 1])
+            raise
 
 # =========================
 # Public orchestration
@@ -519,7 +540,7 @@ def call_gpt_extractor(document_id: str, pdf_bytes: bytes, cfg: Optional[GPTConf
     cfg = cfg or GPTConfig()
     last_err: Optional[Exception] = None
 
-    # 1) Responses API with schema
+    # 1) Try Responses API with schema
     for attempt in range(cfg.max_retries + 1):
         try:
             payload = _responses_with_pdf(cfg.model, document_id, pdf_bytes, allow_schema=True)
@@ -572,19 +593,19 @@ def call_gpt_extractor(document_id: str, pdf_bytes: bytes, cfg: Optional[GPTConf
 
     raise ExtractionError(f"GPT extraction failed: {last_err}")
 
-# =========================
-# Public entry
-# =========================
+class ExtractionError(Exception):
+    pass
+
 def extract_offer_from_pdf_bytes(pdf_bytes: bytes, document_id: str) -> Dict[str, Any]:
     if not pdf_bytes or len(pdf_bytes) > 10 * 1024 * 1024:
         raise ExtractionError("PDF too large or empty (limit: 10MB)")
     # 1) Get raw (schema-pruned) payload from GPT
     raw = call_gpt_extractor(document_id=document_id, pdf_bytes=pdf_bytes)
-    # 2) Augment: split into multiple programs if PDF text clearly contains several variants
+    # 2) Augment: split into multiple BASE programs if PAMATPROGRAMMA shows several variants
     augmented = _augment_with_detected_variants(raw, pdf_bytes)
     # 3) Normalize (hard rules + PP folding + corrected labels)
     normalized = normalize_offer_json({
         **augmented,
-        "document_id": document_id,
+        "document_id": document_id,  # ensure filename propagates
     })
     return normalized
