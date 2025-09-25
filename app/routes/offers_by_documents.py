@@ -3,7 +3,7 @@ from typing import Any, Dict, List
 import os
 import json
 
-from fastapi import APIRouter, Body, HTTPException
+from fastapi import APIRouter, Body
 from sqlalchemy import create_engine, text
 
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -17,10 +17,10 @@ router = APIRouter(prefix="/offers", tags=["offers"])
 @router.post("/by-documents")
 def offers_by_documents(payload: Dict[str, Any] = Body(...)) -> List[Dict[str, Any]]:
     """
-    Input:  { "document_ids": ["Many_Gjensidige.pdf", "BAN-VA.pdf", ...] }
+    Input:  { "document_ids": ["<document_id>", ...] }
     Output: [
       {
-        "source_file": "Many_Gjensidige.pdf",
+        "source_file": "<document_id>",
         "inquiry_id": 123,
         "company_name": "...",
         "employee_count": 42,
@@ -33,18 +33,15 @@ def offers_by_documents(payload: Dict[str, Any] = Body(...)) -> List[Dict[str, A
             "premium_eur": 12.34,
             "payment_method": null,
             "features": {...}
-          },
-          ...
+          }
         ]
-      },
-      ...
+      }
     ]
     """
     document_ids = payload.get("document_ids") or []
     if not document_ids:
         return []
 
-    # Pull ALL offers for those filenames – no DISTINCT/LIMIT 1
     sql = text("""
         SELECT
           id,
@@ -97,8 +94,6 @@ def offers_by_documents(payload: Dict[str, Any] = Body(...)) -> List[Dict[str, A
             "features": features_obj or {},
         })
 
-    # Also return empty groups for filenames that exist in input but have no rows yet
-    # (helps the frontend keep consistent ordering)
     out = list(grouped.values())
     seen = set(grouped.keys())
     for fname in document_ids:
