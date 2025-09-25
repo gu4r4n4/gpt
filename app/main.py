@@ -25,6 +25,7 @@ except Exception:  # pragma: no cover
     Client = None  # type: ignore
 
 from app.gpt_extractor import extract_offer_from_pdf_bytes, ExtractionError
+from app.routes.offers_by_documents import router as offers_by_documents_router
 
 APP_NAME = "GPT Offer Extractor"
 APP_VERSION = "1.0.0"
@@ -37,6 +38,7 @@ EXEC: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=EXTRACT_WORKERS)
 _JOBS_LOCK = threading.Lock()
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
+app.include_router(offers_by_documents_router)  # << register SQLAlchemy router
 
 # -------------------------------
 # CORS (adjust for production)
@@ -732,14 +734,10 @@ def instantiate_template(template_id: int, request: Request, company: str = Form
 # -------------------------------
 # Read/Update offers
 # -------------------------------
-class DocsBody(BaseModel):
-    document_ids: List[str]
 
-
-@app.post("/offers/by-documents")
-def offers_by_documents(body: DocsBody):
-    return _offers_by_document_ids(body.document_ids)
-
+# NOTE: the old inline /offers/by-documents route was REMOVED.
+# The endpoint is now served exclusively by the SQLAlchemy router:
+# POST /offers/by-documents  (see app/routes/offers_by_documents.py)
 
 @app.get("/offers/by-job/{job_id}")
 def offers_by_job(job_id: str):
