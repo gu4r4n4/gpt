@@ -26,6 +26,7 @@ from openai import OpenAI
 
 from app.normalizer import normalize_offer_json  # <-- ensure normalizer is applied
 
+
 # =========================
 # STRICT JSON SCHEMA
 # =========================
@@ -88,6 +89,7 @@ INSURER_OFFER_SCHEMA: Dict[str, Any] = {
 }
 _SCHEMA_VALIDATOR = Draft202012Validator(INSURER_OFFER_SCHEMA)
 
+
 # =========================
 # Features list (prompt helper)
 # =========================
@@ -130,6 +132,7 @@ FEATURE_NAMES: List[str] = [
     "Kritiskās saslimšanas",
     "Maksas stacionārie pakalpojumi, limits EUR (pp)",
 ]
+
 
 # =========================
 # Prompts
@@ -191,6 +194,7 @@ OUTPUT:
 Return STRICT JSON conforming to the schema. No markdown or prose.
 """.strip()
 
+
 # =========================
 # Utils: PDF → text (for fallback), normalization & pruning
 # =========================
@@ -204,6 +208,7 @@ def _pdf_to_text_pages(pdf_bytes: bytes, max_pages: int = 40) -> List[str]:
             txt = ""
         pages.append(txt.replace("\u00A0", " ").replace("\r", "\n")[:20000])
     return pages
+
 
 # numeric helpers
 _MONEY_RE = re.compile(r"^\s*([0-9]{1,3}(?:[ .][0-9]{3})*|[0-9]+)(?:[.,]([0-9]{1,2}))?\s*(?:eur|€)?\s*$", re.IGNORECASE)
@@ -298,6 +303,7 @@ def _prune_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     out["programs"] = norm_programs or []
     return out
 
+
 # =========================
 # Heuristics: detect multi-variant PDFs from raw text
 # =========================
@@ -364,24 +370,19 @@ def _detect_multi_programs_from_text(full_text: str) -> List[Dict[str, Any]]:
             candidates.extend(rows)
 
     # 2) Compensa-style variants: split on "N. VARIANTS" sections and scan for numbers
-    #    If a section appears to contain separate "Programmas nosaukums ... Apdrošinājuma summa ... Prēmija ..." lines,
-    #    attempt to parse one plan from that section.
     if not candidates:
         parts = _VARIANTS_SPLIT_RE.split(full_text)
-        # filter likely variant sections
         variant_parts = [p for p in parts if "Programmas nosaukums" in p and ("Prēmija" in p or "Prēmija vienai" in p)]
         for vp in variant_parts:
-            # name: take the first non-empty line that looks like a plan name (letters/digits/+/())
+            # name: take the first non-empty line that looks like a plan name
             name = None
             for line in vp.splitlines():
                 t = line.strip()
                 if len(t) >= 3 and re.search(r"[A-Za-zĀČĒĢĪĶĻŅŌŖŠŪŽāčēģīķļņōŗšūž]", t):
-                    # skip obvious headers
                     if "Programmas" in t or "Apdrošinājuma" in t or "Prēmija" in t:
                         continue
                     name = t
                     break
-            # numbers: scan whole section for the first decent base sum and premium
             nums = re.findall(r"([0-9]{3,5}(?:[ .][0-9]{3})*(?:[.,][0-9]{2})?)\s*(?:€|EUR)?", vp)
             base_sum = _parse_money_like(nums[0]) if nums else None
             premium = _parse_money_like(nums[1]) if len(nums) > 1 else None
@@ -441,17 +442,16 @@ def _augment_with_detected_variants(pruned_payload: Dict[str, Any], pdf_bytes: b
             "premium_eur": d["premium"] if d["premium"] is not None else "-",
             "features": dict(base_features),  # inherit features (Papildprogrammas merged later by normalizer)
         }
-        # ensure required minimal features exist/updated
         prog = _ensure_features_minimal(prog)
         synthesized.append(prog)
 
     out = dict(pruned_payload)
     out["programs"] = synthesized
-    # carry over warnings
     ws = list(out.get("warnings") or [])
     ws.append("postprocess: multiple variants detected from PDF text; synthesized programs from summary table/sections")
     out["warnings"] = ws
     return out
+
 
 # =========================
 # OpenAI client setup
@@ -472,6 +472,7 @@ def _client_singleton() -> OpenAI:
 
 class ExtractionError(Exception):
     pass
+
 
 # =========================
 # Core: Responses API path
@@ -507,6 +508,7 @@ def _responses_with_pdf(model: str, document_id: str, pdf_bytes: bytes, allow_sc
             texts.append(t)
     raw = "".join(texts).strip() or "{}"
     return json.loads(raw)
+
 
 # =========================
 # Fallback: Chat Completions with extracted text
@@ -547,6 +549,7 @@ def _chat_with_text(model: str, document_id: str, pdf_bytes: bytes) -> Dict[str,
             if start != -1 and end != -1 and end > start:
                 return json.loads(raw[start:end + 1])
             raise
+
 
 # =========================
 # Public orchestration
@@ -608,8 +611,6 @@ def call_gpt_extractor(document_id: str, pdf_bytes: bytes, cfg: Optional[GPTConf
 
     raise ExtractionError(f"GPT extraction failed: {last_err}")
 
-class ExtractionError(Exception):
-    pass
 
 def extract_offer_from_pdf_bytes(pdf_bytes: bytes, document_id: str) -> Dict[str, Any]:
     if not pdf_bytes or len(pdf_bytes) > 10 * 1024 * 1024:
