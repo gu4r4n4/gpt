@@ -133,7 +133,6 @@ def _make_doc_id(prefix: str, idx: int, filename: str) -> str:
 # -------------------------------
 # Utilities
 # -------------------------------
-
 def _num(v: Any) -> Optional[float]:
     """Best-effort numeric coercion. Returns None for blanks, dashes, N/A, etc."""
     if v is None:
