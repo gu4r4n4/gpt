@@ -1,33 +1,32 @@
 # app/gpt_extractor.py
 """
-Extractor with multi-variant support.
-
-Flow:
-1) Try Responses API with the main strict schema (programs[]).
-2) If programs < 2, do a SECOND PASS (Responses API) with a tiny schema that
-   ONLY enumerates the list of visible base plan variants in the PDF (name + premium + base sum).
-3) If the second pass returns ≥2 variants, synthesize programs[] using those variants,
-   inheriting features from the first program (so FE gets identical rows with different names/premiums).
-4) Validate + normalize as before.
+Robust extractor that:
+- Uploads the PDF to OpenAI Files and references it by file_id in Responses API (correct way; fixes 400 invalid file_data).
+- If the SDK doesn't support response_format, retries without it.
+- If Responses path fails, falls back to Chat Completions with PDF text.
+- Always prunes unknown keys, validates against a strict schema,
+  then runs the normalizer (hard rules + PP folding).
+- If a PDF contains multiple base programs/variants, emits one programs[] item per variant
+  (heuristics for Many_* PDFs included).
 """
 
 from __future__ import annotations
-import base64
 import io
 import json
 import os
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from jsonschema import Draft202012Validator
+from pypdf import PdfReader
 from openai import OpenAI
 
 from app.normalizer import normalize_offer_json
 
 # =========================
-# STRICT JSON SCHEMA (main)
+# STRICT JSON SCHEMA
 # =========================
 INSURER_OFFER_SCHEMA: Dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -38,7 +37,6 @@ INSURER_OFFER_SCHEMA: Dict[str, Any] = {
     "properties": {
         "document_id": {"type": "string", "minLength": 1},
         "insurer_code": {"type": "string"},
-        "warnings": {"type": "array", "items": {"type": "string"}},
         "programs": {
             "type": "array",
             "minItems": 1,
@@ -84,42 +82,13 @@ INSURER_OFFER_SCHEMA: Dict[str, Any] = {
                 },
             },
         },
+        "warnings": {"type": "array", "items": {"type": "string"}},
     },
 }
 _SCHEMA_VALIDATOR = Draft202012Validator(INSURER_OFFER_SCHEMA)
 
 # =========================
-# SECOND PASS schema (variants-only)
-# =========================
-VARIANTS_SCHEMA: Dict[str, Any] = {
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "title": "VariantList_v1",
-    "type": "object",
-    "additionalProperties": False,
-    "required": ["document_id", "variants"],
-    "properties": {
-        "document_id": {"type": "string", "minLength": 1},
-        "variants": {
-            "type": "array",
-            "minItems": 1,
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["program_code"],
-                "properties": {
-                    "program_code": {"type": "string", "minLength": 1},
-                    "base_sum_eur": {"oneOf": [{"type": "number"}, {"type": "string", "enum": ["-"]}]},
-                    "premium_eur": {"oneOf": [{"type": "number"}, {"type": "string", "enum": ["-"]}]},
-                },
-            },
-        },
-        "warnings": {"type": "array", "items": {"type": "string"}},
-    },
-}
-_VARIANTS_VALIDATOR = Draft202012Validator(VARIANTS_SCHEMA)
-
-# =========================
-# Prompt helpers
+# Features list (prompt helper)
 # =========================
 FEATURE_NAMES: List[str] = [
     "Programmas nosaukums",
@@ -161,6 +130,9 @@ FEATURE_NAMES: List[str] = [
     "Maksas stacionārie pakalpojumi, limits EUR (pp)",
 ]
 
+# =========================
+# Prompt
+# =========================
 def _build_user_instructions(document_id: str) -> str:
     return f"""
 DOCUMENT_ID: {document_id}
@@ -168,56 +140,65 @@ DOCUMENT_ID: {document_id}
 TASK:
 Read the attached PDF (Latvian insurer offer) and return ONE JSON strictly matching the provided schema.
 Top-level keys allowed ONLY: document_id, insurer_code (optional), programs, warnings.
-Do NOT add any other keys.
 
 IMPORTANT:
-If the document contains MORE THAN ONE base program / variant (e.g. multiple rows in a summary table
-or sections titled like "1. VARIANTS", "2. VARIANTS"), you MUST return one item in programs[] for EACH variant.
+If the document contains MORE THAN ONE base program / variant (e.g., multiple rows in one summary table,
+or sections titled "1. VARIANTS", "2. VARIANTS", etc.), you MUST return one item in programs[] for EACH variant.
 
-PROGRAM SHAPE (minimum per item):
-- program_code  ← program name / code in the document (e.g., "DZINTARS PLUSS 2", "DZINTARS PLUSS 1", "V1 PLUSS (C20/1)")
-- base_sum_eur  ← from/near "Apdrošinājuma summa", return number if possible, else "-"
-- premium_eur   ← from "Prēmija", return number if possible, else "-"
-- features      ← feature-name → {{ "value": <string|number> }}
+PROGRAM SHAPE (minimum per program item):
+- program_code  ← program name / code in the document (e.g., "Pamatprogramma V2+", "DZINTARS Pluss 2", "V1 PLUSS (C20/1)")
+- base_sum_eur  ← from/near "Apdrošinājuma summa vienai personai"; if missing, put "-"
+- premium_eur   ← from "Prēmija vienai personai, EUR" (or "Prēmija"), numeric if possible; if missing, put "-"
+- features      ← object of feature-name → {{ "value": <string|number> }}
 
 FEATURES TO EXTRACT (LV labels exactly as below):
 {chr(10).join(f"- {name}" for name in FEATURE_NAMES)}
 
-STRICT RULES:
+STRICT RULES (override inference):
 1) "Pakalpojuma apmaksas veids" MUST be exactly: "Saskaņā ar cenrādi".
-2) Do NOT create separate papildprogrammas as programs; merge them into the same program via addon fields.
-3) If a value is not clearly present, set "-".
-4) "Pacientu iemaksa": if not stated, use "100%".
-5) Titles/labels must keep Latvian diacritics; keep “MR” (not “MRG”).
+2) "Maksas grūtnieču aprūpe": if mentioned anywhere → "v", else "-".
+3) "Vakcinācija pret ērcēm un gripu": numeric limit → "limits <NUMBER> EUR"; inclusion only → "v"; else "-".
+4) Do NOT create separate Papildprogramma program items. Merge add-ons into base using these fields:
+   - "Zobārstniecība ar 50% atlaidi, apdrošinājuma summa (pp)"
+   - "Ambulatorā rehabilitācija (pp)"
+   - "Medikamenti ar 50% atlaidi"
+   - "Sports"
+   - "Kritiskās saslimšanas"
+   - "Maksas stacionārie pakalpojumi, limits EUR (pp)"
+5) If a value is not clearly present in the PDF, set "-".
+6) Do not invent "Programmas kods"; if none, use "-".
+7) "Pacientu iemaksa": use "100%" if the document doesn't explicitly state a different value.
 
 OUTPUT:
 Return STRICT JSON conforming to the schema. No markdown or prose.
 """.strip()
 
-def _build_variant_list_prompt(document_id: str) -> str:
-    return f"""
-DOCUMENT_ID: {document_id}
-
-TASK:
-Look ONLY for the list/table of base plans (variants). Extract EVERY variant you can see.
-Return JSON that matches the 'VariantList_v1' schema: document_id + variants[].
-For each variant return:
-- program_code (plan name/title as printed, e.g. "DZINTARS PLUSS 2")
-- premium_eur (number if possible, else "-")
-- base_sum_eur (number if possible, else "-")
-
-IMPORTANT:
-- Include ALL variants if multiple are visible in the same document.
-- Do not include papildprogrammas as separate variants.
-- Do not invent names.
-
-OUTPUT: STRICT JSON, no prose.
-""".strip()
-
 # =========================
-# Helpers: numbers & pruning
+# Utils: PDF → text (for fallback), normalization & pruning
 # =========================
+def _pdf_to_text_pages(pdf_bytes: bytes, max_pages: int = 40) -> List[str]:
+    pages: List[str] = []
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    for page in reader.pages[:max_pages]:
+        try:
+            txt = page.extract_text() or ""
+        except Exception:
+            txt = ""
+        pages.append(txt.replace("\u00A0", " ").replace("\r", "\n")[:20000])
+    return pages
+
 _MONEY_RE = re.compile(r"^\s*([0-9]{1,3}(?:[ .][0-9]{3})*|[0-9]+)(?:[.,]([0-9]{1,2}))?\s*(?:eur|€)?\s*$", re.IGNORECASE)
+
+def _parse_money_like(s: str) -> Optional[float]:
+    m = _MONEY_RE.match((s or "").strip().replace("\u00A0", " "))
+    if not m:
+        return None
+    whole, dec = m.groups()
+    whole = (whole or "").replace(" ", "").replace(".", "")
+    try:
+        return float(f"{whole}.{dec}" if dec else whole)
+    except Exception:
+        return None
 
 def _to_number_or_dash(v: Any) -> Any:
     if v is None:
@@ -228,15 +209,8 @@ def _to_number_or_dash(v: Any) -> Any:
         s = v.strip()
         if s == "-" or s == "":
             return "-"
-        m = _MONEY_RE.match(s.replace("\u00A0", " "))
-        if m:
-            whole, dec = m.groups()
-            whole = whole.replace(" ", "").replace(".", "")
-            try:
-                return float(f"{whole}.{dec}" if dec else whole)
-            except Exception:
-                return "-"
-        return "-"
+        val = _parse_money_like(s)
+        return val if val is not None else "-"
     return "-"
 
 def _wrap_feature_value(v: Any) -> Dict[str, Any]:
@@ -264,19 +238,22 @@ def _prune_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(p, dict):
             continue
         q: Dict[str, Any] = {}
-        q["program_code"] = str(p.get("program_code") or "").strip() or str(p.get("name") or "")
+        q["program_code"] = str(p.get("program_code") or "").strip() or str((p.get("name") or "")) or ""
         if "program_type" in p and p["program_type"] in ("base", "additional"):
             q["program_type"] = p["program_type"]
+
         q["base_sum_eur"] = _to_number_or_dash(p.get("base_sum_eur"))
         q["premium_eur"]  = _to_number_or_dash(p.get("premium_eur"))
 
-        feats_in = p.get("features") or {}
-        q["features"] = {}
-        if isinstance(feats_in, dict):
-            for k, v in feats_in.items():
-                q["features"][str(k)] = _wrap_feature_value(v)
+        features_in = p.get("features") or {}
+        if isinstance(features_in, dict):
+            feat_out: Dict[str, Any] = {}
+            for k, v in features_in.items():
+                feat_out[str(k)] = _wrap_feature_value(v)
+            q["features"] = feat_out
+        else:
+            q["features"] = {}
 
-        # fallback: derive name from "Programmas nosaukums" feature
         if not q["program_code"]:
             pn = q["features"].get("Programmas nosaukums", {}).get("value")
             if isinstance(pn, str) and pn.strip():
@@ -303,9 +280,87 @@ def _prune_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     out["programs"] = norm_programs or []
     return out
 
-def _ensure_min_features(prog: Dict[str, Any]) -> Dict[str, Any]:
+# =========================
+# Heuristics: detect multi-variant PDFs from raw text
+# =========================
+_VARIANTS_SPLIT_RE = re.compile(r"(?mi)^\s*\d+\.\s*VARIANTS?\b.*$", re.MULTILINE)
+_TABLE_HEADER_HINTS = (
+    "Programmas nosaukums",
+    "Apdrošinājuma summa",
+    "Prēmija",
+)
+_ROW_RE = re.compile(
+    r"^\s*(?P<name>[A-Za-zĀČĒĢĪĶĻŅŌŖŠŪŽāčēģīķļņōŗšūž0-9+/\-()., ]{3,})\s+"
+    r"(?:(?P<count>\d+)\s+)?"
+    r"(?P<sum>[0-9]{3,5}(?:[ .][0-9]{3})*(?:[.,][0-9]{2})?)\s+"
+    r"(?P<premium>[0-9]{1,4}(?:[.,][0-9]{2})?)"
+    r"(?:\s*(?:€|EUR))?\s*$",
+    re.MULTILINE
+)
+
+def _pages_to_text(pdf_bytes: bytes) -> Tuple[str, List[str]]:
+    pages = _pdf_to_text_pages(pdf_bytes)
+    full = "\n".join(pages)
+    return full, pages
+
+def _looks_like_table_block(block: str) -> bool:
+    hit = 0
+    for h in _TABLE_HEADER_HINTS:
+        if h.lower() in block.lower():
+            hit += 1
+    return hit >= 2
+
+def _parse_rows_from_block(block: str) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for m in _ROW_RE.finditer(block):
+        name = (m.group("name") or "").strip(" -\u200b")
+        base_sum = _parse_money_like(m.group("sum") or "")
+        premium = _parse_money_like(m.group("premium") or "")
+        if not name or base_sum is None or premium is None:
+            continue
+        out.append({"name": name, "base_sum": base_sum, "premium": premium})
+    return out
+
+def _detect_multi_programs_from_text(full_text: str) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+
+    # Table oriented
+    chunks = re.split(r"\n{2,}", full_text)
+    for ch in chunks:
+        if not _looks_like_table_block(ch):
+            continue
+        rows = _parse_rows_from_block(ch)
+        if len(rows) >= 2:
+            candidates.extend(rows)
+
+    # "N. VARIANTS" style
+    if not candidates:
+        parts = _VARIANTS_SPLIT_RE.split(full_text)
+        variant_parts = [p for p in parts if "Programmas nosaukums" in p and ("Prēmija" in p or "Prēmija vienai" in p)]
+        for vp in variant_parts:
+            name = None
+            for line in vp.splitlines():
+                t = line.strip()
+                if len(t) >= 3 and re.search(r"[A-Za-zĀČĒĢĪĶĻŅŌŖŠŪŽāčēģīķļņōŗšūž]", t):
+                    if "Programmas" in t or "Apdrošinājuma" in t or "Prēmija" in t:
+                        continue
+                    name = t
+                    break
+            nums = re.findall(r"([0-9]{3,5}(?:[ .][0-9]{3})*(?:[.,][0-9]{2})?)\s*(?:€|EUR)?", vp)
+            base_sum = _parse_money_like(nums[0]) if nums else None
+            premium = _parse_money_like(nums[1]) if len(nums) > 1 else None
+            if name and base_sum is not None and premium is not None:
+                candidates.append({"name": name, "base_sum": base_sum, "premium": premium})
+
+    uniq: Dict[Tuple[str, float, float], Dict[str, Any]] = {}
+    for c in candidates:
+        key = (c["name"], float(c["base_sum"]), float(c["premium"]))
+        uniq[key] = c
+    return list(uniq.values())
+
+def _ensure_features_minimal(prog: Dict[str, Any]) -> Dict[str, Any]:
     feats = prog.get("features") or {}
-    if not isinstance(feats, dict):
+    if not isinstance(feats, dict) or not feats:
         feats = {}
     name = prog.get("program_code") or "-"
     feats.setdefault("Programmas nosaukums", {"value": name})
@@ -313,6 +368,42 @@ def _ensure_min_features(prog: Dict[str, Any]) -> Dict[str, Any]:
         feats.setdefault("Apdrošinājuma summa pamatpolisei, EUR", {"value": prog["base_sum_eur"]})
     prog["features"] = feats
     return prog
+
+def _augment_with_detected_variants(pruned_payload: Dict[str, Any], pdf_bytes: bytes) -> Dict[str, Any]:
+    programs = pruned_payload.get("programs") or []
+    if len(programs) >= 2:
+        return pruned_payload
+
+    full_text, _ = _pages_to_text(pdf_bytes)
+    detected = _detect_multi_programs_from_text(full_text)
+    if len(detected) < 2:
+        return pruned_payload
+
+    base_prog = programs[0] if programs else {
+        "program_code": "Pamatprogramma",
+        "base_sum_eur": "-",
+        "premium_eur": "-",
+        "features": {},
+    }
+    base_features = base_prog.get("features") or {}
+
+    synthesized: List[Dict[str, Any]] = []
+    for d in detected:
+        prog = {
+            "program_code": d["name"],
+            "base_sum_eur": d["base_sum"] if d["base_sum"] is not None else "-",
+            "premium_eur": d["premium"] if d["premium"] is not None else "-",
+            "features": dict(base_features),
+        }
+        prog = _ensure_features_minimal(prog)
+        synthesized.append(prog)
+
+    out = dict(pruned_payload)
+    out["programs"] = synthesized
+    ws = list(out.get("warnings") or [])
+    ws.append("postprocess: multiple variants detected from PDF text; synthesized programs from summary table/sections")
+    out["warnings"] = ws
+    return out
 
 # =========================
 # OpenAI client setup
@@ -335,70 +426,103 @@ class ExtractionError(Exception):
     pass
 
 # =========================
-# Responses API helpers
+# Core: Responses API path (with file upload → file_id)
 # =========================
-def _responses_json_with_pdf(model: str, prompt: str, schema: Dict[str, Any], document_id: str, pdf_bytes: bytes) -> Dict[str, Any]:
-    """
-    Call Responses API with an explicit JSON schema. Falls back to parsing raw JSON text.
-    """
+def _responses_with_pdf(model: str, document_id: str, pdf_bytes: bytes, allow_schema: bool) -> Dict[str, Any]:
     client = _client_singleton()
+
+    # Upload the PDF first and reference by file_id (correct contract)
+    buf = io.BytesIO(pdf_bytes)
+    buf.name = (document_id or "document.pdf")
+    uploaded = client.files.create(file=buf, purpose="assistants")  # purpose used by Responses as well
+    file_id = uploaded.id
+
     content = [
-        {"type": "input_text", "text": prompt},
-        {"type": "input_file", "filename": document_id or "document.pdf",
-         "file_data": base64.b64encode(pdf_bytes).decode("ascii")},
+        {"type": "input_text", "text": _build_user_instructions(document_id)},
+        {"type": "input_file", "file_id": file_id},
     ]
+
     kwargs: Dict[str, Any] = {
         "model": model,
         "input": [{"role": "user", "content": content}],
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {"name": schema.get("title", "schema"), "schema": schema, "strict": True},
-        },
     }
+    if allow_schema:
+        kwargs["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {"name": "InsurerOfferExtraction_v1", "schema": INSURER_OFFER_SCHEMA, "strict": True},
+        }
+
     resp = client.responses.create(**kwargs)
+
+    # Prefer parsed if present
     payload = getattr(resp, "output_parsed", None)
     if payload is not None:
         return payload
 
-    # fallback: parse concatenated text
-    pieces: List[str] = []
-    for item in getattr(resp, "output", []) or []:
-        t = getattr(item, "content", None)
-        if isinstance(t, str):
-            pieces.append(t)
-    raw = "".join(pieces).strip() or "{}"
+    # Fallback to text
+    raw = None
+    raw = getattr(resp, "output_text", None) or raw
+    if not raw:
+        # very defensive: stitch anything we can find
+        parts: List[str] = []
+        out = getattr(resp, "output", None)
+        if isinstance(out, list):
+            for item in out:
+                t = getattr(item, "content", None)
+                if isinstance(t, str):
+                    parts.append(t)
+        raw = "".join(parts) if parts else "{}"
+    raw = raw.strip() or "{}"
     return json.loads(raw)
 
-def _responses_without_schema(model: str, prompt: str, document_id: str, pdf_bytes: bytes) -> Dict[str, Any]:
-    """
-    Same call, but without response_format — some SDK builds require this.
-    """
+# =========================
+# Fallback: Chat Completions with extracted text
+# =========================
+def _chat_with_text(model: str, document_id: str, pdf_bytes: bytes) -> Dict[str, Any]:
     client = _client_singleton()
-    content = [
-        {"type": "input_text", "text": prompt},
-        {"type": "input_file", "filename": document_id or "document.pdf",
-         "file_data": base64.b64encode(pdf_bytes).decode("ascii")},
-    ]
-    resp = client.responses.create(model=model, input=[{"role": "user", "content": content}])
+    pages = _pdf_to_text_pages(pdf_bytes)
+    user = (
+        _build_user_instructions(document_id)
+        + "\n\nPDF TEXT (per page):\n"
+        + "\n\n".join(f"===== Page {i+1} =====\n{p}" for i, p in enumerate(pages))
+    )
 
-    pieces: List[str] = []
-    for item in getattr(resp, "output", []) or []:
-        t = getattr(item, "content", None)
-        if isinstance(t, str):
-            pieces.append(t)
-    raw = "".join(pieces).strip() or "{}"
-    return json.loads(raw)
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "Return STRICT JSON only. No markdown, no prose."},
+                {"role": "user", "content": user},
+            ],
+            response_format={"type": "json_object"},
+        )
+        txt = resp.choices[0].message.content or "{}"
+        return json.loads(txt)
+    except TypeError:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "Return ONLY raw JSON that matches the required schema. No extra keys."},
+                {"role": "user", "content": user},
+            ],
+        )
+        raw = resp.choices[0].message.content or "{}"
+        start, end = raw.find("{"), raw.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            return json.loads(raw[start:end + 1])
+        return {}
 
 # =========================
-# Core passes
+# Public orchestration
 # =========================
-def _first_pass(document_id: str, pdf_bytes: bytes, cfg: GPTConfig) -> Dict[str, Any]:
+def call_gpt_extractor(document_id: str, pdf_bytes: bytes, cfg: Optional[GPTConfig] = None) -> Dict[str, Any]:
+    cfg = cfg or GPTConfig()
     last_err: Optional[Exception] = None
 
-    # Responses API with schema
+    # 1) Responses API with schema
     for attempt in range(cfg.max_retries + 1):
         try:
-            payload = _responses_json_with_pdf(cfg.model, _build_user_instructions(document_id), INSURER_OFFER_SCHEMA, document_id, pdf_bytes)
+            payload = _responses_with_pdf(cfg.model, document_id, pdf_bytes, allow_schema=True)
             pruned = _prune_payload(payload)
             _SCHEMA_VALIDATOR.validate(pruned)
             return pruned
@@ -408,132 +532,59 @@ def _first_pass(document_id: str, pdf_bytes: bytes, cfg: GPTConfig) -> Dict[str,
         except Exception as e:
             last_err = e
             if attempt < cfg.max_retries:
-                time.sleep(0.6 * (attempt + 1))
+                time.sleep(0.7 * (attempt + 1))
                 continue
 
-    # Responses API without schema
+    # 2) Responses API without schema
     for attempt in range(cfg.max_retries + 1):
         try:
-            payload = _responses_without_schema(cfg.model, _build_user_instructions(document_id), document_id, pdf_bytes)
+            payload = _responses_with_pdf(cfg.model, document_id, pdf_bytes, allow_schema=False)
             pruned = _prune_payload(payload)
             _SCHEMA_VALIDATOR.validate(pruned)
             return pruned
         except Exception as e:
             last_err = e
             if attempt < cfg.max_retries:
-                time.sleep(0.6 * (attempt + 1))
+                time.sleep(0.7 * (attempt + 1))
                 continue
             break
 
-    # Final fallback — chat with text is intentionally omitted here to keep latency acceptable
-    raise ExtractionError(f"first pass failed: {last_err}")
-
-def _second_pass_variants(document_id: str, pdf_bytes: bytes, cfg: GPTConfig) -> Optional[List[Dict[str, Any]]]:
-    """
-    Ask the model to enumerate visible variants. Returns list of dicts or None.
-    """
-    last_err: Optional[Exception] = None
-
-    # With schema
+    # 3) Chat fallback
     for attempt in range(cfg.max_retries + 1):
         try:
-            payload = _responses_json_with_pdf(cfg.model, _build_variant_list_prompt(document_id), VARIANTS_SCHEMA, document_id, pdf_bytes)
-            _VARIANTS_VALIDATOR.validate(payload)
-            variants = payload.get("variants") or []
-            if isinstance(variants, list) and variants:
-                # normalize numbers/dashes
-                out = []
-                for v in variants:
-                    out.append({
-                        "program_code": str(v.get("program_code") or "").strip(),
-                        "base_sum_eur": _to_number_or_dash(v.get("base_sum_eur")),
-                        "premium_eur":  _to_number_or_dash(v.get("premium_eur")),
-                    })
-                return [x for x in out if x["program_code"]]
-            return None
-        except TypeError as te:
-            last_err = te
-            break
+            try_models = [cfg.model, cfg.fallback_chat_model] if cfg.fallback_chat_model != cfg.model else [cfg.model]
+            for m in try_models:
+                try:
+                    payload = _chat_with_text(m, document_id, pdf_bytes)
+                    pruned = _prune_payload(payload)
+                    _SCHEMA_VALIDATOR.validate(pruned)
+                    return pruned
+                except Exception as inner:
+                    last_err = inner
+                    continue
+            raise last_err or RuntimeError("Chat path failed")
         except Exception as e:
             last_err = e
             if attempt < cfg.max_retries:
-                time.sleep(0.6 * (attempt + 1))
-                continue
-
-    # Without schema
-    for attempt in range(cfg.max_retries + 1):
-        try:
-            payload = _responses_without_schema(cfg.model, _build_variant_list_prompt(document_id), document_id, pdf_bytes)
-            # be forgiving here
-            try:
-                data = dict(payload)
-            except Exception:
-                # if payload is a stringified JSON, parse again
-                data = json.loads(str(payload))
-            variants = data.get("variants") or []
-            out = []
-            for v in variants:
-                out.append({
-                    "program_code": str(v.get("program_code") or "").strip(),
-                    "base_sum_eur": _to_number_or_dash(v.get("base_sum_eur")),
-                    "premium_eur":  _to_number_or_dash(v.get("premium_eur")),
-                })
-            return [x for x in out if x["program_code"]]
-        except Exception as e:
-            last_err = e
-            if attempt < cfg.max_retries:
-                time.sleep(0.6 * (attempt + 1))
+                time.sleep(0.7 * (attempt + 1))
                 continue
             break
 
-    # give up
-    return None
-
-def _synthesize_from_variants(first_pass: Dict[str, Any], variants: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Build programs[] from variant rows but keep features from the first program
-    (so all columns get the same coverage details but different names/premiums).
-    """
-    base_prog = (first_pass.get("programs") or [{}])[0] if first_pass.get("programs") else {}
-    base_features = dict(base_prog.get("features") or {})
-
-    programs: List[Dict[str, Any]] = []
-    for v in variants:
-        prog = {
-            "program_code": v.get("program_code") or base_prog.get("program_code") or "Pamatprogramma",
-            "base_sum_eur": v.get("base_sum_eur", base_prog.get("base_sum_eur", "-")),
-            "premium_eur":  v.get("premium_eur",  base_prog.get("premium_eur", "-")),
-            "features": dict(base_features),
-        }
-        prog = _ensure_min_features(prog)
-        programs.append(prog)
-
-    out = dict(first_pass)
-    out["programs"] = programs
-    ws = list(out.get("warnings") or [])
-    ws.append("second-pass: multi-variant table detected; programs synthesized from variant list")
-    out["warnings"] = ws
-    return out
+    raise ExtractionError(f"GPT extraction failed: {last_err}")
 
 # =========================
-# Public API
+# Public entry
 # =========================
 def extract_offer_from_pdf_bytes(pdf_bytes: bytes, document_id: str) -> Dict[str, Any]:
     if not pdf_bytes or len(pdf_bytes) > 10 * 1024 * 1024:
         raise ExtractionError("PDF too large or empty (limit: 10MB)")
-
-    cfg = GPTConfig()
-
-    # 1) First pass (full programs)
-    first = _first_pass(document_id, pdf_bytes, cfg)
-
-    # 2) If single program, try second pass to enumerate variants
-    if len(first.get("programs") or []) < 2:
-        variants = _second_pass_variants(document_id, pdf_bytes, cfg)
-        if variants and len(variants) >= 2:
-            first = _synthesize_from_variants(first, variants)
-
-    # 3) Validate again and normalize
-    _SCHEMA_VALIDATOR.validate(first)
-    normalized = normalize_offer_json({**first, "document_id": document_id})
+    # 1) Get raw (schema-pruned) payload from GPT
+    raw = call_gpt_extractor(document_id=document_id, pdf_bytes=pdf_bytes)
+    # 2) Augment: split into multiple programs if PDF text clearly contains several variants
+    augmented = _augment_with_detected_variants(raw, pdf_bytes)
+    # 3) Normalize (hard rules + PP folding + corrected labels)
+    normalized = normalize_offer_json({
+        **augmented,
+        "document_id": document_id,
+    })
     return normalized
