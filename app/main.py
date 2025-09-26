@@ -1,3 +1,4 @@
+# app/main.py
 from __future__ import annotations
 
 import os
@@ -171,6 +172,72 @@ def _inject_meta(payload: Dict[str, Any], *, insurer: str, company: str, insured
     payload["inquiry_id"] = int(inquiry_id) if str(inquiry_id).isdigit() else None
 
 
+# ---------- NEW: helpers to avoid duplicate (filename, insurer, program_code) ----------
+def _feature_value(x: Any) -> Any:
+    if isinstance(x, dict):
+        return x.get("value")
+    return x
+
+def _disambiguate_duplicate_program_codes(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    For the same (filename, insurer, program_code) appearing more than once,
+    append a meaningful suffix so it becomes unique (e.g., '— stacionārs 750 EUR'
+    or '— prēmija 282'). Falls back to '— variants #n'.
+    """
+    groups: Dict[Tuple[str, str, str], List[int]] = {}
+    for i, r in enumerate(rows):
+        key = (
+            (r.get("filename") or "-"),
+            (r.get("insurer") or r.get("company_hint") or "-").strip(),
+            (r.get("program_code") or "-").strip().lower(),
+        )
+        groups.setdefault(key, []).append(i)
+
+    for _, idxs in groups.items():
+        if len(idxs) <= 1:
+            continue
+
+        base_label = rows[idxs[0]].get("program_code") or "-"
+        used_labels: set = set()
+
+        for n, idx in enumerate(idxs, start=1):
+            r = rows[idx]
+            f = r.get("features") or {}
+
+            # Try to use a distinguishing attribute from features/premium/base_sum
+            stac = (
+                _feature_value(f.get("Maksas stacionārie pakalpojumi, limits EUR"))
+                or _feature_value(f.get("Maksas stacionārie pakalpojumi, limits EUR (pp)"))
+            )
+            prem = r.get("premium_eur")
+            base_sum = r.get("base_sum_eur")
+
+            suffix = None
+            if stac not in (None, "", "-"):
+                if isinstance(stac, (int, float)) or (isinstance(stac, str) and stac.replace('.', '', 1).isdigit()):
+                    suffix = f"stacionārs {stac} EUR"
+                else:
+                    suffix = str(stac)
+            elif prem not in (None, "", "-"):
+                suffix = f"prēmija {prem}"
+            elif base_sum not in (None, "", "-"):
+                suffix = f"b/s {base_sum}"
+
+            label = f"{base_label} — {suffix}" if suffix else f"{base_label} — variants {n}"
+
+            # Ensure within this set it's unique
+            uniq = label
+            k = 2
+            while uniq in used_labels:
+                uniq = f"{label} #{k}"
+                k += 1
+            used_labels.add(uniq)
+            rows[idx]["program_code"] = uniq
+
+    return rows
+# --------------------------------------------------------------------------------------
+
+
 def _rows_for_offers_table(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Convert one normalized extractor payload (with .programs list)
@@ -211,6 +278,8 @@ def _rows_for_offers_table(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "org_id": org_id,
                 "created_by_user_id": created_by_user_id,
             })
+        # NEW: ensure (filename, insurer, program_code) is unique to satisfy DB constraint
+        rows = _disambiguate_duplicate_program_codes(rows)
     else:
         rows.append({
             "insurer": hint,
@@ -601,7 +670,7 @@ def _process_pdf_bytes(
         with _JOBS_LOCK:
             rec = _jobs.get(job_id)
             if rec is not None:
-                rec["timings"].setdefault(doc_id, {}).update(payload["_timings"]) 
+                rec["timings"].setdefault(doc_id, {}).update(payload["_timings"])
                 if not ok:
                     rec["errors"].append({"document_id": doc_id, "error": f"supabase_insert: {err}"})
     except Exception as e:
