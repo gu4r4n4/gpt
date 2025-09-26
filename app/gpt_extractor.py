@@ -103,7 +103,7 @@ FEATURE_NAMES: List[str] = [
     "Maksas ārsta-specialista konsultācija, limits EUR",
     "Profesora, docenta, internista konsultācija, limits EUR",
     "Homeopāts",
-    "Psihoterapeits",
+    "Psihoterapeets",
     "Sporta ārsts",
     "ONLINE ārstu konsultācijas",
     "Laboratoriskie izmeklējumi",
@@ -196,10 +196,16 @@ Return STRICT JSON conforming to the schema. No markdown or prose.
 # =========================
 # Utils: PDF → text (for fallback), normalization & pruning
 # =========================
-def _pdf_to_text_pages(pdf_bytes: bytes, max_pages: int = 40) -> List[str]:
+DEFAULT_MAX_PAGES = int(os.getenv("EXTRACT_MAX_PAGES", "200"))
+
+def _pdf_to_text_pages(pdf_bytes: bytes, max_pages: Optional[int] = None) -> List[str]:
+    """Extract text per page with a configurable page cap."""
     pages: List[str] = []
     reader = PdfReader(io.BytesIO(pdf_bytes))
-    for page in reader.pages[:max_pages]:
+    cap = max_pages if isinstance(max_pages, int) and max_pages > 0 else DEFAULT_MAX_PAGES
+    for idx, page in enumerate(reader.pages):
+        if idx >= cap:
+            break
         try:
             txt = page.extract_text() or ""
         except Exception:
@@ -303,19 +309,15 @@ def _prune_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 # =========================
 # Heuristics: multi-variant detection (BASE ONLY)
 # =========================
-
-# Case-insensitive markers for section boundaries
 _PAMAT_MARK = re.compile(r"\bPAMATPROGRAMMA\b|\bPamatprogramma\b", re.IGNORECASE)
 _PAPILD_MARK = re.compile(r"\bPAPILDPROGRAMMAS?\b|\bPapildprogrammas?\b|\bPapildprogramma\b", re.IGNORECASE)
 
-# Header hints inside the base table block
 _BASE_HEADER_HINTS = (
     "Programmas nosaukums",
-    "Apdrošinājuma summa",  # includes "Apdrošinājuma summa vienai personai"
-    "Prēmija",              # includes "Prēmija vienai personai, EUR"
+    "Apdrošinājuma summa",
+    "Prēmija",
 )
 
-# Row pattern: NAME ... BASE_SUM ... PREMIUM (keep permissive for diacritics & symbols)
 _BASE_ROW_RE = re.compile(
     r"^\s*(?P<name>[A-Za-zĀČĒĢĪĶĻŅŌŖŠŪŽāčēģīķļņōŗšūž0-9+/\-()., ]{3,}?)\s+"
     r"(?P<sum>[0-9]{3,5}(?:[ .][0-9]{3})*(?:[.,][0-9]{2})?)\s+"
@@ -337,26 +339,17 @@ def _looks_like_base_header(block: str) -> bool:
     return hit >= 2
 
 def _extract_pamat_block(full_text: str) -> Optional[str]:
-    """
-    Return the text slice from first PAMATPROGRAMMA marker up to the first PAPILD... marker.
-    """
     m_start = _PAMAT_MARK.search(full_text)
     if not m_start:
         return None
     start = m_start.start()
     m_end = _PAPILD_MARK.search(full_text, m_start.end())
     end = m_end.start() if m_end else len(full_text)
-    block = full_text[start:end]
-    return block
+    return full_text[start:end]
 
 def _parse_base_rows(block: str) -> List[Dict[str, Any]]:
-    """
-    Parse rows inside the PAMATPROGRAMMA block only.
-    Requires it to look like a base table by headers.
-    """
     if not block or not _looks_like_base_header(block):
         return []
-
     rows: List[Dict[str, Any]] = []
     for m in _BASE_ROW_RE.finditer(block):
         name = (m.group("name") or "").strip(" -\u200b")
@@ -364,19 +357,12 @@ def _parse_base_rows(block: str) -> List[Dict[str, Any]]:
         premium = _parse_money_like(m.group("premium") or "")
         if not name or base_sum is None or premium is None:
             continue
-        # very common false-positive guard: ignore header-like names
         if "Programmas" in name or "Apdrošinājuma" in name or "Prēmija" in name:
             continue
         rows.append({"name": name, "base_sum": base_sum, "premium": premium})
-
-    # Return only if we are clearly seeing multiple offers
     return rows if len(rows) >= 2 else []
 
 def _detect_base_programs_from_text(full_text: str) -> List[Dict[str, Any]]:
-    """
-    Conservative detector that ONLY scans the PAMATPROGRAMMA section and returns
-    a list of base variants (name, base_sum, premium). It stops before any PAPILD... section.
-    """
     block = _extract_pamat_block(full_text)
     if not block:
         return []
@@ -386,29 +372,20 @@ def _ensure_features_minimal(prog: Dict[str, Any]) -> Dict[str, Any]:
     feats = prog.get("features") or {}
     if not isinstance(feats, dict) or not feats:
         feats = {}
-    # always ensure Programmas nosaukums present
     name = prog.get("program_code") or "-"
     feats.setdefault("Programmas nosaukums", {"value": name})
-    # optionally attach base sum into features (UI consistency)
     if prog.get("base_sum_eur", "-") != "-":
         feats.setdefault("Apdrošinājuma summa pamatpolisei, EUR", {"value": prog["base_sum_eur"]})
     prog["features"] = feats
     return prog
 
 def _augment_with_detected_variants(pruned_payload: Dict[str, Any], pdf_bytes: bytes) -> Dict[str, Any]:
-    """
-    If GPT returned a single program but the PDF text clearly contains multiple BASE variants
-    (inside PAMATPROGRAMMA), synthesize one programs[] per variant and keep the original features.
-    We explicitly do NOT read from PAPILDPROGRAMMAS to avoid wrong premiums.
-    """
     programs = pruned_payload.get("programs") or []
     if len(programs) >= 2:
-        return pruned_payload  # already multi-variant
+        return pruned_payload
 
     full_text, _ = _pdf_pages_text(pdf_bytes)
     detected = _detect_base_programs_from_text(full_text)
-
-    # Only intervene when we are confident there are ≥2 distinct base offers
     if len(detected) < 2:
         return pruned_payload
 
@@ -426,7 +403,7 @@ def _augment_with_detected_variants(pruned_payload: Dict[str, Any], pdf_bytes: b
             "program_code": d["name"],
             "base_sum_eur": d["base_sum"] if d["base_sum"] is not None else "-",
             "premium_eur": d["premium"] if d["premium"] is not None else "-",
-            "features": dict(base_features),  # inherit original features (normalizer will handle PP folding)
+            "features": dict(base_features),
         }
         prog = _ensure_features_minimal(prog)
         synthesized.append(prog)
@@ -593,19 +570,13 @@ def call_gpt_extractor(document_id: str, pdf_bytes: bytes, cfg: Optional[GPTConf
 
     raise ExtractionError(f"GPT extraction failed: {last_err}")
 
-class ExtractionError(Exception):
-    pass
-
 def extract_offer_from_pdf_bytes(pdf_bytes: bytes, document_id: str) -> Dict[str, Any]:
     if not pdf_bytes or len(pdf_bytes) > 10 * 1024 * 1024:
         raise ExtractionError("PDF too large or empty (limit: 10MB)")
-    # 1) Get raw (schema-pruned) payload from GPT
     raw = call_gpt_extractor(document_id=document_id, pdf_bytes=pdf_bytes)
-    # 2) Augment: split into multiple BASE programs if PAMATPROGRAMMA shows several variants
     augmented = _augment_with_detected_variants(raw, pdf_bytes)
-    # 3) Normalize (hard rules + PP folding + corrected labels)
     normalized = normalize_offer_json({
         **augmented,
-        "document_id": document_id,  # ensure filename propagates
+        "document_id": document_id,
     })
     return normalized
