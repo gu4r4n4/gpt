@@ -10,9 +10,23 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL env var is required")
 
-# Add pool_pre_ping to avoid stale pooled connections
-engine = create_engine(DATABASE_URL, future=True, pool_pre_ping=True)
+engine = create_engine(DATABASE_URL, future=True)
 router = APIRouter(prefix="/offers", tags=["offers"])
+
+
+def flatten_features(features_obj: Any) -> Dict[str, Any]:
+    """
+    Convert {'Feature A': {'value': 'v', ...}, 'Feature B': 'x'} into
+    {'Feature A': 'v', 'Feature B': 'x'} for FE display.
+    """
+    flat: Dict[str, Any] = {}
+    if isinstance(features_obj, dict):
+        for k, v in features_obj.items():
+            if isinstance(v, dict) and "value" in v:
+                flat[str(k)] = v["value"]
+            else:
+                flat[str(k)] = v
+    return flat
 
 
 @router.post("/by-documents")
@@ -25,7 +39,18 @@ def offers_by_documents(payload: Dict[str, Any] = Body(...)) -> List[Dict[str, A
         "inquiry_id": 123,
         "company_name": "...",
         "employee_count": 42,
-        "programs": [ { ... } ]
+        "programs": [
+          {
+            "row_id": 111,
+            "insurer": "Gjensidige",
+            "program_code": "Dzintars PLUSS 2",
+            "base_sum_eur": 1000.0,
+            "premium_eur": 12.34,
+            "payment_method": null,
+            "features": {...},        # <-- flattened for FE
+            "features_raw": {...}     # <-- original shape (with value/confidence/provenance)
+          }
+        ]
       }
     ]
     """
@@ -82,7 +107,8 @@ def offers_by_documents(payload: Dict[str, Any] = Body(...)) -> List[Dict[str, A
             "base_sum_eur": float(r["base_sum_eur"]) if r["base_sum_eur"] is not None else None,
             "premium_eur": float(r["premium_eur"]) if r["premium_eur"] is not None else None,
             "payment_method": r["payment_method"],
-            "features": features_obj or {},
+            "features": flatten_features(features_obj or {}),  # <-- FLATTENED
+            "features_raw": features_obj or {},                # <-- ORIGINAL for advanced UI
         })
 
     out = list(grouped.values())
