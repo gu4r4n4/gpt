@@ -62,7 +62,7 @@ INSURER_OFFER_SCHEMA: Dict[str, Any] = {
                                 "value": {
                                     "oneOf": [
                                         {"type": "number"},
-                                        {"type": "string", "maxLength": 160}
+                                        {"type": "string", "maxLength": 160},
                                     ]
                                 },
                                 "confidence": {"type": "number", "minimum": 0, "maximum": 1},
@@ -187,24 +187,23 @@ def _pdf_to_text_pages(pdf_bytes: bytes, max_pages: int = 100) -> List[str]:
             txt = page.extract_text() or ""
         except Exception:
             txt = ""
-        # normalize non-breaking spaces and soft hyphens
         txt = txt.replace("\u00A0", " ").replace("\u00AD", "").replace("\r", "\n")
         pages.append(txt[:20000])
     return pages
 
 # Money parsing
 _MONEY_RE = re.compile(
-    r"^\s*([0-9]{1,3}(?:[ . ][0-9]{3})*|[0-9]+)(?:[.,]([0-9]{1,2}))?\s*(?:eur|€)?\s*$",
+    r"^\s*([0-9]{1,3}(?:[ .][0-9]{3})*|[0-9]+)(?:[.,]([0-9]{1,2}))?\s*(?:eur|€)?\s*$",
     re.IGNORECASE,
 )
 
 def _parse_money_like(s: str) -> Optional[float]:
-    s = (s or "").strip().replace("\u00A0", " ").replace(" ", " ")
+    s = (s or "").strip().replace("\u00A0", " ")
     m = _MONEY_RE.match(s)
     if not m:
         return None
     whole, dec = m.groups()
-    whole = (whole or "").replace(" ", "").replace(".", "").replace(" ", "")
+    whole = (whole or "").replace(" ", "").replace(".", "")
     try:
         return float(f"{whole}.{dec}" if dec else whole)
     except Exception:
@@ -253,7 +252,7 @@ def _prune_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             q["program_type"] = p["program_type"]
 
         q["base_sum_eur"] = _to_number_or_dash(p.get("base_sum_eur"))
-        q["premium_eur"]  = _to_number_or_dash(p.get("premium_eur"))
+        q["premium_eur"] = _to_number_or_dash(p.get("premium_eur"))
 
         features_in = p.get("features") or {}
         if isinstance(features_in, dict):
@@ -279,7 +278,7 @@ def _prune_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             q = {
                 "program_code": str(bp.get("name") or "Pamatprogramma").strip(),
                 "base_sum_eur": _to_number_or_dash(bp.get("base_sum_eur")),
-                "premium_eur":  _to_number_or_dash(bp.get("premium_eur")),
+                "premium_eur": _to_number_or_dash(bp.get("premium_eur")),
                 "features": {},
             }
             feats = bp.get("features") or {}
@@ -293,7 +292,6 @@ def _prune_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 # =========================
 # Heuristics: multi-variant detection (BASE ONLY)
 # =========================
-
 _PAMAT_MARK = re.compile(r"\bPAMATPROGRAMMA\b|\bPamatprogramma\b", re.IGNORECASE)
 _PAPILD_MARK = re.compile(r"\bPAPILDPROGRAMMAS?\b|\bPapildprogrammas?\b|\bPapildprogramma\b", re.IGNORECASE)
 
@@ -301,14 +299,14 @@ _BASE_HEADER_HINTS = (
     "Programmas nosaukums",
     "Apdrošinājuma summa",
     "Prēmija",
+    "vienai personai",  # extra hint
 )
 
-# Strict one-line row pattern
+# Strict single-line row pattern allowing EUR/€ after BOTH numbers
 _BASE_ROW_RE = re.compile(
     r"^\s*(?P<name>[A-Za-zĀČĒĢĪĶĻŅŌŖŠŪŽāčēģīķļņōŗšūž0-9+/\-()., ]{3,}?)\s+"
-    r"(?P<sum>[0-9]{3,5}(?:[ . ][0-9]{3})*(?:[.,][0-9]{2})?)\s+"
-    r"(?P<premium>[0-9]{1,4}(?:[.,][0-9]{2})?)"
-    r"(?:\s*(?:€|EUR))?\s*$",
+    r"(?P<sum>(?:[0-9]{1,3}(?:[ .][0-9]{3})*|[0-9]+)(?:[.,][0-9]{1,2})?)\s*(?:€|EUR)?\s+"
+    r"(?P<premium>(?:[0-9]{1,3}(?:[ .][0-9]{3})*|[0-9]+)(?:[.,][0-9]{1,2})?)\s*(?:€|EUR)?\s*$",
     re.MULTILINE,
 )
 
@@ -349,7 +347,10 @@ def _parse_base_rows_strict(block: str) -> List[Dict[str, Any]]:
     return rows
 
 # Loose, multi-line tolerant row parser
-_MONEY_ANYWHERE_RE = re.compile(r"([0-9]{1,3}(?:[ . ][0-9]{3})*|[0-9]+)(?:[.,]([0-9]{1,2}))?(?:\s*(?:€|EUR))?", re.IGNORECASE)
+_MONEY_ANYWHERE_RE = re.compile(
+    r"([0-9]{1,3}(?:[ .][0-9]{3})*|[0-9]+)(?:[.,]([0-9]{1,2}))?(?:\s*(?:€|EUR))?",
+    re.IGNORECASE,
+)
 
 def _parse_base_rows_loose(block: str) -> List[Dict[str, Any]]:
     if not block:
@@ -363,11 +364,8 @@ def _parse_base_rows_loose(block: str) -> List[Dict[str, Any]]:
         nonlocal acc_name, acc_nums, rows
         if not acc_name:
             return
-        # sanity: need at least 2 numbers to guess base_sum vs premium
-        nums = acc_nums[-3:]  # take last numbers seen near row end
-        nums = [n for n in nums if isinstance(n, (int, float))]
+        nums = [n for n in acc_nums if isinstance(n, (int, float))]
         if len(nums) >= 2:
-            # heuristic: base_sum is usually higher (>=300), premium is smaller (<=200)
             base_sum = max(nums)
             premium = min(nums)
             if base_sum >= 300 and premium <= 200:
@@ -377,26 +375,22 @@ def _parse_base_rows_loose(block: str) -> List[Dict[str, Any]]:
         acc_name, acc_nums = [], []
 
     for ln in lines:
-        # harvest any numbers in the line
         nums = []
         for m in _MONEY_ANYWHERE_RE.finditer(ln):
-            nums.append(_parse_money_like(m.group(0)))
-        nums = [n for n in nums if n is not None]
+            val = _parse_money_like(m.group(0))
+            if val is not None:
+                nums.append(val)
 
-        # if the line looks like a header separator, flush
         if _looks_like_base_header(ln):
             flush()
             continue
 
-        # accumulate; if we see at least 2 fresh numbers in this vicinity, flush a row
         acc_name.append(ln)
         acc_nums.extend(nums)
         if len(acc_nums) >= 2:
-            # check if the last chunk has enough spacing (end of row)
             flush()
 
     flush()
-    # Only accept as multi if we really discovered 2 or more rows
     return rows if len(rows) >= 2 else []
 
 def _detect_base_programs_from_text(full_text: str) -> List[Dict[str, Any]]:
@@ -406,8 +400,7 @@ def _detect_base_programs_from_text(full_text: str) -> List[Dict[str, Any]]:
     strict = _parse_base_rows_strict(block)
     if len(strict) >= 2:
         return strict
-    loose = _parse_base_rows_loose(block)
-    return loose
+    return _parse_base_rows_loose(block)
 
 def _ensure_features_minimal(prog: Dict[str, Any]) -> Dict[str, Any]:
     feats = prog.get("features") or {}
@@ -422,13 +415,16 @@ def _ensure_features_minimal(prog: Dict[str, Any]) -> Dict[str, Any]:
 
 def _augment_with_detected_variants(pruned_payload: Dict[str, Any], pdf_bytes: bytes) -> Dict[str, Any]:
     programs = pruned_payload.get("programs") or []
-    if len(programs) >= 2:
-        return pruned_payload  # already multi-variant
-
     full_text, _ = _pdf_pages_text(pdf_bytes)
     detected = _detect_base_programs_from_text(full_text)
 
-    if len(detected) < 2:
+    # Always record detection count for visibility in /debug/doc
+    ws = list(pruned_payload.get("warnings") or [])
+    if detected:
+        ws.append(f"postprocess: detected {len(detected)} base rows in PAMATPROGRAMMA")
+
+    if len(programs) >= 2 or len(detected) < 2:
+        pruned_payload["warnings"] = ws
         return pruned_payload
 
     base_prog = programs[0] if programs else {
@@ -452,8 +448,7 @@ def _augment_with_detected_variants(pruned_payload: Dict[str, Any], pdf_bytes: b
 
     out = dict(pruned_payload)
     out["programs"] = synthesized
-    ws = list(out.get("warnings") or [])
-    ws.append("postprocess: multiple base variants detected in PAMATPROGRAMMA; synthesized programs from base table only")
+    ws.append("postprocess: synthesized programs from base table only")
     out["warnings"] = ws
     return out
 
