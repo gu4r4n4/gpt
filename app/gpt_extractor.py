@@ -9,6 +9,8 @@ Robust extractor that:
 Safe post-process:
 - If the PDF clearly contains multiple *base* variants in PAMATPROGRAMMA, synthesize one programs[] per variant.
 - We explicitly stop before any PAPILD... section so premiums are never taken from add-ons.
+- Normalizer safety-belt: if it collapses multiple programs to a single program, restore synthesized programs
+  (can be disabled via env KEEP_SYNTH_MULTI=0).
 """
 
 from __future__ import annotations
@@ -26,7 +28,6 @@ from openai import OpenAI
 from pypdf import PdfReader
 
 from app.normalizer import normalize_offer_json
-
 
 # =========================
 # STRICT JSON SCHEMA
@@ -90,7 +91,6 @@ INSURER_OFFER_SCHEMA: Dict[str, Any] = {
 }
 _SCHEMA_VALIDATOR = Draft202012Validator(INSURER_OFFER_SCHEMA)
 
-
 # =========================
 # Features list (prompt helper)
 # =========================
@@ -133,7 +133,6 @@ FEATURE_NAMES: List[str] = [
     "Kritiskās saslimšanas",
     "Maksas stacionārie pakalpojumi, limits EUR (pp)",
 ]
-
 
 # =========================
 # Prompt
@@ -179,7 +178,6 @@ OUTPUT:
 Return STRICT JSON conforming to the schema. No markdown or prose.
 """.strip()
 
-
 # =========================
 # PDF utils & normalization helpers
 # =========================
@@ -191,13 +189,10 @@ def _pdf_to_text_pages(pdf_bytes: bytes, max_pages: int = 100) -> List[str]:
             txt = page.extract_text() or ""
         except Exception:
             txt = ""
-        # normalize NBSP/soft hyphen and CRs
         txt = txt.replace("\u00A0", " ").replace("\u00AD", "").replace("\r", "\n")
         pages.append(txt[:20000])
     return pages
 
-
-# Money parsing
 _MONEY_RE = re.compile(
     r"^\s*([0-9]{1,3}(?:[ .][0-9]{3})*|[0-9]+)(?:[.,]([0-9]{1,2}))?\s*(?:eur|€)?\s*$",
     re.IGNORECASE,
@@ -295,7 +290,6 @@ def _prune_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     out["programs"] = norm_programs or []
     return out
 
-
 # =========================
 # Heuristics: multi-variant detection (BASE ONLY)
 # =========================
@@ -309,7 +303,7 @@ _BASE_HEADER_HINTS = (
     "vienai personai",
 )
 
-# Strict single-line row pattern with OPTIONAL small "count" column between name and sums
+# Strict single-line row pattern with OPTIONAL small "count" column
 _BASE_ROW_RE = re.compile(
     r"^\s*(?P<name>[A-Za-zĀČĒĢĪĶĻŅŌŖŠŪŽāčēģīķļņōŗšūž0-9+/\-()., ]{3,}?)\s+"
     r"(?:(?P<count>\d{1,4})\s+)?"  # optional 'insured count' column
@@ -354,7 +348,6 @@ def _parse_base_rows_strict(block: str) -> List[Dict[str, Any]]:
         rows.append({"name": name, "base_sum": base_sum, "premium": premium})
     return rows
 
-# Loose, multi-line tolerant row parser
 _MONEY_ANYWHERE_RE = re.compile(
     r"([0-9]{1,3}(?:[ .][0-9]{3})*|[0-9]+)(?:[.,]([0-9]{1,2}))?(?:\s*(?:€|EUR))?",
     re.IGNORECASE,
@@ -373,8 +366,7 @@ def _parse_base_rows_loose(block: str) -> List[Dict[str, Any]]:
         if not acc_name:
             return
         nums = [n for n in acc_nums if isinstance(n, (int, float))]
-        # ignore small numbers (likely 'count'); keep last two big money-like values
-        moneyish = [n for n in nums if n >= 150]
+        moneyish = [n for n in nums if n >= 150]  # ignore tiny "count" numbers
         if len(moneyish) >= 2:
             s, p = moneyish[-2], moneyish[-1]
             base_sum, premium = (max(s, p), min(s, p))
@@ -393,7 +385,6 @@ def _parse_base_rows_loose(block: str) -> List[Dict[str, Any]]:
             val = _parse_money_like(m.group(0))
             if val is not None:
                 acc_nums.append(val)
-        # likely end-of-row if line ends with a number
         if re.search(r"\d(?:[.,]\d{2})?\s*(?:€|EUR)?\s*$", ln, re.IGNORECASE):
             flush()
 
@@ -425,10 +416,10 @@ def _augment_with_detected_variants(pruned_payload: Dict[str, Any], pdf_bytes: b
     full_text, _ = _pdf_pages_text(pdf_bytes)
     detected = _detect_base_programs_from_text(full_text)
 
-    # Always record detection count for visibility in /debug/doc
     ws = list(pruned_payload.get("warnings") or [])
     if detected:
-        ws.append(f"postprocess: detected {len(detected)} base rows in PAMATPROGRAMMA")
+        names_preview = ", ".join([d["name"] for d in detected[:4]])
+        ws.append(f"postprocess: detected {len(detected)} base rows in PAMATPROGRAMMA: {names_preview}")
 
     if len(programs) >= 2 or len(detected) < 2:
         pruned_payload["warnings"] = ws
@@ -455,10 +446,9 @@ def _augment_with_detected_variants(pruned_payload: Dict[str, Any], pdf_bytes: b
 
     out = dict(pruned_payload)
     out["programs"] = synthesized
-    ws.append("postprocess: synthesized programs from base table only")
+    ws.append(f"postprocess: synthesized {len(synthesized)} programs from PAMATPROGRAMMA (base table only)")
     out["warnings"] = ws
     return out
-
 
 # =========================
 # OpenAI client setup
@@ -476,7 +466,6 @@ def _client_singleton() -> OpenAI:
     if _client is None:
         _client = OpenAI()
     return _client
-
 
 # =========================
 # Core: Responses API path
@@ -512,7 +501,6 @@ def _responses_with_pdf(model: str, document_id: str, pdf_bytes: bytes, allow_sc
             texts.append(t)
     raw = "".join(texts).strip() or "{}"
     return json.loads(raw)
-
 
 # =========================
 # Fallback: Chat Completions with extracted text
@@ -554,12 +542,29 @@ def _chat_with_text(model: str, document_id: str, pdf_bytes: bytes) -> Dict[str,
                 return json.loads(raw[start : end + 1])
             raise
 
-
 # =========================
-# Orchestration
+# Normalizer safety-belt + orchestration
 # =========================
 class ExtractionError(Exception):
     pass
+
+def _normalize_safely(augmented: Dict[str, Any], document_id: str) -> Dict[str, Any]:
+    """Run normalizer; if it collapses synthesized multi-variant programs, restore them (unless KEEP_SYNTH_MULTI=0)."""
+    try:
+        normalized = normalize_offer_json({**augmented, "document_id": document_id})
+    except Exception as e:
+        augmented.setdefault("warnings", []).append(f"normalize_error: {e}; returning augmented")
+        return augmented
+
+    keep_multi = os.getenv("KEEP_SYNTH_MULTI", "1") != "0"
+    pre = len(augmented.get("programs") or [])
+    post = len(normalized.get("programs") or [])
+    if keep_multi and pre >= 2 and post < 2:
+        normalized["warnings"] = (normalized.get("warnings") or []) + [
+            f"postprocess: restored {pre} synthesized programs (normalizer had collapsed to {post})."
+        ]
+        normalized["programs"] = augmented["programs"]
+    return normalized
 
 def call_gpt_extractor(document_id: str, pdf_bytes: bytes, cfg: Optional[GPTConfig] = None) -> Dict[str, Any]:
     cfg = cfg or GPTConfig()
@@ -623,5 +628,5 @@ def extract_offer_from_pdf_bytes(pdf_bytes: bytes, document_id: str) -> Dict[str
         raise ExtractionError("PDF too large or empty (limit: 12MB)")
     raw = call_gpt_extractor(document_id=document_id, pdf_bytes=pdf_bytes)
     augmented = _augment_with_detected_variants(raw, pdf_bytes)
-    normalized = normalize_offer_json({**augmented, "document_id": document_id})
+    normalized = _normalize_safely(augmented, document_id=document_id)
     return normalized
