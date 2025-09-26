@@ -27,6 +27,7 @@ from pypdf import PdfReader
 
 from app.normalizer import normalize_offer_json
 
+
 # =========================
 # STRICT JSON SCHEMA
 # =========================
@@ -89,6 +90,7 @@ INSURER_OFFER_SCHEMA: Dict[str, Any] = {
 }
 _SCHEMA_VALIDATOR = Draft202012Validator(INSURER_OFFER_SCHEMA)
 
+
 # =========================
 # Features list (prompt helper)
 # =========================
@@ -131,6 +133,7 @@ FEATURE_NAMES: List[str] = [
     "Kritiskās saslimšanas",
     "Maksas stacionārie pakalpojumi, limits EUR (pp)",
 ]
+
 
 # =========================
 # Prompt
@@ -176,6 +179,7 @@ OUTPUT:
 Return STRICT JSON conforming to the schema. No markdown or prose.
 """.strip()
 
+
 # =========================
 # PDF utils & normalization helpers
 # =========================
@@ -187,9 +191,11 @@ def _pdf_to_text_pages(pdf_bytes: bytes, max_pages: int = 100) -> List[str]:
             txt = page.extract_text() or ""
         except Exception:
             txt = ""
+        # normalize NBSP/soft hyphen and CRs
         txt = txt.replace("\u00A0", " ").replace("\u00AD", "").replace("\r", "\n")
         pages.append(txt[:20000])
     return pages
+
 
 # Money parsing
 _MONEY_RE = re.compile(
@@ -252,7 +258,7 @@ def _prune_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             q["program_type"] = p["program_type"]
 
         q["base_sum_eur"] = _to_number_or_dash(p.get("base_sum_eur"))
-        q["premium_eur"] = _to_number_or_dash(p.get("premium_eur"))
+        q["premium_eur"]  = _to_number_or_dash(p.get("premium_eur"))
 
         features_in = p.get("features") or {}
         if isinstance(features_in, dict):
@@ -278,7 +284,7 @@ def _prune_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             q = {
                 "program_code": str(bp.get("name") or "Pamatprogramma").strip(),
                 "base_sum_eur": _to_number_or_dash(bp.get("base_sum_eur")),
-                "premium_eur": _to_number_or_dash(bp.get("premium_eur")),
+                "premium_eur":  _to_number_or_dash(bp.get("premium_eur")),
                 "features": {},
             }
             feats = bp.get("features") or {}
@@ -288,6 +294,7 @@ def _prune_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     out["programs"] = norm_programs or []
     return out
+
 
 # =========================
 # Heuristics: multi-variant detection (BASE ONLY)
@@ -299,12 +306,13 @@ _BASE_HEADER_HINTS = (
     "Programmas nosaukums",
     "Apdrošinājuma summa",
     "Prēmija",
-    "vienai personai",  # extra hint
+    "vienai personai",
 )
 
-# Strict single-line row pattern allowing EUR/€ after BOTH numbers
+# Strict single-line row pattern with OPTIONAL small "count" column between name and sums
 _BASE_ROW_RE = re.compile(
     r"^\s*(?P<name>[A-Za-zĀČĒĢĪĶĻŅŌŖŠŪŽāčēģīķļņōŗšūž0-9+/\-()., ]{3,}?)\s+"
+    r"(?:(?P<count>\d{1,4})\s+)?"  # optional 'insured count' column
     r"(?P<sum>(?:[0-9]{1,3}(?:[ .][0-9]{3})*|[0-9]+)(?:[.,][0-9]{1,2})?)\s*(?:€|EUR)?\s+"
     r"(?P<premium>(?:[0-9]{1,3}(?:[ .][0-9]{3})*|[0-9]+)(?:[.,][0-9]{1,2})?)\s*(?:€|EUR)?\s*$",
     re.MULTILINE,
@@ -365,29 +373,28 @@ def _parse_base_rows_loose(block: str) -> List[Dict[str, Any]]:
         if not acc_name:
             return
         nums = [n for n in acc_nums if isinstance(n, (int, float))]
-        if len(nums) >= 2:
-            base_sum = max(nums)
-            premium = min(nums)
-            if base_sum >= 300 and premium <= 200:
+        # ignore small numbers (likely 'count'); keep last two big money-like values
+        moneyish = [n for n in nums if n >= 150]
+        if len(moneyish) >= 2:
+            s, p = moneyish[-2], moneyish[-1]
+            base_sum, premium = (max(s, p), min(s, p))
+            if base_sum >= 500 and premium <= 700:
                 name = re.sub(r"\s{2,}", " ", " ".join(acc_name)).strip(" -\u200b")
                 if name and not any(h in name for h in ("Programmas", "Apdrošinājuma", "Prēmija")):
                     rows.append({"name": name, "base_sum": float(base_sum), "premium": float(premium)})
         acc_name, acc_nums = [], []
 
     for ln in lines:
-        nums = []
-        for m in _MONEY_ANYWHERE_RE.finditer(ln):
-            val = _parse_money_like(m.group(0))
-            if val is not None:
-                nums.append(val)
-
         if _looks_like_base_header(ln):
             flush()
             continue
-
         acc_name.append(ln)
-        acc_nums.extend(nums)
-        if len(acc_nums) >= 2:
+        for m in _MONEY_ANYWHERE_RE.finditer(ln):
+            val = _parse_money_like(m.group(0))
+            if val is not None:
+                acc_nums.append(val)
+        # likely end-of-row if line ends with a number
+        if re.search(r"\d(?:[.,]\d{2})?\s*(?:€|EUR)?\s*$", ln, re.IGNORECASE):
             flush()
 
     flush()
@@ -452,6 +459,7 @@ def _augment_with_detected_variants(pruned_payload: Dict[str, Any], pdf_bytes: b
     out["warnings"] = ws
     return out
 
+
 # =========================
 # OpenAI client setup
 # =========================
@@ -469,8 +477,6 @@ def _client_singleton() -> OpenAI:
         _client = OpenAI()
     return _client
 
-class ExtractionError(Exception):
-    pass
 
 # =========================
 # Core: Responses API path
@@ -506,6 +512,7 @@ def _responses_with_pdf(model: str, document_id: str, pdf_bytes: bytes, allow_sc
             texts.append(t)
     raw = "".join(texts).strip() or "{}"
     return json.loads(raw)
+
 
 # =========================
 # Fallback: Chat Completions with extracted text
@@ -547,9 +554,13 @@ def _chat_with_text(model: str, document_id: str, pdf_bytes: bytes) -> Dict[str,
                 return json.loads(raw[start : end + 1])
             raise
 
+
 # =========================
 # Orchestration
 # =========================
+class ExtractionError(Exception):
+    pass
+
 def call_gpt_extractor(document_id: str, pdf_bytes: bytes, cfg: Optional[GPTConfig] = None) -> Dict[str, Any]:
     cfg = cfg or GPTConfig()
     last_err: Optional[Exception] = None
@@ -606,9 +617,6 @@ def call_gpt_extractor(document_id: str, pdf_bytes: bytes, cfg: Optional[GPTConf
             break
 
     raise ExtractionError(f"GPT extraction failed: {last_err}")
-
-class ExtractionError(Exception):
-    pass
 
 def extract_offer_from_pdf_bytes(pdf_bytes: bytes, document_id: str) -> Dict[str, Any]:
     if not pdf_bytes or len(pdf_bytes) > 12 * 1024 * 1024:
