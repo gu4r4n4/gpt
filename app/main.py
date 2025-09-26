@@ -26,6 +26,8 @@ except Exception:  # pragma: no cover
 
 from app.gpt_extractor import extract_offer_from_pdf_bytes, ExtractionError
 from app.routes.offers_by_documents import router as offers_by_documents_router
+from app.routes.debug_db import router as debug_db_router          # <-- NEW
+from app.routes.ingest import router as ingest_router              # <-- NEW
 
 APP_NAME = "GPT Offer Extractor"
 APP_VERSION = "1.0.0"
@@ -38,7 +40,9 @@ EXEC: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=EXTRACT_WORKERS)
 _JOBS_LOCK = threading.Lock()
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
-app.include_router(offers_by_documents_router)  # << register SQLAlchemy router
+app.include_router(offers_by_documents_router)  # SQLAlchemy router
+app.include_router(debug_db_router)             # <-- NEW
+app.include_router(ingest_router)               # <-- NEW
 
 # -------------------------------
 # CORS (adjust for production)
