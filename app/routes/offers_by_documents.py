@@ -10,7 +10,8 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL env var is required")
 
-engine = create_engine(DATABASE_URL, future=True)
+# Add pool_pre_ping to avoid stale pooled connections
+engine = create_engine(DATABASE_URL, future=True, pool_pre_ping=True)
 router = APIRouter(prefix="/offers", tags=["offers"])
 
 
@@ -24,17 +25,7 @@ def offers_by_documents(payload: Dict[str, Any] = Body(...)) -> List[Dict[str, A
         "inquiry_id": 123,
         "company_name": "...",
         "employee_count": 42,
-        "programs": [
-          {
-            "row_id": 111,
-            "insurer": "Gjensidige",
-            "program_code": "Dzintars PLUSS 2",
-            "base_sum_eur": 1000.0,
-            "premium_eur": 12.34,
-            "payment_method": null,
-            "features": {...}
-          }
-        ]
+        "programs": [ { ... } ]
       }
     ]
     """
