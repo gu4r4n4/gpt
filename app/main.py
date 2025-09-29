@@ -831,6 +831,21 @@ class OfferUpdateBody(BaseModel):
     program_code: Optional[str] = None
 
 
+# DELETE one offer/program by id
+@app.delete("/offers/{offer_id}")
+def delete_offer(offer_id: int):
+    if not _supabase:
+        raise HTTPException(status_code=503, detail="DB not configured")
+    try:
+        _supabase.table(_OFFERS_TABLE).delete().eq("id", offer_id).execute()
+        # best-effort: purge from cached ids so fallback views don’t resurrect it
+        for doc_id, ids in list(_INSERTED_IDS.items()):
+            _INSERTED_IDS[doc_id] = [i for i in ids if i != offer_id]
+        return {"ok": True, "deleted": offer_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"delete failed: {e}")
+
+
 @app.patch("/offers/{offer_id}")
 def update_offer(offer_id: int, body: OfferUpdateBody):
     if not _supabase:
