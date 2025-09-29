@@ -15,6 +15,7 @@ from typing import List, Optional, Dict, Any, Tuple
 from fastapi import (
     FastAPI, File, UploadFile, HTTPException, Form, Request, Body
 )
+    # fmt: off
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -273,7 +274,7 @@ def _rows_for_offers_table(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "status": "parsed",
                 "error": None,
                 "company_name": company_name,
-                "employee_count": int(employee_count) if isinstance(employee_count, (int, float)) else None,
+                "employee_count": employee_count if isinstance(employee_count, int) else None,
                 # multi-tenant fields (ensure DB columns exist)
                 "org_id": org_id,
                 "created_by_user_id": created_by_user_id,
@@ -296,7 +297,7 @@ def _rows_for_offers_table(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             "status": "error",
             "error": payload.get("_error") or "no programs",
             "company_name": company_name,
-            "employee_count": int(employee_count) if isinstance(employee_count, (int, float)) else None,
+            "employee_count": employee_count if isinstance(employee_count, int) else None,
             # multi-tenant fields
             "org_id": org_id,
             "created_by_user_id": created_by_user_id,
@@ -547,7 +548,8 @@ async def extract_multiple(request: Request):
     for idx, f in enumerate(files, start=1):
         filename = f.filename or "uploaded.pdf"
         if not filename.lower().endswith(".pdf"):
-            results.append({"document_id": filename, "error": "Unsupported file type (only PDF)"})
+            results.append({"document_id": filename, "error": "Unsupported file type (only PDF)")
+            ]
             continue
         try:
             doc_id = _make_doc_id(batch_id, idx, filename)
@@ -923,6 +925,8 @@ class ShareCreateBody(BaseModel):
     role: Optional[str] = None
     allow_edit_fields: Optional[List[str]] = None
     insurer_only: Optional[str] = None
+    # NEW: preferences for FE (column order, hidden rows, etc.)
+    view_prefs: Optional[Dict[str, Any]] = None   # <<<<<< ADDED
 
 def _gen_token() -> str:
     return secrets.token_urlsafe(16)
@@ -945,6 +949,8 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
         "role": body.role,
         "allow_edit_fields": body.allow_edit_fields,
         "insurer_only": body.insurer_only,
+        # keep in payload for back-compat; top-level column also persisted
+        "view_prefs": body.view_prefs or {},        # <<<<<< NEW
     }
 
     expires_at = None
@@ -956,6 +962,7 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
         "inquiry_id": None,
         "payload": payload,
         "expires_at": expires_at,
+        "view_prefs": body.view_prefs or {},        # <<<<<< NEW: store in dedicated column
     }
 
     if _supabase:
@@ -975,7 +982,8 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
         except Exception:
             url = f"/shares/{token}"
 
-    return {"ok": True, "token": token, "url": url, "title": body.title}
+    # include view_prefs in the response so FE can immediately use it if needed
+    return {"ok": True, "token": token, "url": url, "title": body.title, "view_prefs": body.view_prefs or {}}
 
 
 @app.get("/shares/{token}", name="get_share_token_only")
@@ -1031,6 +1039,8 @@ def get_share_token_only(token: str):
     resp["allow_edit_fields"] = payload.get("allow_edit_fields") or []
     # helpful for debugging in FE
     resp["filtered_insurer"] = payload.get("insurer_only") or ""
+    # >>> return view preferences so FE can restore user view exactly
+    resp["view_prefs"] = share.get("view_prefs") or payload.get("view_prefs") or {}  # <<<<<< NEW
 
     return resp
 
