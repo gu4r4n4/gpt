@@ -12,10 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any, Tuple
 
-from fastapi import (
-    FastAPI, File, UploadFile, HTTPException, Form, Request, Body
-)
-    # fmt: off
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -28,8 +25,8 @@ except Exception:  # pragma: no cover
 
 from app.gpt_extractor import extract_offer_from_pdf_bytes, ExtractionError
 from app.routes.offers_by_documents import router as offers_by_documents_router
-from app.routes.debug_db import router as debug_db_router          # <-- NEW
-from app.routes.ingest import router as ingest_router              # <-- NEW
+from app.routes.debug_db import router as debug_db_router
+from app.routes.ingest import router as ingest_router
 
 APP_NAME = "GPT Offer Extractor"
 APP_VERSION = "1.0.0"
@@ -43,8 +40,8 @@ _JOBS_LOCK = threading.Lock()
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 app.include_router(offers_by_documents_router)  # SQLAlchemy router
-app.include_router(debug_db_router)             # <-- NEW
-app.include_router(ingest_router)               # <-- NEW
+app.include_router(debug_db_router)
+app.include_router(ingest_router)
 
 # -------------------------------
 # CORS (adjust for production)
@@ -75,10 +72,10 @@ if _SUPABASE_URL and _SUPABASE_KEY and create_client is not None:
 # -------------------------------
 # In-memory helpers (single process)
 # -------------------------------
-_jobs: Dict[str, Dict[str, Any]] = {}            # job_id -> { total, done, errors, docs: [doc_ids...], timings: {doc_id: {...}} }
+_jobs: Dict[str, Dict[str, Any]] = {}            # job_id -> { total, done, errors, docs, timings }
 _LAST_RESULTS: Dict[str, Dict[str, Any]] = {}    # doc_id -> payload (dev + supabase-fallback)
 _SHARES_FALLBACK: Dict[str, Dict[str, Any]] = {} # token -> row
-_INSERTED_IDS: Dict[str, List[int]] = {}         # doc_id -> [row ids] (to expose row_id even if we fall back)
+_INSERTED_IDS: Dict[str, List[int]] = {}         # doc_id -> [row ids]
 
 # -------------------------------
 # Request context (org & user)
@@ -173,7 +170,7 @@ def _inject_meta(payload: Dict[str, Any], *, insurer: str, company: str, insured
     payload["inquiry_id"] = int(inquiry_id) if str(inquiry_id).isdigit() else None
 
 
-# ---------- NEW: helpers to avoid duplicate (filename, insurer, program_code) ----------
+# ---------- Helpers to avoid duplicate (filename, insurer, program_code) ----------
 def _feature_value(x: Any) -> Any:
     if isinstance(x, dict):
         return x.get("value")
@@ -205,7 +202,6 @@ def _disambiguate_duplicate_program_codes(rows: List[Dict[str, Any]]) -> List[Di
             r = rows[idx]
             f = r.get("features") or {}
 
-            # Try to use a distinguishing attribute from features/premium/base_sum
             stac = (
                 _feature_value(f.get("Maksas stacionārie pakalpojumi, limits EUR"))
                 or _feature_value(f.get("Maksas stacionārie pakalpojumi, limits EUR (pp)"))
@@ -226,7 +222,6 @@ def _disambiguate_duplicate_program_codes(rows: List[Dict[str, Any]]) -> List[Di
 
             label = f"{base_label} — {suffix}" if suffix else f"{base_label} — variants {n}"
 
-            # Ensure within this set it's unique
             uniq = label
             k = 2
             while uniq in used_labels:
@@ -258,28 +253,26 @@ def _rows_for_offers_table(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     programs = payload.get("programs", []) or []
     if programs:
         for prog in programs:
-            insurer_val = prog.get("insurer") or hint  # fallback to user-selected hint
+            insurer_val = prog.get("insurer") or hint
             rows.append({
                 "insurer": insurer_val,
-                "company_hint": hint,             # dropdown hint
+                "company_hint": hint,
                 "program_code": prog.get("program_code"),
                 "source": "api",
-                "filename": doc_id,               # UNIQUE per run (sanitized)
-                "inquiry_id": inquiry_id,         # nullable
+                "filename": doc_id,
+                "inquiry_id": inquiry_id,
                 "base_sum_eur": _num(prog.get("base_sum_eur")),
                 "premium_eur": _num(prog.get("premium_eur")),
                 "payment_method": prog.get("payment_method"),
                 "features": prog.get("features") or {},
-                "raw_json": payload,              # provenance/debug
+                "raw_json": payload,
                 "status": "parsed",
                 "error": None,
                 "company_name": company_name,
-                "employee_count": employee_count if isinstance(employee_count, int) else None,
-                # multi-tenant fields (ensure DB columns exist)
+                "employee_count": int(employee_count) if isinstance(employee_count, (int, float)) else None,
                 "org_id": org_id,
                 "created_by_user_id": created_by_user_id,
             })
-        # NEW: ensure (filename, insurer, program_code) is unique to satisfy DB constraint
         rows = _disambiguate_duplicate_program_codes(rows)
     else:
         rows.append({
@@ -297,8 +290,7 @@ def _rows_for_offers_table(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             "status": "error",
             "error": payload.get("_error") or "no programs",
             "company_name": company_name,
-            "employee_count": employee_count if isinstance(employee_count, int) else None,
-            # multi-tenant fields
+            "employee_count": int(employee_count) if isinstance(employee_count, (int, float)) else None,
             "org_id": org_id,
             "created_by_user_id": created_by_user_id,
         })
@@ -318,15 +310,13 @@ def _aggregate_offers_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "status": r.get("status") or "parsed",
                 "error": r.get("error"),
                 "company_hint": r.get("company_hint"),
-                # prefer explicit insurer_hint (if present), then parsed insurer, then company_hint
                 "insurer_hint": r.get("insurer_hint") or r.get("insurer") or r.get("company_hint"),
                 "company_name": r.get("company_name"),
                 "employee_count": r.get("employee_count"),
             }
-        # If this row has a program, collect it
         if (r.get("status") or "parsed") != "error":
             grouped[src]["programs"].append({
-                "row_id": r.get("id"),  # <-- used by FE for edits
+                "row_id": r.get("id"),
                 "insurer": r.get("insurer"),
                 "program_code": r.get("program_code"),
                 "base_sum_eur": r.get("base_sum_eur"),
@@ -334,12 +324,10 @@ def _aggregate_offers_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "payment_method": r.get("payment_method"),
                 "features": r.get("features") or {},
             })
-        # Prefer parsed status if any row parsed successfully
         if grouped[src]["status"] == "error" and (r.get("status") or "parsed") == "parsed":
             grouped[src]["status"] = "parsed"
             grouped[src]["error"] = None
 
-    # If a group has 0 programs and no explicit error, flag it
     for g in grouped.values():
         if not g["programs"] and not g.get("error"):
             g["status"] = "error"
@@ -353,7 +341,7 @@ def save_to_supabase(payload: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     Compatible with older supabase-py that doesn't support .insert(...).select(...).
     """
     doc_id = payload.get("document_id") or payload.get("source_file") or "uploaded.pdf"
-    _LAST_RESULTS[doc_id] = payload  # keep a fallback copy regardless of DB
+    _LAST_RESULTS[doc_id] = payload
 
     if not _supabase:
         return True, None
@@ -361,10 +349,8 @@ def save_to_supabase(payload: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     try:
         rows = _rows_for_offers_table(payload)
 
-        # 1) INSERT without chaining .select()  (older supabase-py)
         _supabase.table(_OFFERS_TABLE).insert(rows).execute()
 
-        # 2) Fetch inserted ids by filename so FE can PATCH using row_id
         try:
             q = (
                 _supabase.table(_OFFERS_TABLE)
@@ -377,7 +363,6 @@ def save_to_supabase(payload: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
             if ids:
                 _INSERTED_IDS[doc_id] = ids
         except Exception:
-            # best-effort; edits will still work because /offers/by-documents pulls from DB with ids
             pass
 
         return True, None
@@ -396,7 +381,6 @@ def _rows_from_fallback(doc_ids: List[str]) -> List[Dict[str, Any]]:
         if not p:
             continue
         rs = _rows_for_offers_table(p)
-        # Stitch DB ids we cached at insert time (best-effort order)
         ids = _INSERTED_IDS.get(doc_id) or []
         if ids:
             k = 0
@@ -420,7 +404,7 @@ def _offers_by_document_ids(doc_ids: List[str]) -> List[Dict[str, Any]]:
                 _supabase.table(_OFFERS_TABLE)
                 .select("*")
                 .in_("filename", doc_ids)
-                .execute()  # removed ORDER BY created_at for speed
+                .execute()
             )
             rows = res.data or []
         except Exception as e:
@@ -462,7 +446,6 @@ async def extract_pdf(
     try:
         payload = extract_offer_from_pdf_bytes(data, document_id=doc_id)
         payload["original_filename"] = original_name
-        # carry context
         payload["_org_id"] = org_id
         payload["_user_id"] = user_id
 
@@ -548,8 +531,7 @@ async def extract_multiple(request: Request):
     for idx, f in enumerate(files, start=1):
         filename = f.filename or "uploaded.pdf"
         if not filename.lower().endswith(".pdf"):
-            results.append({"document_id": filename, "error": "Unsupported file type (only PDF)")
-            ]
+            results.append({"document_id": filename, "error": "Unsupported file type (only PDF)"})
             continue
         try:
             doc_id = _make_doc_id(batch_id, idx, filename)
@@ -600,7 +582,6 @@ async def extract_multiple_async(request: Request):
         _jobs[job_id] = {"total": len(files), "done": 0, "errors": [], "docs": [], "timings": {}}
 
     doc_ids: List[str] = []
-    # Enqueue each file to thread-pool workers
     for idx, f in enumerate(files, start=1):
         filename = f.filename or "uploaded.pdf"
         doc_id = _make_doc_id(job_id, idx, filename)
@@ -647,12 +628,10 @@ def _process_pdf_bytes(
             rec["timings"].setdefault(doc_id, {})["queue_s"] = round(t_start - float(enq_ts), 3)
 
     try:
-        # LLM extraction timing
         t_llm0 = time.monotonic()
         payload = extract_offer_from_pdf_bytes(data, document_id=doc_id)
         t_llm = time.monotonic() - t_llm0
 
-        # DB timing (including meta injection)
         t_db0 = time.monotonic()
         payload["original_filename"] = original_name
         payload["_org_id"] = org_id
@@ -666,7 +645,6 @@ def _process_pdf_bytes(
             "db_s": round(t_db, 3),
             "total_s": round(time.monotonic() - t_start, 3),
         }
-        # Keep a latest copy for debug/fallback
         _LAST_RESULTS[doc_id] = payload
 
         with _JOBS_LOCK:
@@ -681,7 +659,6 @@ def _process_pdf_bytes(
             if rec is not None:
                 rec["errors"].append({"document_id": doc_id, "error": f"extract: {e}"})
                 rec["timings"].setdefault(doc_id, {})["total_s"] = round(time.monotonic() - t_start, 3)
-        # store minimal error payload for fallback visibility
         payload = {
             "document_id": doc_id,
             "original_filename": original_name,
@@ -775,7 +752,6 @@ def instantiate_template(template_id: int, request: Request, company: str = Form
     )
     defaults = tpl.get("defaults") or {}
 
-    # Insert one program row in public.offers
     row = {
         "insurer": tpl.get("insurer"),
         "company_hint": tpl.get("insurer"),
@@ -792,13 +768,11 @@ def instantiate_template(template_id: int, request: Request, company: str = Form
         "error": None,
         "company_name": company or "-",
         "employee_count": int(insured_count) if insured_count else None,
-        # multi-tenant stamps
         "org_id": org_id,
         "created_by_user_id": user_id,
     }
     _supabase.table(_OFFERS_TABLE).insert(row).execute()
 
-    # bump usage (optional RPC; ignore if not present)
     try:
         _supabase.rpc("increment_template_usage", {"t_id": template_id}).execute()
     except Exception:
@@ -809,11 +783,6 @@ def instantiate_template(template_id: int, request: Request, company: str = Form
 # -------------------------------
 # Read/Update offers
 # -------------------------------
-
-# NOTE: the old inline /offers/by-documents route was REMOVED.
-# The endpoint is now served exclusively by the SQLAlchemy router:
-# POST /offers/by-documents  (see app/routes/offers_by_documents.py)
-
 @app.get("/offers/by-job/{job_id}")
 def offers_by_job(job_id: str):
     with _JOBS_LOCK:
@@ -833,14 +802,12 @@ class OfferUpdateBody(BaseModel):
     program_code: Optional[str] = None
 
 
-# DELETE one offer/program by id
 @app.delete("/offers/{offer_id}")
 def delete_offer(offer_id: int):
     if not _supabase:
         raise HTTPException(status_code=503, detail="DB not configured")
     try:
         _supabase.table(_OFFERS_TABLE).delete().eq("id", offer_id).execute()
-        # best-effort: purge from cached ids so fallback views don’t resurrect it
         for doc_id, ids in list(_INSERTED_IDS.items()):
             _INSERTED_IDS[doc_id] = [i for i in ids if i != offer_id]
         return {"ok": True, "deleted": offer_id}
@@ -885,7 +852,6 @@ def update_offer(offer_id: int, body: OfferUpdateBody):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"update failed: {e}")
 
-
 # (legacy — still available)
 @app.get("/offers/by-inquiry/{inquiry_id}")
 def offers_by_inquiry(inquiry_id: int):
@@ -895,7 +861,7 @@ def offers_by_inquiry(inquiry_id: int):
                 _supabase.table(_OFFERS_TABLE)
                 .select("*")
                 .eq("inquiry_id", inquiry_id)
-                .execute()  # removed ORDER BY created_at for speed
+                .execute()
             )
             rows = res.data or []
         except Exception as e:
@@ -920,13 +886,12 @@ class ShareCreateBody(BaseModel):
     document_ids: Optional[List[str]] = None
     results: Optional[List[Dict[str, Any]]] = None
     expires_in_hours: Optional[int] = Field(720, ge=0, description="0 = never expires")
-    # optional flags for role/permissions and insurer filtering
     editable: Optional[bool] = None
     role: Optional[str] = None
     allow_edit_fields: Optional[List[str]] = None
     insurer_only: Optional[str] = None
-    # NEW: preferences for FE (column order, hidden rows, etc.)
-    view_prefs: Optional[Dict[str, Any]] = None   # <<<<<< ADDED
+    # FE view preferences (column order, hidden rows, etc.)
+    view_prefs: Optional[Dict[str, Any]] = None
 
 def _gen_token() -> str:
     return secrets.token_urlsafe(16)
@@ -944,13 +909,11 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
         "employees_count": body.employees_count,
         "document_ids": body.document_ids or [],
         "results": body.results if mode == "snapshot" else None,
-        # pass-through flags
         "editable": body.editable,
         "role": body.role,
         "allow_edit_fields": body.allow_edit_fields,
         "insurer_only": body.insurer_only,
-        # keep in payload for back-compat; top-level column also persisted
-        "view_prefs": body.view_prefs or {},        # <<<<<< NEW
+        "view_prefs": body.view_prefs or {},
     }
 
     expires_at = None
@@ -962,7 +925,7 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
         "inquiry_id": None,
         "payload": payload,
         "expires_at": expires_at,
-        "view_prefs": body.view_prefs or {},        # <<<<<< NEW: store in dedicated column
+        "view_prefs": body.view_prefs or {},  # stored in dedicated column too
     }
 
     if _supabase:
@@ -982,7 +945,6 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
         except Exception:
             url = f"/shares/{token}"
 
-    # include view_prefs in the response so FE can immediately use it if needed
     return {"ok": True, "token": token, "url": url, "title": body.title, "view_prefs": body.view_prefs or {}}
 
 
@@ -1017,7 +979,7 @@ def get_share_token_only(token: str):
     else:
         offers = []
 
-    # Optional: filter to a single insurer for insurer-confirmation links
+    # Optional: filter by a single insurer (insurer confirmation links)
     def _norm(s: Optional[str]) -> str:
         return (s or "").strip().lower()
 
@@ -1033,14 +995,12 @@ def get_share_token_only(token: str):
         offers = filtered
 
     resp["offers"] = offers
-    # mirror flags so FE can enforce permissions
     resp["editable"] = bool(payload.get("editable"))
     resp["role"] = payload.get("role") or "broker"
     resp["allow_edit_fields"] = payload.get("allow_edit_fields") or []
-    # helpful for debugging in FE
     resp["filtered_insurer"] = payload.get("insurer_only") or ""
-    # >>> return view preferences so FE can restore user view exactly
-    resp["view_prefs"] = share.get("view_prefs") or payload.get("view_prefs") or {}  # <<<<<< NEW
+    # Return view prefs (prefer dedicated column, fallback to payload)
+    resp["view_prefs"] = share.get("view_prefs") or payload.get("view_prefs") or {}
 
     return resp
 
