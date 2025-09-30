@@ -9,10 +9,10 @@ import secrets
 import threading
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Dict, Any, Tuple
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Request, Body, Header, Depends
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Request, Body, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -549,7 +549,6 @@ async def extract_multiple(request: Request):
             results.append(payload)
             doc_ids.append(doc_id)
         except ExtractionError as e:
-            # doc_id may be undefined if error happened before creation; use filename as safe fallback
             err_doc_id = locals().get("doc_id", f"{batch_id}::{idx}::{_safe_filename(filename)}")
             payload = {
                 "document_id": err_doc_id,
@@ -803,27 +802,36 @@ class OfferUpdateBody(BaseModel):
     insurer: Optional[str] = None
     program_code: Optional[str] = None
 
-# ---------- Share token auth helpers for edit/delete ----------
+# ---------- Share token helpers ----------
 def _load_share_record(token: str) -> Optional[Dict[str, Any]]:
+    """Try DB first; if not found or error, fall back to in-proc cache."""
     if not token:
         return None
+    rec = None
     if _supabase:
         try:
             res = _supabase.table(_SHARE_TABLE).select("*").eq("token", token).limit(1).execute()
             rows = res.data or []
-            return rows[0] if rows else None
-        except Exception:
-            return None
-    return _SHARES_FALLBACK.get(token)
+            if rows:
+                rec = rows[0]
+        except Exception as e:
+            print(f"[warn] share select failed: {e}")
+    if not rec:
+        rec = _SHARES_FALLBACK.get(token)
+    return rec
 
-def _parse_iso_utc(s: Optional[str]) -> Optional[datetime]:
+def _parse_to_utc_naive(s: Optional[str]) -> Optional[datetime]:
+    """
+    Parse ISO string with 'Z', '+00:00', or no tz, return UTC-naive datetime.
+    """
     if not s:
         return None
     try:
-        # Accept "Z" suffix or offsetless ISO
-        if s.endswith("Z"):
-            s = s[:-1]
-        return datetime.fromisoformat(s)
+        iso = s.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
     except Exception:
         return None
 
@@ -833,8 +841,8 @@ def _ensure_share_editable(share_token: Optional[str]) -> None:
     rec = _load_share_record(share_token)
     if not rec:
         raise HTTPException(status_code=403, detail="Invalid share token")
-    exp = _parse_iso_utc(rec.get("expires_at"))
-    if exp and datetime.utcnow() > exp:
+    exp = _parse_to_utc_naive(rec.get("expires_at"))
+    if exp is not None and datetime.utcnow() > exp:
         raise HTTPException(status_code=403, detail="Share token expired")
     payload = rec.get("payload") or {}
     if not bool(payload.get("editable")):
@@ -842,7 +850,6 @@ def _ensure_share_editable(share_token: Optional[str]) -> None:
 
 @app.delete("/offers/{offer_id}")
 def delete_offer(offer_id: int, x_share_token: Optional[str] = Header(default=None, alias="X-Share-Token")):
-    # If a share token is provided, require it to be editable
     _ensure_share_editable(x_share_token)
 
     if not _supabase:
@@ -857,7 +864,6 @@ def delete_offer(offer_id: int, x_share_token: Optional[str] = Header(default=No
 
 @app.patch("/offers/{offer_id}")
 def update_offer(offer_id: int, body: OfferUpdateBody, x_share_token: Optional[str] = Header(default=None, alias="X-Share-Token")):
-    # If a share token is provided, require it to be editable
     _ensure_share_editable(x_share_token)
 
     if not _supabase:
@@ -870,7 +876,7 @@ def update_offer(offer_id: int, body: OfferUpdateBody, x_share_token: Optional[s
             raise HTTPException(status_code=400, detail="premium_eur must be numeric")
         updates["premium_eur"] = v
     if body.base_sum_eur is not None:
-        v = _num(body.base_sum_eur)
+        v = _num(body.base_sum_er)
         if v is None:
             raise HTTPException(status_code=400, detail="base_sum_eur must be numeric")
         updates["base_sum_eur"] = v
@@ -976,8 +982,9 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
             _supabase.table(_SHARE_TABLE).insert(row).execute()
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Share create failed: {e}")
-    else:
-        _SHARES_FALLBACK[token] = row
+
+    # Always keep a hot cache copy so GET works even if RLS/replication blocks reads.
+    _SHARES_FALLBACK[token] = row
 
     base = os.getenv("SHARE_BASE_URL")
     if base:
@@ -988,31 +995,20 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
         except Exception:
             url = f"/shares/{token}"
 
-    # Returning view_prefs here is harmless, but FE uses GET for reading payload
+    # Returning view_prefs here is harmless; FE reads the payload on GET.
     return {"ok": True, "token": token, "url": url, "title": body.title, "view_prefs": body.view_prefs or {}}
 
 
 @app.get("/shares/{token}", name="get_share_token_only")
 def get_share_token_only(token: str):
     """Return snapshot results or dynamic offers for a token (with optional insurer-only filtering)."""
-    share: Optional[Dict[str, Any]] = None
-    if _supabase:
-        try:
-            res = _supabase.table(_SHARE_TABLE).select("*").eq("token", token).limit(1).execute()
-            rows = res.data or []
-            if rows:
-                share = rows[0]
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Share fetch failed: {e}")
-    else:
-        share = _SHARES_FALLBACK.get(token)
-
+    share = _load_share_record(token)
     if not share:
         raise HTTPException(status_code=404, detail="Share token not found")
 
-    # Expiry check
-    exp = _parse_iso_utc(share.get("expires_at"))
-    if exp and datetime.utcnow() > exp:
+    # Expiry check (robust)
+    exp = _parse_to_utc_naive(share.get("expires_at"))
+    if exp is not None and datetime.utcnow() > exp:
         raise HTTPException(status_code=404, detail="Share token expired")
 
     payload = share.get("payload") or {}
@@ -1055,7 +1051,7 @@ def get_share_token_only(token: str):
     return {
         "ok": True,
         "token": token,
-        "payload": response_payload,   # <-- FE reads editable & view_prefs from here
+        "payload": response_payload,   # FE reads editable & view_prefs from here
         "offers": offers,
     }
 
