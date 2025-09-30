@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any, Tuple
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Request, Body
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Request, Body, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -48,7 +48,7 @@ app.include_router(ingest_router)
 # -------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten in production
+    allow_origins=["*"],  # tighten in production (e.g., ["https://vis.ongo.lv"])
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -549,8 +549,10 @@ async def extract_multiple(request: Request):
             results.append(payload)
             doc_ids.append(doc_id)
         except ExtractionError as e:
+            # doc_id may be undefined if error happened before creation; use filename as safe fallback
+            err_doc_id = locals().get("doc_id", f"{batch_id}::{idx}::{_safe_filename(filename)}")
             payload = {
-                "document_id": filename,
+                "document_id": err_doc_id,
                 "original_filename": filename,
                 "programs": [],
                 "_error": f"ExtractionError: {e}",
@@ -558,7 +560,7 @@ async def extract_multiple(request: Request):
                 "_user_id": user_id,
             }
             _inject_meta(payload, insurer=insurers[idx - 1] or "", company=company, insured_count=insured_count, inquiry_id=inquiry_id)
-            _LAST_RESULTS[doc_id] = payload
+            _LAST_RESULTS[err_doc_id] = payload
             results.append(payload)
         except Exception as e:
             results.append({"document_id": filename, "error": f"Unexpected error: {e}"})
@@ -801,9 +803,48 @@ class OfferUpdateBody(BaseModel):
     insurer: Optional[str] = None
     program_code: Optional[str] = None
 
+# ---------- Share token auth helpers for edit/delete ----------
+def _load_share_record(token: str) -> Optional[Dict[str, Any]]:
+    if not token:
+        return None
+    if _supabase:
+        try:
+            res = _supabase.table(_SHARE_TABLE).select("*").eq("token", token).limit(1).execute()
+            rows = res.data or []
+            return rows[0] if rows else None
+        except Exception:
+            return None
+    return _SHARES_FALLBACK.get(token)
+
+def _parse_iso_utc(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        # Accept "Z" suffix or offsetless ISO
+        if s.endswith("Z"):
+            s = s[:-1]
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+def _ensure_share_editable(share_token: Optional[str]) -> None:
+    if not share_token:
+        return
+    rec = _load_share_record(share_token)
+    if not rec:
+        raise HTTPException(status_code=403, detail="Invalid share token")
+    exp = _parse_iso_utc(rec.get("expires_at"))
+    if exp and datetime.utcnow() > exp:
+        raise HTTPException(status_code=403, detail="Share token expired")
+    payload = rec.get("payload") or {}
+    if not bool(payload.get("editable")):
+        raise HTTPException(status_code=403, detail="Share is read-only")
 
 @app.delete("/offers/{offer_id}")
-def delete_offer(offer_id: int):
+def delete_offer(offer_id: int, x_share_token: Optional[str] = Header(default=None, alias="X-Share-Token")):
+    # If a share token is provided, require it to be editable
+    _ensure_share_editable(x_share_token)
+
     if not _supabase:
         raise HTTPException(status_code=503, detail="DB not configured")
     try:
@@ -814,9 +855,11 @@ def delete_offer(offer_id: int):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"delete failed: {e}")
 
-
 @app.patch("/offers/{offer_id}")
-def update_offer(offer_id: int, body: OfferUpdateBody):
+def update_offer(offer_id: int, body: OfferUpdateBody, x_share_token: Optional[str] = Header(default=None, alias="X-Share-Token")):
+    # If a share token is provided, require it to be editable
+    _ensure_share_editable(x_share_token)
+
     if not _supabase:
         raise HTTPException(status_code=503, detail="DB not configured")
 
@@ -945,6 +988,7 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
         except Exception:
             url = f"/shares/{token}"
 
+    # Returning view_prefs here is harmless, but FE uses GET for reading payload
     return {"ok": True, "token": token, "url": url, "title": body.title, "view_prefs": body.view_prefs or {}}
 
 
@@ -966,9 +1010,13 @@ def get_share_token_only(token: str):
     if not share:
         raise HTTPException(status_code=404, detail="Share token not found")
 
+    # Expiry check
+    exp = _parse_iso_utc(share.get("expires_at"))
+    if exp and datetime.utcnow() > exp:
+        raise HTTPException(status_code=404, detail="Share token expired")
+
     payload = share.get("payload") or {}
     mode = payload.get("mode") or "snapshot"
-    resp: Dict[str, Any] = {"ok": True, "token": token, "payload": payload}
 
     # Build offers (snapshot or dynamic)
     if mode == "snapshot" and payload.get("results"):
@@ -994,15 +1042,22 @@ def get_share_token_only(token: str):
                 filtered.append(ng)
         offers = filtered
 
-    resp["offers"] = offers
-    resp["editable"] = bool(payload.get("editable"))
-    resp["role"] = payload.get("role") or "broker"
-    resp["allow_edit_fields"] = payload.get("allow_edit_fields") or []
-    resp["filtered_insurer"] = payload.get("insurer_only") or ""
-    # Return view prefs (prefer dedicated column, fallback to payload)
-    resp["view_prefs"] = share.get("view_prefs") or payload.get("view_prefs") or {}
+    # Shape EXACTLY as Share.tsx expects:
+    response_payload = {
+        "company_name": payload.get("company_name"),
+        "employees_count": payload.get("employees_count"),
+        "editable": bool(payload.get("editable")),
+        "role": payload.get("role") or "broker",
+        "allow_edit_fields": payload.get("allow_edit_fields") or [],
+        "view_prefs": share.get("view_prefs") or payload.get("view_prefs") or {},
+    }
 
-    return resp
+    return {
+        "ok": True,
+        "token": token,
+        "payload": response_payload,   # <-- FE reads editable & view_prefs from here
+        "offers": offers,
+    }
 
 # -------------------------------
 # Debug helpers
