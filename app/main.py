@@ -873,24 +873,30 @@ def delete_offer(offer_id: int, x_share_token: Optional[str] = Header(default=No
 def update_offer(
     offer_id: int,
     body: OfferUpdateBody,
-    x_share_token: Optional[str] = Header(default=None, alias="X-Share-Token")
+    x_share_token: Optional[str] = Header(default=None, alias="X-Share-Token"),
 ):
+    # Share token must be valid & editable when present
     _ensure_share_editable(x_share_token)
 
     if not _supabase:
         raise HTTPException(status_code=503, detail="DB not configured")
 
     updates: Dict[str, Any] = {}
+
+    # --- numeric fields (with robust coercion) ---
     if body.premium_eur is not None:
         v = _num(body.premium_eur)
         if v is None:
             raise HTTPException(status_code=400, detail="premium_eur must be numeric")
         updates["premium_eur"] = v
-    if body.base_sum_eur is not None:
-        v = _num(body.base_sum_eur)  # fixed typo
+
+    if body.base_sum_eur is not None:  # <-- FIXED: was 'base_sum_er'
+        v = _num(body.base_sum_eur)
         if v is None:
             raise HTTPException(status_code=400, detail="base_sum_eur must be numeric")
         updates["base_sum_eur"] = v
+
+    # --- text/json fields ---
     if body.payment_method is not None:
         updates["payment_method"] = body.payment_method
     if body.features is not None:
@@ -904,22 +910,34 @@ def update_offer(
         raise HTTPException(status_code=400, detail="no changes provided")
 
     try:
-        # IMPORTANT: chain .select("*") so we actually get a row back
-        res = (
+        # 1) Perform the update (NO .select() chaining here)
+        upd = (
             _supabase.table(_OFFERS_TABLE)
             .update(updates)
             .eq("id", offer_id)
+            .execute()
+        )
+
+        # If the client/lib doesn’t return rows on update, fetch the row explicitly.
+        # This works across supabase-py versions and keeps the response shape stable.
+        sel = (
+            _supabase.table(_OFFERS_TABLE)
             .select("*")
+            .eq("id", offer_id)
             .limit(1)
             .execute()
         )
-        rows = res.data or []
+        rows = sel.data or []
 
-        # Fallback: if the client doesn't need the full row, still return ok
         if not rows:
-            return {"ok": True, "offer": {"id": offer_id, **updates}}
+            # Either the row doesn't exist, RLS blocked it, or no row was updated.
+            # Keep the error message the same to avoid FE breakage.
+            raise HTTPException(status_code=404, detail="offer not found")
 
         return {"ok": True, "offer": rows[0]}
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"update failed: {e}")
 
