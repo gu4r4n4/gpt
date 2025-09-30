@@ -803,22 +803,26 @@ class OfferUpdateBody(BaseModel):
     program_code: Optional[str] = None
 
 # ---------- Share token helpers ----------
-def _load_share_record(token: str) -> Optional[Dict[str, Any]]:
-    """Try DB first; if not found or error, fall back to in-proc cache."""
+def _load_share_record(token: str, attempts: int = 6, delay_s: float = 0.15) -> Optional[Dict[str, Any]]:
+    """
+    Try DB a few times (to bridge replication/lag), then fall back to in-proc cache.
+    """
     if not token:
         return None
-    rec = None
+    # Try DB
     if _supabase:
-        try:
-            res = _supabase.table(_SHARE_TABLE).select("*").eq("token", token).limit(1).execute()
-            rows = res.data or []
-            if rows:
-                rec = rows[0]
-        except Exception as e:
-            print(f"[warn] share select failed: {e}")
-    if not rec:
-        rec = _SHARES_FALLBACK.get(token)
-    return rec
+        for i in range(max(1, attempts)):
+            try:
+                res = _supabase.table(_SHARE_TABLE).select("*").eq("token", token).limit(1).execute()
+                rows = res.data or []
+                if rows:
+                    return rows[0]
+            except Exception as e:
+                print(f"[warn] share select failed (attempt {i+1}): {e}")
+            if i + 1 < attempts:
+                time.sleep(delay_s)
+    # Fallback cache (same-dyno hot path)
+    return _SHARES_FALLBACK.get(token)
 
 def _parse_to_utc_naive(s: Optional[str]) -> Optional[datetime]:
     """
@@ -876,7 +880,7 @@ def update_offer(offer_id: int, body: OfferUpdateBody, x_share_token: Optional[s
             raise HTTPException(status_code=400, detail="premium_eur must be numeric")
         updates["premium_eur"] = v
     if body.base_sum_eur is not None:
-        v = _num(body.base_sum_er)
+        v = _num(body.base_sum_eur)  # <-- fixed typo: base_sum_eur
         if v is None:
             raise HTTPException(status_code=400, detail="base_sum_eur must be numeric")
         updates["base_sum_eur"] = v
