@@ -44,13 +44,13 @@ app.include_router(debug_db_router)
 app.include_router(ingest_router)
 
 # -------------------------------
-# CORS (adjust for production)
+# CORS
 # -------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten in production (e.g., ["https://vis.ongo.lv"])
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["*"],   # includes PATCH
     allow_headers=["*"],
 )
 
@@ -121,7 +121,6 @@ def root():
 _SAFE_DOC_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
 
 def _safe_filename(name: str) -> str:
-    """Convert user filename to a safe ASCII variant so doc_ids are stable and queryable."""
     name = unicodedata.normalize("NFKD", name or "").encode("ascii", "ignore").decode("ascii")
     base = os.path.basename(name or "uploaded.pdf")
     root, ext = os.path.splitext(base)
@@ -132,14 +131,12 @@ def _safe_filename(name: str) -> str:
     return f"{root}{ext}"
 
 def _make_doc_id(prefix: str, idx: int, filename: str) -> str:
-    """Build the unique document_id used across the system and saved in offers.filename."""
     return f"{prefix}::{idx}::{_safe_filename(filename)}"
 
 # -------------------------------
 # Utilities
 # -------------------------------
 def _num(v: Any) -> Optional[float]:
-    """Best-effort numeric coercion. Returns None for blanks, dashes, N/A, etc."""
     if v is None:
         return None
     if isinstance(v, (int, float)):
@@ -159,29 +156,19 @@ def _num(v: Any) -> Optional[float]:
             return None
     return None
 
-
 def _inject_meta(payload: Dict[str, Any], *, insurer: str, company: str, insured_count: int, inquiry_id: str) -> None:
-    """Attach meta to payload; inquiry_id is optional/nullable."""
     payload["insurer_hint"] = insurer or payload.get("insurer_hint") or "-"
     payload["company_name"] = company or payload.get("company_name") or "-"
-    payload["employee_count"] = (
-        insured_count if isinstance(insured_count, int) else payload.get("employee_count")
-    )
+    payload["employee_count"] = insured_count if isinstance(insured_count, int) else payload.get("employee_count")
     payload["inquiry_id"] = int(inquiry_id) if str(inquiry_id).isdigit() else None
 
-
-# ---------- Helpers to avoid duplicate (filename, insurer, program_code) ----------
+# ---------- Helpers ----------
 def _feature_value(x: Any) -> Any:
     if isinstance(x, dict):
         return x.get("value")
     return x
 
 def _disambiguate_duplicate_program_codes(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    For the same (filename, insurer, program_code) appearing more than once,
-    append a meaningful suffix so it becomes unique (e.g., '— stacionārs 750 EUR'
-    or '— prēmija 282'). Falls back to '— variants #n'.
-    """
     groups: Dict[Tuple[str, str, str], List[int]] = {}
     for i, r in enumerate(rows):
         key = (
@@ -231,18 +218,10 @@ def _disambiguate_duplicate_program_codes(rows: List[Dict[str, Any]]) -> List[Di
             rows[idx]["program_code"] = uniq
 
     return rows
-# --------------------------------------------------------------------------------------
-
 
 def _rows_for_offers_table(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Convert one normalized extractor payload (with .programs list)
-    into rows for public.offers (one row per program).
-    Uses payload['document_id'] as the 'filename' (unique per batch/job).
-    For "no programs", emits a single error row so the UI can show a failure card.
-    """
     doc_id = payload.get("document_id") or payload.get("source_file") or "uploaded.pdf"
-    inquiry_id = payload.get("inquiry_id")  # may be None
+    inquiry_id = payload.get("inquiry_id")
     company_name = payload.get("company_name")
     employee_count = payload.get("employee_count")
     hint = payload.get("insurer_hint") or None
@@ -296,9 +275,7 @@ def _rows_for_offers_table(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         })
     return rows
 
-
 def _aggregate_offers_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Aggregate DB rows to the FE shape grouped by source_file (document_id)."""
     grouped: Dict[str, Dict[str, Any]] = {}
     for r in rows:
         src = r.get("filename") or "-"
@@ -334,12 +311,7 @@ def _aggregate_offers_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             g["error"] = "no programs"
     return list(grouped.values())
 
-
 def save_to_supabase(payload: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
-    """
-    Insert one row per program into public.offers (or keep in memory if no Supabase).
-    Compatible with older supabase-py that doesn't support .insert(...).select(...).
-    """
     doc_id = payload.get("document_id") or payload.get("source_file") or "uploaded.pdf"
     _LAST_RESULTS[doc_id] = payload
 
@@ -348,9 +320,7 @@ def save_to_supabase(payload: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
 
     try:
         rows = _rows_for_offers_table(payload)
-
         _supabase.table(_OFFERS_TABLE).insert(rows).execute()
-
         try:
             q = (
                 _supabase.table(_OFFERS_TABLE)
@@ -364,17 +334,14 @@ def save_to_supabase(payload: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
                 _INSERTED_IDS[doc_id] = ids
         except Exception:
             pass
-
         return True, None
-
     except Exception as e:
         payload["_error"] = f"supabase_insert: {e}"
         _LAST_RESULTS[doc_id] = payload
         print(f"[warn] Supabase insert failed for {doc_id}: {e}")
         return False, str(e)
 
-
-def _rows_from_fallback(doc_ids: List[str]) -> List[Dict[str, Any]]:
+def _rows_from_fallback(doc_ids: List[str]) -> List[Dict[str, Any]]():
     rows: List[Dict[str, Any]] = []
     for doc_id in doc_ids:
         p = _LAST_RESULTS.get(doc_id)
@@ -391,9 +358,7 @@ def _rows_from_fallback(doc_ids: List[str]) -> List[Dict[str, Any]]:
         rows.extend(rs)
     return rows
 
-
 def _offers_by_document_ids(doc_ids: List[str]) -> List[Dict[str, Any]]:
-    """Query offers by exact document_id list (stored in 'filename'). Falls back to memory if empty/error."""
     if not doc_ids:
         return []
     rows: List[Dict[str, Any]] = []
@@ -436,7 +401,6 @@ async def extract_pdf(
         raise HTTPException(status_code=415, detail="PDF required")
 
     org_id, user_id = _ctx_ids(request)
-
     batch_id = str(uuid.uuid4())
     doc_id = _make_doc_id(batch_id, 1, file.filename or "uploaded.pdf")
     original_name = file.filename or "uploaded.pdf"
@@ -448,7 +412,6 @@ async def extract_pdf(
         payload["original_filename"] = original_name
         payload["_org_id"] = org_id
         payload["_user_id"] = user_id
-
         _inject_meta(payload, insurer=insurer, company=company, insured_count=insured_count, inquiry_id=inquiry_id)
         ok, err = save_to_supabase(payload)
         payload["_timings"] = {"total_s": round(time.monotonic() - t0, 3)}
@@ -469,10 +432,9 @@ async def extract_pdf(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
 
-# ---- Helper to parse multipart safely (no Pydantic validation for files) ----
+# ---- parse multipart ----
 async def _parse_upload_form(request: Request) -> Dict[str, Any]:
     form = await request.form()
-
     files: List[UploadFile] = form.getlist("files")
     if not files:
         single = form.get("files")
@@ -511,7 +473,6 @@ async def _parse_upload_form(request: Request) -> Dict[str, Any]:
         "insured_count": insured_cnt,
         "inquiry_id": inquiry_id,
     }
-
 
 @app.post("/extract/multiple")
 async def extract_multiple(request: Request):
@@ -566,7 +527,6 @@ async def extract_multiple(request: Request):
 
     return JSONResponse({"documents": doc_ids, "results": results})
 
-
 @app.post("/extract/multiple-async", status_code=202)
 async def extract_multiple_async(request: Request):
     org_id, user_id = _ctx_ids(request)
@@ -606,7 +566,6 @@ async def extract_multiple_async(request: Request):
     with _JOBS_LOCK:
         _jobs[job_id]["docs"] = doc_ids
     return {"job_id": job_id, "accepted": len(files), "documents": doc_ids}
-
 
 def _process_pdf_bytes(
     data: bytes,
@@ -677,7 +636,6 @@ def _process_pdf_bytes(
             if rec is not None:
                 rec["done"] += 1
 
-
 @app.get("/jobs/{job_id}")
 def job_status(job_id: str):
     with _JOBS_LOCK:
@@ -687,7 +645,7 @@ def job_status(job_id: str):
         return job
 
 # -------------------------------
-# Templates API (create/list/instantiate)
+# Templates API
 # -------------------------------
 @app.post("/templates")
 def create_template(
@@ -696,7 +654,7 @@ def create_template(
     program_code: str = Form(""),
     label: str = Form(""),
     employees_bucket: int = Form(0),
-    defaults: Dict[str, Any] = Body({}, embed=True),  # { premium_eur, base_sum_eur, payment_method, features:{} }
+    defaults: Dict[str, Any] = Body({}, embed=True),
 ):
     org_id, user_id = _ctx_ids(request)
     if not _supabase:
@@ -714,7 +672,6 @@ def create_template(
     res = _supabase.table("offer_templates").insert(row).execute()
     return {"ok": True, "template": (res.data or [row])[0]}
 
-
 @app.get("/templates")
 def list_templates(request: Request, insurer: str = "", employees_bucket: int = 0, limit: int = 20):
     org_id, _ = _ctx_ids(request)
@@ -729,13 +686,8 @@ def list_templates(request: Request, insurer: str = "", employees_bucket: int = 
     res = q.execute()
     return res.data or []
 
-
 @app.post("/templates/{template_id}/instantiate")
 def instantiate_template(template_id: int, request: Request, company: str = Form(""), insured_count: int = Form(0)):
-    """
-    Create an 'offers' group from a template (source='template', status='draft').
-    Returns a 'document_id' (so the FE can use offers/by-documents exactly like PDFs).
-    """
     org_id, user_id = _ctx_ids(request)
     if not _supabase:
         raise HTTPException(status_code=503, detail="DB not configured")
@@ -746,11 +698,7 @@ def instantiate_template(template_id: int, request: Request, company: str = Form
     tpl = t.data[0]
 
     batch_id = str(uuid.uuid4())
-    doc_id = _make_doc_id(
-        batch_id,
-        1,
-        f"{tpl.get('insurer','template')}-{tpl.get('program_code') or 'DRAFT'}.tmpl.json"
-    )
+    doc_id = _make_doc_id(batch_id, 1, f"{tpl.get('insurer','template')}-{tpl.get('program_code') or 'DRAFT'}.tmpl.json")
     defaults = tpl.get("defaults") or {}
 
     row = {
@@ -773,12 +721,10 @@ def instantiate_template(template_id: int, request: Request, company: str = Form
         "created_by_user_id": user_id,
     }
     _supabase.table(_OFFERS_TABLE).insert(row).execute()
-
     try:
         _supabase.rpc("increment_template_usage", {"t_id": template_id}).execute()
     except Exception:
         pass
-
     return {"ok": True, "document_id": doc_id}
 
 # -------------------------------
@@ -793,7 +739,6 @@ def offers_by_job(job_id: str):
     doc_ids = job.get("docs") or []
     return _offers_by_document_ids(doc_ids)
 
-
 class OfferUpdateBody(BaseModel):
     premium_eur: Optional[Any] = None
     base_sum_eur: Optional[Any] = None
@@ -802,16 +747,9 @@ class OfferUpdateBody(BaseModel):
     insurer: Optional[str] = None
     program_code: Optional[str] = None
 
-# ---------- Share token helpers ----------
 def _load_share_record(token: str, attempts: int = 25, delay_s: float = 0.2) -> Optional[Dict[str, Any]]:
-    """
-    Try DB a few times (to bridge replication/lag across instances),
-    then fall back to in-proc cache.
-    Total wait ~5s by default.
-    """
     if not token:
         return None
-
     if _supabase:
         for i in range(max(1, attempts)):
             try:
@@ -823,14 +761,9 @@ def _load_share_record(token: str, attempts: int = 25, delay_s: float = 0.2) -> 
                 print(f"[warn] share select failed (attempt {i+1}/{attempts}): {e}")
             if i + 1 < attempts:
                 time.sleep(delay_s)
-
-    # Same-dyno hot cache (works when GET hits the same process as POST)
     return _SHARES_FALLBACK.get(token)
 
 def _parse_to_utc_naive(s: Optional[str]) -> Optional[datetime]:
-    """
-    Parse ISO string with 'Z', '+00:00', or no tz, return UTC-naive datetime.
-    """
     if not s:
         return None
     try:
@@ -858,12 +791,11 @@ def _ensure_share_editable(share_token: Optional[str]) -> None:
 @app.delete("/offers/{offer_id}")
 def delete_offer(offer_id: int, x_share_token: Optional[str] = Header(default=None, alias="X-Share-Token")):
     _ensure_share_editable(x_share_token)
-
     if not _supabase:
         raise HTTPException(status_code=503, detail="DB not configured")
     try:
         _supabase.table(_OFFERS_TABLE).delete().eq("id", offer_id).execute()
-        for doc_id, ids in list(_INSERTED_IDS.items()"):
+        for doc_id, ids in list(_INSERTED_IDS.items()):
             _INSERTED_IDS[doc_id] = [i for i in ids if i != offer_id]
         return {"ok": True, "deleted": offer_id}
     except Exception as e:
@@ -875,28 +807,21 @@ def update_offer(
     body: OfferUpdateBody,
     x_share_token: Optional[str] = Header(default=None, alias="X-Share-Token"),
 ):
-    # Share token must be valid & editable when present
     _ensure_share_editable(x_share_token)
-
     if not _supabase:
         raise HTTPException(status_code=503, detail="DB not configured")
 
     updates: Dict[str, Any] = {}
-
-    # --- numeric fields (with robust coercion) ---
     if body.premium_eur is not None:
         v = _num(body.premium_eur)
         if v is None:
             raise HTTPException(status_code=400, detail="premium_eur must be numeric")
         updates["premium_eur"] = v
-
-    if body.base_sum_eur is not None:  # <-- FIXED: was 'base_sum_er'
+    if body.base_sum_eur is not None:
         v = _num(body.base_sum_eur)
         if v is None:
             raise HTTPException(status_code=400, detail="base_sum_eur must be numeric")
         updates["base_sum_eur"] = v
-
-    # --- text/json fields ---
     if body.payment_method is not None:
         updates["payment_method"] = body.payment_method
     if body.features is not None:
@@ -905,15 +830,11 @@ def update_offer(
         updates["insurer"] = body.insurer
     if body.program_code is not None:
         updates["program_code"] = body.program_code
-
     if not updates:
         raise HTTPException(status_code=400, detail="no changes provided")
 
     try:
-        # 1) Perform the update (NO .select() chaining here)
         _supabase.table(_OFFERS_TABLE).update(updates).eq("id", offer_id).execute()
-
-        # 2) Fetch updated row explicitly
         sel = _supabase.table(_OFFERS_TABLE).select("*").eq("id", offer_id).limit(1).execute()
         rows = sel.data or []
         if not rows:
@@ -924,18 +845,14 @@ def update_offer(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"update failed: {e}")
 
-
-# (legacy — still available)
+# -------------------------------
+# Offers by inquiry (legacy)
+# -------------------------------
 @app.get("/offers/by-inquiry/{inquiry_id}")
 def offers_by_inquiry(inquiry_id: int):
     if _supabase:
         try:
-            res = (
-                _supabase.table(_OFFERS_TABLE)
-                .select("*")
-                .eq("inquiry_id", inquiry_id)
-                .execute()
-            )
+            res = _supabase.table(_OFFERS_TABLE).select("*").eq("inquiry_id", inquiry_id).execute()
             rows = res.data or []
         except Exception as e:
             print(f"[warn] Supabase by-inquiry failed: {e}")
@@ -949,31 +866,27 @@ def offers_by_inquiry(inquiry_id: int):
     return _aggregate_offers_rows(rows)
 
 # -------------------------------
-# Token-only Share links (public.share_links)
+# Shares
 # -------------------------------
 class ShareCreateBody(BaseModel):
-    """Create a token that represents a snapshot or a dynamic by-documents view."""
     title: Optional[str] = None
     company_name: Optional[str] = None
     employees_count: Optional[int] = None
     document_ids: Optional[List[str]] = None
     results: Optional[List[Dict[str, Any]]] = None
-    expires_in_hours: Optional[int] = Field(720, ge=0, description="0 = never expires")
+    expires_in_hours: Optional[int] = Field(720, ge=0)
     editable: Optional[bool] = None
     role: Optional[str] = None
     allow_edit_fields: Optional[List[str]] = None
     insurer_only: Optional[str] = None
-    # FE view preferences (column order, hidden rows, etc.)
     view_prefs: Optional[Dict[str, Any]] = None
 
 def _gen_token() -> str:
     return secrets.token_urlsafe(16)
 
-
 @app.post("/shares")
 def create_share_token_only(body: ShareCreateBody, request: Request):
     token = _gen_token()
-
     mode = "snapshot" if (body.results and len(body.results) > 0) else "by-documents"
     payload = {
         "mode": mode,
@@ -998,7 +911,7 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
         "inquiry_id": None,
         "payload": payload,
         "expires_at": expires_at,
-        "view_prefs": body.view_prefs or {},  # stored in dedicated column too
+        "view_prefs": body.view_prefs or {},
     }
 
     if _supabase:
@@ -1007,7 +920,6 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Share create failed: {e}")
 
-    # Always keep a hot cache copy so GET works even if RLS/replication blocks reads.
     _SHARES_FALLBACK[token] = row
 
     base = os.getenv("SHARE_BASE_URL")
@@ -1019,18 +931,14 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
         except Exception:
             url = f"/shares/{token}"
 
-    # Returning view_prefs here is harmless; FE reads the payload on GET.
     return {"ok": True, "token": token, "url": url, "title": body.title, "view_prefs": body.view_prefs or {}}
-
 
 @app.get("/shares/{token}", name="get_share_token_only")
 def get_share_token_only(token: str):
-    """Return snapshot results or dynamic offers for a token (with optional insurer-only filtering)."""
     share = _load_share_record(token)
     if not share:
         raise HTTPException(status_code=404, detail="Share token not found")
 
-    # Expiry check (robust)
     exp = _parse_to_utc_naive(share.get("expires_at"))
     if exp is not None and datetime.utcnow() > exp:
         raise HTTPException(status_code=404, detail="Share token expired")
@@ -1038,7 +946,6 @@ def get_share_token_only(token: str):
     payload = share.get("payload") or {}
     mode = payload.get("mode") or "snapshot"
 
-    # Build offers (snapshot or dynamic)
     if mode == "snapshot" and payload.get("results"):
         offers = payload["results"]
     elif mode == "by-documents":
@@ -1047,7 +954,6 @@ def get_share_token_only(token: str):
     else:
         offers = []
 
-    # Optional: filter by a single insurer (insurer confirmation links)
     def _norm(s: Optional[str]) -> str:
         return (s or "").strip().lower()
 
@@ -1062,7 +968,6 @@ def get_share_token_only(token: str):
                 filtered.append(ng)
         offers = filtered
 
-    # Shape EXACTLY as Share.tsx expects:
     response_payload = {
         "company_name": payload.get("company_name"),
         "employees_count": payload.get("employees_count"),
@@ -1072,19 +977,14 @@ def get_share_token_only(token: str):
         "view_prefs": share.get("view_prefs") or payload.get("view_prefs") or {},
     }
 
-    return {
-        "ok": True,
-        "token": token,
-        "payload": response_payload,   # FE reads editable & view_prefs from here
-        "offers": offers,
-    }
+    return {"ok": True, "token": token, "payload": response_payload, "offers": offers}
 
-# ---------- NEW: update share header/meta (company/employees/view_prefs) ----------
+# ---- NEW: update share meta (supports PATCH and POST) ----
 class ShareUpdateBody(BaseModel):
     company_name: Optional[str] = None
     employees_count: Optional[int] = Field(None, ge=0)
     view_prefs: Optional[Dict[str, Any]] = None
-    title: Optional[str] = None  # optional
+    title: Optional[str] = None
 
 def _share_is_editable(rec: Dict[str, Any], *, field: Optional[str] = None) -> None:
     payload = (rec or {}).get("payload") or {}
@@ -1094,7 +994,7 @@ def _share_is_editable(rec: Dict[str, Any], *, field: Optional[str] = None) -> N
     if field and allowed and field not in allowed:
         raise HTTPException(status_code=403, detail=f"Field '{field}' is not allowed to edit")
 
-@app.patch("/shares/{token}")
+@app.api_route("/shares/{token}", methods=["PATCH", "POST"])
 def update_share_token_only(token: str, body: ShareUpdateBody, request: Request):
     rec = _load_share_record(token)
     if not rec:
@@ -1111,18 +1011,15 @@ def update_share_token_only(token: str, body: ShareUpdateBody, request: Request)
         _share_is_editable(rec, field="company_name")
         payload["company_name"] = body.company_name
         changed = True
-
     if body.employees_count is not None:
         _share_is_editable(rec, field="employees_count")
         payload["employees_count"] = int(body.employees_count)
         changed = True
-
     if body.view_prefs is not None:
         _share_is_editable(rec, field="view_prefs")
         payload["view_prefs"] = body.view_prefs
         rec["view_prefs"] = body.view_prefs
         changed = True
-
     if body.title is not None:
         _share_is_editable(rec, field="title")
         payload["title"] = body.title
@@ -1131,7 +1028,6 @@ def update_share_token_only(token: str, body: ShareUpdateBody, request: Request)
     if not changed:
         raise HTTPException(status_code=400, detail="no changes provided")
 
-    # persist to DB if available
     if _supabase:
         try:
             _supabase.table(_SHARE_TABLE).update({
@@ -1141,12 +1037,10 @@ def update_share_token_only(token: str, body: ShareUpdateBody, request: Request)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Share update failed: {e}")
 
-    # hot cache update
     rec["payload"] = payload
     rec["view_prefs"] = rec.get("view_prefs") or {}
     _SHARES_FALLBACK[token] = rec
 
-    # optional propagation to offers rows
     if (request.query_params.get("propagate_offers") or "").lower() in {"1", "true", "yes"}:
         try:
             doc_ids = (payload.get("document_ids") or [])
@@ -1158,7 +1052,6 @@ def update_share_token_only(token: str, body: ShareUpdateBody, request: Request)
                     upd["employee_count"] = int(body.employees_count)
                 if upd:
                     _supabase.table(_OFFERS_TABLE).update(upd).in_("filename", doc_ids).execute()
-            # keep in-memory fallback consistent
             for d in payload.get("document_ids") or []:
                 p = _LAST_RESULTS.get(d)
                 if p:
@@ -1169,7 +1062,6 @@ def update_share_token_only(token: str, body: ShareUpdateBody, request: Request)
         except Exception as e:
             print(f"[warn] offers propagation failed: {e}")
 
-    # return same shape FE already expects
     response_payload = {
         "company_name": payload.get("company_name"),
         "employees_count": payload.get("employees_count"),
@@ -1198,7 +1090,6 @@ def debug_last_results():
             "employee_count": p.get("employee_count"),
         })
     return out
-
 
 @app.get("/debug/doc/{doc_id}")
 def debug_doc(doc_id: str):
