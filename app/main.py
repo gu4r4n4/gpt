@@ -420,6 +420,22 @@ def _offers_by_document_ids(doc_ids: List[str]) -> List[Dict[str, Any]]:
         obj["_source"] = "fallback" if used_fallback else "supabase"
     return agg
 
+# ---------- NEW helper to derive meta from offers (for share creation) ----------
+def _derive_meta_from_offers(offers: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[int]]:
+    company: Optional[str] = None
+    employees: Optional[int] = None
+    for g in offers or []:
+        if company is None and g.get("company_name"):
+            company = g.get("company_name")
+        if employees is None and g.get("employee_count") is not None:
+            try:
+                employees = int(g.get("employee_count"))
+            except Exception:
+                pass
+        if company is not None and employees is not None:
+            break
+    return company, employees
+
 # -------------------------------
 # Extract endpoints
 # -------------------------------
@@ -975,11 +991,31 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
     token = _gen_token()
 
     mode = "snapshot" if (body.results and len(body.results) > 0) else "by-documents"
+
+    # NEW: derive company/employees when not sent from FE
+    derived_company = body.company_name
+    derived_employees = body.employees_count
+    try:
+        if derived_company is None or derived_employees is None:
+            if mode == "snapshot" and body.results:
+                dc, de = _derive_meta_from_offers(body.results)
+            elif mode == "by-documents" and body.document_ids:
+                dc, de = _derive_meta_from_offers(_offers_by_document_ids(body.document_ids))
+            else:
+                dc, de = (None, None)
+            if derived_company is None:
+                derived_company = dc
+            if derived_employees is None:
+                derived_employees = de
+    except Exception:
+        # never block share creation on derivation issues
+        pass
+
     payload = {
         "mode": mode,
         "title": body.title,
-        "company_name": body.company_name,
-        "employees_count": body.employees_count,
+        "company_name": derived_company,
+        "employees_count": derived_employees,
         "document_ids": body.document_ids or [],
         "results": body.results if mode == "snapshot" else None,
         "editable": body.editable,
@@ -1079,7 +1115,7 @@ def get_share_token_only(token: str):
         "offers": offers,
     }
 
-# ---------- NEW: update share header/meta (company/employees/view_prefs) ----------
+# ---------- update share header/meta (company/employees/view_prefs) ----------
 class ShareUpdateBody(BaseModel):
     company_name: Optional[str] = None
     employees_count: Optional[int] = Field(None, ge=0)
