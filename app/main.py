@@ -863,7 +863,7 @@ def delete_offer(offer_id: int, x_share_token: Optional[str] = Header(default=No
         raise HTTPException(status_code=503, detail="DB not configured")
     try:
         _supabase.table(_OFFERS_TABLE).delete().eq("id", offer_id).execute()
-        for doc_id, ids in list(_INSERTED_IDS.items()):
+        for doc_id, ids in list(_INSERTED_IDS.items()"):
             _INSERTED_IDS[doc_id] = [i for i in ids if i != offer_id]
         return {"ok": True, "deleted": offer_id}
     except Exception as e:
@@ -911,31 +911,14 @@ def update_offer(
 
     try:
         # 1) Perform the update (NO .select() chaining here)
-        upd = (
-            _supabase.table(_OFFERS_TABLE)
-            .update(updates)
-            .eq("id", offer_id)
-            .execute()
-        )
+        _supabase.table(_OFFERS_TABLE).update(updates).eq("id", offer_id).execute()
 
-        # If the client/lib doesn’t return rows on update, fetch the row explicitly.
-        # This works across supabase-py versions and keeps the response shape stable.
-        sel = (
-            _supabase.table(_OFFERS_TABLE)
-            .select("*")
-            .eq("id", offer_id)
-            .limit(1)
-            .execute()
-        )
+        # 2) Fetch updated row explicitly
+        sel = _supabase.table(_OFFERS_TABLE).select("*").eq("id", offer_id).limit(1).execute()
         rows = sel.data or []
-
         if not rows:
-            # Either the row doesn't exist, RLS blocked it, or no row was updated.
-            # Keep the error message the same to avoid FE breakage.
             raise HTTPException(status_code=404, detail="offer not found")
-
         return {"ok": True, "offer": rows[0]}
-
     except HTTPException:
         raise
     except Exception as e:
@@ -1095,6 +1078,107 @@ def get_share_token_only(token: str):
         "payload": response_payload,   # FE reads editable & view_prefs from here
         "offers": offers,
     }
+
+# ---------- NEW: update share header/meta (company/employees/view_prefs) ----------
+class ShareUpdateBody(BaseModel):
+    company_name: Optional[str] = None
+    employees_count: Optional[int] = Field(None, ge=0)
+    view_prefs: Optional[Dict[str, Any]] = None
+    title: Optional[str] = None  # optional
+
+def _share_is_editable(rec: Dict[str, Any], *, field: Optional[str] = None) -> None:
+    payload = (rec or {}).get("payload") or {}
+    if not bool(payload.get("editable")):
+        raise HTTPException(status_code=403, detail="Share is read-only")
+    allowed = set(payload.get("allow_edit_fields") or [])
+    if field and allowed and field not in allowed:
+        raise HTTPException(status_code=403, detail=f"Field '{field}' is not allowed to edit")
+
+@app.patch("/shares/{token}")
+def update_share_token_only(token: str, body: ShareUpdateBody, request: Request):
+    rec = _load_share_record(token)
+    if not rec:
+        raise HTTPException(status_code=404, detail="Share token not found")
+
+    exp = _parse_to_utc_naive(rec.get("expires_at"))
+    if exp is not None and datetime.utcnow() > exp:
+        raise HTTPException(status_code=404, detail="Share token expired")
+
+    payload = rec.get("payload") or {}
+    changed = False
+
+    if body.company_name is not None:
+        _share_is_editable(rec, field="company_name")
+        payload["company_name"] = body.company_name
+        changed = True
+
+    if body.employees_count is not None:
+        _share_is_editable(rec, field="employees_count")
+        payload["employees_count"] = int(body.employees_count)
+        changed = True
+
+    if body.view_prefs is not None:
+        _share_is_editable(rec, field="view_prefs")
+        payload["view_prefs"] = body.view_prefs
+        rec["view_prefs"] = body.view_prefs
+        changed = True
+
+    if body.title is not None:
+        _share_is_editable(rec, field="title")
+        payload["title"] = body.title
+        changed = True
+
+    if not changed:
+        raise HTTPException(status_code=400, detail="no changes provided")
+
+    # persist to DB if available
+    if _supabase:
+        try:
+            _supabase.table(_SHARE_TABLE).update({
+                "payload": payload,
+                "view_prefs": rec.get("view_prefs") or {},
+            }).eq("token", token).execute()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Share update failed: {e}")
+
+    # hot cache update
+    rec["payload"] = payload
+    rec["view_prefs"] = rec.get("view_prefs") or {}
+    _SHARES_FALLBACK[token] = rec
+
+    # optional propagation to offers rows
+    if (request.query_params.get("propagate_offers") or "").lower() in {"1", "true", "yes"}:
+        try:
+            doc_ids = (payload.get("document_ids") or [])
+            if doc_ids and _supabase:
+                upd: Dict[str, Any] = {}
+                if body.company_name is not None:
+                    upd["company_name"] = body.company_name
+                if body.employees_count is not None:
+                    upd["employee_count"] = int(body.employees_count)
+                if upd:
+                    _supabase.table(_OFFERS_TABLE).update(upd).in_("filename", doc_ids).execute()
+            # keep in-memory fallback consistent
+            for d in payload.get("document_ids") or []:
+                p = _LAST_RESULTS.get(d)
+                if p:
+                    if body.company_name is not None:
+                        p["company_name"] = body.company_name
+                    if body.employees_count is not None:
+                        p["employee_count"] = int(body.employees_count)
+        except Exception as e:
+            print(f"[warn] offers propagation failed: {e}")
+
+    # return same shape FE already expects
+    response_payload = {
+        "company_name": payload.get("company_name"),
+        "employees_count": payload.get("employees_count"),
+        "editable": bool(payload.get("editable")),
+        "role": payload.get("role") or "broker",
+        "allow_edit_fields": payload.get("allow_edit_fields") or [],
+        "view_prefs": rec.get("view_prefs") or payload.get("view_prefs") or {},
+    }
+    return {"ok": True, "token": token, "payload": response_payload}
 
 # -------------------------------
 # Debug helpers
