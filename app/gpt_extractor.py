@@ -911,3 +911,65 @@ def extract_offer_from_pdf_bytes(pdf_bytes: bytes, document_id: str) -> Dict[str
     # Normalize with safety-belt
     normalized = _normalize_safely(enriched, document_id=document_id)
     return normalized
+
+# =========================
+# Six-field fetch helpers (NON-BREAKING ADD-ON)
+# =========================
+
+# Default 6 items (can be overridden via env SIX_FIELDS="a,b,c,d,e,f")
+_DEFAULT_SIX_FIELDS = [
+    "Programmas nosaukums",
+    "Apdrošinājuma summa pamatpolisei, EUR",
+    "Pamatpolises prēmija 1 darbiniekam, EUR",
+    "Maksas Operācijas, limits EUR",
+    "Optika 50%, limits EUR",
+    "Zobārstniecība ar 50% atlaidi (pp)",
+]
+
+def _env_six_fields() -> List[str]:
+    env = os.getenv("SIX_FIELDS", "")
+    if not env:
+        return list(_DEFAULT_SIX_FIELDS)
+    parts = [p.strip() for p in env.split(",")]
+    return [p for p in parts if p] or list(_DEFAULT_SIX_FIELDS)
+
+def _get_feature_value(prog: Dict[str, Any], key: str) -> Any:
+    """Safely pull a value for a display field from a program."""
+    feats: Dict[str, Any] = prog.get("features") or {}
+    fv = feats.get(key, {})
+    val = fv.get("value") if isinstance(fv, dict) else None
+
+    # Smart fallbacks for the two most common numeric fields
+    if (val in (None, "-", "")) and key == "Apdrošinājuma summa pamatpolisei, EUR":
+        top = prog.get("base_sum_eur")
+        return top if top not in (None, "") else "-"
+    if (val in (None, "-", "")) and key == "Pamatpolises prēmija 1 darbiniekam, EUR":
+        top = prog.get("premium_eur")
+        return top if top not in (None, "") else "-"
+
+    return val if (val not in (None, "")) else "-"
+
+def fetch_six_items_from_payload(payload: Dict[str, Any], fields: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """
+    Create a compact list per program with exactly 6 items (order preserved).
+    This DOES NOT modify the original payload.
+    """
+    fields = fields or _env_six_fields()
+    progs = payload.get("programs") or []
+    out: List[Dict[str, Any]] = []
+    for p in progs:
+        row = {"program_code": p.get("program_code", "-")}
+        for f in fields:
+            row[f] = _get_feature_value(p, f)
+        out.append(row)
+    return out
+
+def extract_offer_and_fetch_six(pdf_bytes: bytes, document_id: str, fields: Optional[List[str]] = None) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """
+    Convenience wrapper:
+      - runs the full extractor (unchanged)
+      - returns (full_payload, six_items_list)
+    """
+    payload = extract_offer_from_pdf_bytes(pdf_bytes, document_id)
+    six = fetch_six_items_from_payload(payload, fields=fields)
+    return payload, six
