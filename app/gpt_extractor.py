@@ -679,7 +679,7 @@ def _prune_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         out["document_id"] = str(payload.get("document_id") or "uploaded.pdf")
 
     if "warnings" in out and not isinstance(out["warnings"], list):
-        out["warnings"] = [str(out["warnings")]] if out.get("warnings") else []
+        out["warnings"] = [str(out["warnings"]) ] if out.get("warnings") else []
 
     programs = payload.get("programs") or []
     norm_programs: List[Dict[str, Any]] = []
