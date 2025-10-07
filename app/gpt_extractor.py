@@ -393,7 +393,6 @@ def _parse_base_rows_loose(block: str) -> List[Dict[str, Any]]:
     for ln in lines:
         if _looks_like_base_header(ln):
             flush()
-            continue
         acc_name.append(ln)
         for m in _MONEY_ANYWHERE_RE.finditer(ln):
             val = _parse_money_like(m.group(0))
@@ -496,6 +495,28 @@ _AMOUNT_NEAR_RE = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
+# --- BALTA & generic "Maksas stacionār..." helpers (PP triple limits + premiums) ---
+_PP_STAC_KEYWORDS_RE = re.compile(
+    r"(Maksas\s+stacion[āa]rie\s+pakalpojumi|MAKSAS\s+STACION[ĀA]RS|Maksas\s+stacion[āa]ra\s+pakalpojumi|Maksas\s+pakalpojumi\s+stacion[āa]r[āa]|Maksas\s+stacion[āa]r[āa]\s+pal[īi]dz[īi]ba)",
+    re.IGNORECASE,
+)
+_LIMITS_LIST_RE = re.compile(
+    r"(?P<a>\d{2,5})\s*(?:EUR|€)?\s*[/;,]\s*(?P<b>\d{2,5})\s*(?:EUR|€)?\s*[/;,]\s*(?P<c>\d{2,5})\s*(?:EUR|€)?(?:\s*(?:EUR|€))?\s*(?:par\s+katru\s+gad[iī]jumu)?",
+    re.IGNORECASE,
+)
+_PREMIA_LINE_TRIPLE_RE = re.compile(
+    r"Pr[ēe]mija\s*1\s*\(?(?:vienai)?\)?\s*pers\.,?\s*EUR[^\d]{0,40}([0-9.,]+)\s*[/;,]\s*([0-9.,]+)\s*[/;,]\s*([0-9.,]+)",
+    re.IGNORECASE,
+)
+
+# --- Generic single-value premium patterns (for PP blocks) ---
+_PREM_SINGLE_PATTERNS = [
+    re.compile(r"Pr[ēe]mija\s*1\s*darb\.?,?\s*(?:EUR)?[^\d]{0,40}([0-9][0-9.,]*)", re.IGNORECASE),
+    re.compile(r"Apdrošin[āa]šanas\s*pr[ēe]mija\s*vienam\s*darbiniekam\s*gad[āa],?\s*EUR[^\d]{0,40}([0-9][0-9.,]*)", re.IGNORECASE),
+    re.compile(r"vienai\s*personai\s*gad[āa][^\d]{0,40}([0-9][0-9.,]*)", re.IGNORECASE),
+    re.compile(r"Pr[ēe]mija\s*1\s*\(?(?:vienai)?\)?\s*pers\.,?\s*EUR[^\d]{0,40}([0-9][0-9.,]*)", re.IGNORECASE),
+]
+
 def _txt_clean(t: str) -> str:
     return t.replace("\u00A0", " ").replace("\u00AD", "")
 
@@ -535,6 +556,39 @@ def _find_amount_near(text: str, anchor_span: Tuple[int, int]) -> Optional[str]:
     if not m:
         return None
     return _normalize_num_str(m.group("num"))
+
+def _find_limit_near(text: str, anchor_span: Tuple[int, int]) -> Optional[str]:
+    """Prefer integer-like amounts (likely limits) near the anchor."""
+    start = max(0, anchor_span[0] - 160)
+    end = min(len(text), anchor_span[1] + 300)
+    window = text[start:end]
+    candidates = []
+    for m in _AMOUNT_NEAR_RE.finditer(window):
+        raw = m.group("num")
+        norm = _normalize_num_str(raw)
+        # treat as limit if no decimals OR large enough
+        is_intlike = (("." not in norm) and ("," not in raw))
+        try:
+            val = float(norm)
+        except Exception:
+            continue
+        if is_intlike or val >= 50:
+            candidates.append((val, norm))
+    if not candidates:
+        return None
+    # choose the first reasonable candidate
+    return candidates[0][1]
+
+def _find_premium_single_near(text: str, anchor_span: Tuple[int, int]) -> Optional[str]:
+    """Find a single premium value near the anchor using flexible headings."""
+    start = anchor_span[1]
+    end = min(len(text), start + 800)
+    window = text[start:end]
+    for rx in _PREM_SINGLE_PATTERNS:
+        m = rx.search(window)
+        if m:
+            return _normalize_num_str(m.group(1))
+    return None
 
 def _value_obj(value: Any, conf: float, prov_text: str) -> Dict[str, Any]:
     return {"value": value, "confidence": round(conf, 3), "provenance": {"source_text": prov_text, "table_hint": "PAPILDPROGRAMMAS"}}
@@ -586,17 +640,23 @@ def extract_papildprogrammas_features(full_text_raw: str) -> Dict[str, Dict[str,
     key = "Zobārstniecība ar 50% atlaidi (pamatpolise)"
     dent_base = re.search(r"Zob[āa]rstniec[īi]ba.*50\s*%.*(pamatpolise|pamatprogramma)", pp_text, re.IGNORECASE)
     if dent_base:
-        amt = _find_amount_near(pp_text, dent_base.span())
+        amt = _find_limit_near(pp_text, dent_base.span())
         out[key] = _value_obj((f"{amt} EUR" if amt else "v"), 0.8 if amt else 0.6, _short_excerpt(pp_text, dent_base.span()))
     else:
         set_default(key)
 
-    # 4) Zobārstniecība ar 50% atlaidi (pp)
+    # 4) Zobārstniecība ar 50% atlaidi (pp) — include premium in parentheses if found
     key = "Zobārstniecība ar 50% atlaidi (pp)"
-    dent_pp = re.search(r"Zob[āa]rstniec[īi]ba.*50\s*%.*(papildprogramma|PP|\bpp\b)", pp_text, re.IGNORECASE)
+    dent_pp = re.search(r"(Zob[āa]rstniec[īi]ba.*50\s*%|Zob[āa]rstniec[īi]ba\s*[–-]\s*C3CH)", pp_text, re.IGNORECASE)
     if dent_pp:
-        amt = _find_amount_near(pp_text, dent_pp.span())
-        out[key] = _value_obj((f"{amt} EUR" if amt else "v"), 0.85 if amt else 0.6, _short_excerpt(pp_text, dent_pp.span()))
+        lim = _find_limit_near(pp_text, dent_pp.span())
+        prem = _find_premium_single_near(pp_text, dent_pp.span())
+        if lim and prem:
+            out[key] = _value_obj(f"{lim} EUR limits ({prem})", 0.92, _short_excerpt(pp_text, dent_pp.span()))
+        elif lim:
+            out[key] = _value_obj(f"{lim} EUR limits", 0.86, _short_excerpt(pp_text, dent_pp.span()))
+        else:
+            out[key] = _value_obj("v", 0.6, _short_excerpt(pp_text, dent_pp.span()))
     else:
         set_default(key)
 
@@ -609,21 +669,33 @@ def extract_papildprogrammas_features(full_text_raw: str) -> Dict[str, Dict[str,
     else:
         set_default(key)
 
-    # 6) Ambulatorā rehabilitācija (pp)
+    # 6) Ambulatorā rehabilitācija (pp) — include premium if found
     key = "Ambulatorā rehabilitācija (pp)"
-    rehab = re.search(r"Ambulator[āa]\s+rehabilit[āa]cija.*(papildprogramma|PP|\bpp\b)?", pp_text, re.IGNORECASE)
+    rehab = re.search(r"Ambulator[āa]\s+rehabilit[āa]cija", pp_text, re.IGNORECASE)
     if rehab:
-        amt = _find_amount_near(pp_text, rehab.span())
-        out[key] = _value_obj((f"{amt} EUR" if amt else "v"), 0.85 if amt else 0.6, _short_excerpt(pp_text, rehab.span()))
+        lim = _find_limit_near(pp_text, rehab.span())
+        prem = _find_premium_single_near(pp_text, rehab.span())
+        if lim and prem:
+            out[key] = _value_obj(f"{lim} EUR limits ({prem})", 0.9, _short_excerpt(pp_text, rehab.span()))
+        elif lim:
+            out[key] = _value_obj(f"{lim} EUR limits", 0.82, _short_excerpt(pp_text, rehab.span()))
+        else:
+            out[key] = _value_obj("v", 0.6, _short_excerpt(pp_text, rehab.span()))
     else:
         set_default(key)
 
-    # 7) Medikamenti ar 50% atlaidi
+    # 7) Medikamenti ar 50% atlaidi — include premium if found
     key = "Medikamenti ar 50% atlaidi"
-    meds = re.search(r"Medikamenti.*50\s*%.*(atlaide|kompens[āa]cija)?", pp_text, re.IGNORECASE)
+    meds = re.search(r"\bMedikament[ui]|\bMedikamenti\s*B4", pp_text, re.IGNORECASE)
     if meds:
-        amt = _find_amount_near(pp_text, meds.span())
-        out[key] = _value_obj((f"{amt} EUR" if amt else "v"), 0.85 if amt else 0.6, _short_excerpt(pp_text, meds.span()))
+        lim = _find_limit_near(pp_text, meds.span())
+        prem = _find_premium_single_near(pp_text, meds.span())
+        if lim and prem:
+            out[key] = _value_obj(f"{lim} EUR limits ({prem})", 0.9, _short_excerpt(pp_text, meds.span()))
+        elif lim:
+            out[key] = _value_obj(f"{lim} EUR limits", 0.82, _short_excerpt(pp_text, meds.span()))
+        else:
+            out[key] = _value_obj("v", 0.6, _short_excerpt(pp_text, meds.span()))
     else:
         set_default(key)
 
@@ -635,20 +707,47 @@ def extract_papildprogrammas_features(full_text_raw: str) -> Dict[str, Dict[str,
     else:
         set_default(key)
 
-    # 9) Kritiskās saslimšanas
+    # 9) Kritiskās saslimšanas — amount + premium, or presence
     key = "Kritiskās saslimšanas"
-    crit = re.search(r"Kritisk[āa]s saslim[šs]an[āa]s|Kritisko saslim[šs]anu apdro[šs]in[āa]šana", pp_text, re.IGNORECASE)
+    crit = re.search(r"Kritisk[āa]s\s+saslimšan[au]m?s?|Kritisko\s+saslimšan[au]?\b|kritiskaj[āa]m\s+saslimšan[āa]m", pp_text, re.IGNORECASE)
     if crit:
-        out[key] = _value_obj("v", 0.6, _short_excerpt(pp_text, crit.span()))
+        lim = _find_limit_near(pp_text, crit.span())
+        prem = _find_premium_single_near(pp_text, crit.span())
+        if lim and prem:
+            out[key] = _value_obj(f"{lim} EUR limits ({prem})", 0.9, _short_excerpt(pp_text, crit.span()))
+        elif lim:
+            out[key] = _value_obj(f"{lim} EUR limits", 0.82, _short_excerpt(pp_text, crit.span()))
+        else:
+            out[key] = _value_obj("ir iekļauts", 0.6, _short_excerpt(pp_text, crit.span()))
     else:
         set_default(key)
 
-    # 10) Maksas stacionārie pakalpojumi, limits EUR (pp)
+    # 10) Maksas stacionārie pakalpojumi, limits EUR (pp) — triple limits + premiums in parentheses when found
     key = "Maksas stacionārie pakalpojumi, limits EUR (pp)"
-    stac = re.search(r"Maksas\s+stacion[āa]rie\s+pakalpojumi", pp_text, re.IGNORECASE)
+    stac = _PP_STAC_KEYWORDS_RE.search(pp_text)
     if stac:
-        amt = _find_amount_near(pp_text, stac.span())
-        out[key] = _value_obj((f"{amt} EUR" if amt else "v"), 0.9 if amt else 0.6, _short_excerpt(pp_text, stac.span()))
+        win_start = stac.end()
+        win_end = min(len(pp_text), win_start + 800)
+        window = pp_text[win_start:win_end]
+
+        lim_m = _LIMITS_LIST_RE.search(window)
+        prem_m = _PREMIA_LINE_TRIPLE_RE.search(window)
+
+        limits_str = None
+        premiums_str = None
+        if lim_m:
+            a, b, c = lim_m.group("a"), lim_m.group("b"), lim_m.group("c")
+            limits_str = f"{int(a)} EUR / {int(b)} EUR / {int(c)} EUR par katru gadījumu"
+        if prem_m:
+            a, b, c = [_normalize_num_str(x) for x in prem_m.groups()]
+            premiums_str = f"{a}/{b}/{c}"
+
+        if limits_str and premiums_str:
+            out[key] = _value_obj(f"{limits_str} ({premiums_str})", 0.92, _short_excerpt(pp_text, stac.span()))
+        elif limits_str:
+            out[key] = _value_obj(limits_str, 0.85, _short_excerpt(pp_text, stac.span()))
+        else:
+            out[key] = _value_obj("ir iekļauts", 0.65, _short_excerpt(pp_text, stac.span()))
     else:
         set_default(key)
 
