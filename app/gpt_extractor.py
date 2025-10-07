@@ -17,6 +17,9 @@ Safe post-process:
 Plus:
 * Parse Papildprogrammas section from raw PDF text and merge specific feature values into each base program,
   including: "Maksas Operācijas, limits EUR" and "Optika 50%, limits EUR".
+
+Also:
+* Six-field fetch helpers to return a compact set of fields per program (configurable via env SIX_FIELDS).
 """
 
 from __future__ import annotations
@@ -512,7 +515,7 @@ def _pp_section_slice(text: str) -> str:
         text[start:],
         re.IGNORECASE,
     )
-    end = start + m_end.start() if m_end else len(text)
+    end = start + (m_end.start() if m_end else len(text[start:]))
     return text[start:end]
 
 def _normalize_num_str(num_str: str) -> str:
@@ -536,6 +539,45 @@ def _find_amount_near(text: str, anchor_span: Tuple[int, int]) -> Optional[str]:
         return None
     return _normalize_num_str(m.group("num"))
 
+# Prefer the LARGEST reasonable candidate (handles "300 / 500 / 750" → 750)
+def _find_limit_near(text: str, anchor_span: Tuple[int, int]) -> Optional[str]:
+    start = max(0, anchor_span[0] - 160)
+    end = min(len(text), anchor_span[1] + 300)
+    window = text[start:end]
+    candidates = []
+    for m in _AMOUNT_NEAR_RE.finditer(window):
+        raw = m.group("num")
+        norm = _normalize_num_str(raw)
+        try:
+            val = float(norm)
+        except Exception:
+            continue
+        if (("." not in norm) or val >= 50):
+            candidates.append((val, norm))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda t: t[0], reverse=True)
+    return candidates[0][1]
+
+_PREM_SINGLE_PATTERNS = [
+    re.compile(r"Pr[ēe]mija\s*1\s*darb\.?,?\s*(?:EUR)?[^\d]{0,40}([0-9][0-9.,]*)", re.IGNORECASE),
+    re.compile(r"Apdrošin[āa]šanas\s*pr[ēe]mija\s*vien(am|ai)\s*darb(iniekam|niecei)\s*gad[āa],?\s*EUR[^\d]{0,40}([0-9][0-9.,]*)", re.IGNORECASE),
+    re.compile(r"vien(ai|am)\s*person(ai|ai)\s*gad[āa][^\d]{0,40}([0-9][0-9.,]*)", re.IGNORECASE),
+    re.compile(r"Pr[ēe]mija\s*1\s*(?:\(?(?:vienai)?\)?\s*)?pers\.[^\d]{0,40}([0-9][0-9.,]*)", re.IGNORECASE),
+]
+
+def _find_premium_single_near(text: str, anchor_span: Tuple[int, int]) -> Optional[str]:
+    start = anchor_span[1]
+    end = min(len(text), start + 800)
+    window = text[start:end]
+    for rx in _PREM_SINGLE_PATTERNS:
+        m = rx.search(window)
+        if m:
+            num = next((g for g in m.groups() if g and re.search(r"\d", g)), None)
+            if num:
+                return _normalize_num_str(num)
+    return None
+
 def _value_obj(value: Any, conf: float, prov_text: str) -> Dict[str, Any]:
     return {"value": value, "confidence": round(conf, 3), "provenance": {"source_text": prov_text, "table_hint": "PAPILDPROGRAMMAS"}}
 
@@ -555,52 +597,58 @@ def extract_papildprogrammas_features(full_text_raw: str) -> Dict[str, Dict[str,
         if key not in out:
             out[key] = _value_obj("-", 0.2, "not found in Papildprogrammas")
 
-    # 1) Maksas Operācijas, limits EUR
+    # 1) Maksas Operācijas
     key = "Maksas Operācijas, limits EUR"
     mo = re.search(r"Maksas\s+Oper[āa]cij(?:a|as)", pp_text, re.IGNORECASE)
     if mo:
-        special = re.search(r"saska[nņ]ā ar programmas nosac[iī]jumiem", pp_text[mo.start():mo.start()+200], re.IGNORECASE)
-        amt = _find_amount_near(pp_text, mo.span())
+        special = re.search(r"saska[nņ]ā\s+ar\s+programmas\s+nosac[iī]jumiem", pp_text[mo.start():mo.start()+220], re.IGNORECASE)
+        lim = _find_limit_near(pp_text, mo.span())
+        prem = _find_premium_single_near(pp_text, mo.span())
         if special:
-            out[key] = _value_obj("saskaņā ar programmas nosacījumiem", 0.8, _short_excerpt(pp_text, special.span()))
-        elif amt:
-            out[key] = _value_obj(f"limits {amt} EUR", 0.9, _short_excerpt(pp_text, mo.span()))
+            out[key] = _value_obj("saskaņā ar programmas nosacījumiem", 0.85, _short_excerpt(pp_text, special.span()))
+        elif lim and prem:
+            out[key] = _value_obj(f"{lim} EUR limits ({prem})", 0.9, _short_excerpt(pp_text, mo.span()))
+        elif lim:
+            out[key] = _value_obj(f"limits {lim} EUR", 0.86, _short_excerpt(pp_text, mo.span()))
         else:
             out[key] = _value_obj("v", 0.6, _short_excerpt(pp_text, mo.span()))
     else:
         set_default(key)
 
-    # 2) Optika 50%, limits EUR
+    # 2) Optika 50%
     key = "Optika 50%, limits EUR"
-    opt = re.search(r"\bOptika\s*50\s*%|\bOptikas?\s*50\s*%", pp_text, re.IGNORECASE)
+    opt = re.search(r"\bOptik[aa]s?\s*[-–]?\s*50\s*%|\bOptika\s*-\s*50\s*%", pp_text, re.IGNORECASE)
     if opt:
         amt = _find_amount_near(pp_text, opt.span())
-        if amt:
-            out[key] = _value_obj(f"ir iekļauts ({amt} EUR)", 0.85, _short_excerpt(pp_text, opt.span()))
-        else:
-            out[key] = _value_obj("v", 0.6, _short_excerpt(pp_text, opt.span()))
+        out[key] = _value_obj((f"ir iekļauts ({amt} EUR)" if amt else "v"), 0.85 if amt else 0.6, _short_excerpt(pp_text, opt.span()))
     else:
         set_default(key)
 
-    # 3) Zobārstniecība ar 50% atlaidi (pamatpolise)
+    # 3) Zobārstniecība (pamatpolise)
     key = "Zobārstniecība ar 50% atlaidi (pamatpolise)"
     dent_base = re.search(r"Zob[āa]rstniec[īi]ba.*50\s*%.*(pamatpolise|pamatprogramma)", pp_text, re.IGNORECASE)
     if dent_base:
-        amt = _find_amount_near(pp_text, dent_base.span())
-        out[key] = _value_obj((f"{amt} EUR" if amt else "v"), 0.8 if amt else 0.6, _short_excerpt(pp_text, dent_base.span()))
+        lim = _find_limit_near(pp_text, dent_base.span())
+        out[key] = _value_obj((f"{lim} EUR" if lim else "v"), 0.8 if lim else 0.6, _short_excerpt(pp_text, dent_base.span()))
     else:
         set_default(key)
 
-    # 4) Zobārstniecība ar 50% atlaidi (pp)
+    # 4) Zobārstniecība (pp) — anything 50% NOT explicitly tied to pamatpolise
     key = "Zobārstniecība ar 50% atlaidi (pp)"
-    dent_pp = re.search(r"Zob[āa]rstniec[īi]ba.*50\s*%.*(papildprogramma|PP|\bpp\b)", pp_text, re.IGNORECASE)
+    dent_pp = re.search(r"Zob[āa]rstniec[īi]ba.*50\s*%(?!.*pamatpolise)(?!.*pamatprogramma)", pp_text, re.IGNORECASE)
     if dent_pp:
-        amt = _find_amount_near(pp_text, dent_pp.span())
-        out[key] = _value_obj((f"{amt} EUR" if amt else "v"), 0.85 if amt else 0.6, _short_excerpt(pp_text, dent_pp.span()))
+        lim = _find_limit_near(pp_text, dent_pp.span())
+        prem = _find_premium_single_near(pp_text, dent_pp.span())
+        if lim and prem:
+            out[key] = _value_obj(f"{lim} EUR limits ({prem})", 0.9, _short_excerpt(pp_text, dent_pp.span()))
+        elif lim:
+            out[key] = _value_obj(f"{lim} EUR limits", 0.86, _short_excerpt(pp_text, dent_pp.span()))
+        else:
+            out[key] = _value_obj("v", 0.6, _short_excerpt(pp_text, dent_pp.span()))
     else:
         set_default(key)
 
-    # 5) Vakcinācija pret ērcēm un gripu (special rule)
+    # 5) Vakcinācija pret ērcēm un gripu
     key = "Vakcinācija pret ērcēm un gripu"
     vacc = re.search(r"Vakcin[āa]cija.*([eē]r[cč]u|[eē]rc[ēe]m).*grip", pp_text, re.IGNORECASE)
     if vacc:
@@ -611,64 +659,88 @@ def extract_papildprogrammas_features(full_text_raw: str) -> Dict[str, Dict[str,
 
     # 6) Ambulatorā rehabilitācija (pp)
     key = "Ambulatorā rehabilitācija (pp)"
-    rehab = re.search(r"Ambulator[āa]\s+rehabilit[āa]cija.*(papildprogramma|PP|\bpp\b)?", pp_text, re.IGNORECASE)
+    rehab = re.search(r"Ambulator[āa]\s+rehabilit[āa]cija", pp_text, re.IGNORECASE)
     if rehab:
-        amt = _find_amount_near(pp_text, rehab.span())
-        out[key] = _value_obj((f"{amt} EUR" if amt else "v"), 0.85 if amt else 0.6, _short_excerpt(pp_text, rehab.span()))
+        lim = _find_limit_near(pp_text, rehab.span())
+        prem = _find_premium_single_near(pp_text, rehab.span())
+        if lim and prem:
+            out[key] = _value_obj(f"{lim} EUR limits ({prem})", 0.88, _short_excerpt(pp_text, rehab.span()))
+        elif lim:
+            out[key] = _value_obj(f"{lim} EUR limits", 0.82, _short_excerpt(pp_text, rehab.span()))
+        else:
+            out[key] = _value_obj("v", 0.6, _short_excerpt(pp_text, rehab.span()))
     else:
         set_default(key)
 
-    # 7) Medikamenti ar 50% atlaidi
+    # 7) Medikamenti ar 50% atlaidi (Medikamenti/Medikamentu, optional B4)
     key = "Medikamenti ar 50% atlaidi"
-    meds = re.search(r"Medikamenti.*50\s*%.*(atlaide|kompens[āa]cija)?", pp_text, re.IGNORECASE)
+    meds = re.search(r"\bMedikament(?:i|u)\b(?:\s*B4)?", pp_text, re.IGNORECASE)
     if meds:
-        amt = _find_amount_near(pp_text, meds.span())
-        out[key] = _value_obj((f"{amt} EUR" if amt else "v"), 0.85 if amt else 0.6, _short_excerpt(pp_text, meds.span()))
+        lim = _find_limit_near(pp_text, meds.span())
+        prem = _find_premium_single_near(pp_text, meds.span())
+        if lim and prem:
+            out[key] = _value_obj(f"{lim} EUR limits ({prem})", 0.88, _short_excerpt(pp_text, meds.span()))
+        elif lim:
+            out[key] = _value_obj(f"{lim} EUR limits", 0.82, _short_excerpt(pp_text, meds.span()))
+        else:
+            out[key] = _value_obj("v", 0.6, _short_excerpt(pp_text, meds.span()))
     else:
         set_default(key)
 
     # 8) Sports
     key = "Sports"
     sports = re.search(r"\bSports\b|Sporta aktivit[āa]tes|Sporta pakalpojumi", pp_text, re.IGNORECASE)
-    if sports:
-        out[key] = _value_obj("v", 0.6, _short_excerpt(pp_text, sports.span()))
-    else:
-        set_default(key)
+    out[key] = _value_obj(("v" if sports else "-"), 0.6 if sports else 0.2, _short_excerpt(pp_text, sports.span()) if sports else "not found in Papildprogrammas")
 
     # 9) Kritiskās saslimšanas
     key = "Kritiskās saslimšanas"
-    crit = re.search(r"Kritisk[āa]s saslim[šs]an[āa]s|Kritisko saslim[šs]anu apdro[šs]in[āa]šana", pp_text, re.IGNORECASE)
+    crit = re.search(r"Kritisk[āa]s?\s+saslimšan(?:a|ām|u)|Kritisko\s+saslimšan(?:u|ām)", pp_text, re.IGNORECASE)
     if crit:
-        out[key] = _value_obj("v", 0.6, _short_excerpt(pp_text, crit.span()))
+        lim = _find_limit_near(pp_text, crit.span())
+        prem = _find_premium_single_near(pp_text, crit.span())
+        if lim and prem:
+            out[key] = _value_obj(f"{lim} EUR limits ({prem})", 0.88, _short_excerpt(pp_text, crit.span()))
+        elif lim:
+            out[key] = _value_obj(f"{lim} EUR limits", 0.8, _short_excerpt(pp_text, crit.span()))
+        else:
+            out[key] = _value_obj("ir iekļauts", 0.6, _short_excerpt(pp_text, crit.span()))
     else:
         set_default(key)
 
-    # 10) Maksas stacionārie pakalpojumi, limits EUR (pp)
+    # 10) Maksas stacionārie pakalpojumi (pp) — single limit, fallback to presence
     key = "Maksas stacionārie pakalpojumi, limits EUR (pp)"
-    stac = re.search(r"Maksas\s+stacion[āa]rie\s+pakalpojumi", pp_text, re.IGNORECASE)
+    stac = re.search(r"Maksas\s+stacion[āa]r(?:ie|a)\s+pakalpojumi", pp_text, re.IGNORECASE)
     if stac:
-        amt = _find_amount_near(pp_text, stac.span())
-        out[key] = _value_obj((f"{amt} EUR" if amt else "v"), 0.9 if amt else 0.6, _short_excerpt(pp_text, stac.span()))
+        lim = _find_limit_near(pp_text, stac.span())
+        prem = _find_premium_single_near(pp_text, stac.span())
+        if lim and prem:
+            out[key] = _value_obj(f"{lim} EUR ({prem})", 0.86, _short_excerpt(pp_text, stac.span()))
+        elif lim:
+            out[key] = _value_obj(f"{lim} EUR", 0.8, _short_excerpt(pp_text, stac.span()))
+        else:
+            out[key] = _value_obj("ir iekļauts", 0.65, _short_excerpt(pp_text, stac.span()))
     else:
         set_default(key)
 
-    # Cap value length to <=160 per schema
+    # Cap value length to <= 160
     for k, v in out.items():
         if isinstance(v.get("value"), str) and len(v["value"]) > 160:
             v["value"] = v["value"][:160]
-
     return out
 
 def _safe_merge_features(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Merge src feature objects into dst (do NOT overwrite good values).
-    Overwrite only if missing/empty/"-" in dst.
+    Merge src feature objects into dst.
+    Overwrite if dst is missing/empty/"-"/"v" to let concrete limits replace placeholders.
     """
     out = dict(dst or {})
     for k, v in (src or {}).items():
         dv = out.get(k, {})
         dv_val = (dv or {}).get("value", "-") if isinstance(dv, dict) else "-"
-        should_set = (dv is None) or (dv_val in ("", "-")) or (isinstance(dv_val, str) and not dv_val.strip())
+        should_set = (
+            (dv is None)
+            or (isinstance(dv_val, str) and dv_val.strip().lower() in {"", "-", "v"})
+        )
         if should_set:
             out[k] = v
     return out
@@ -732,7 +804,9 @@ class GPTConfig:
     log_prompts: bool = os.getenv("LOG_PROMPTS", "false").lower() == "true"
     fallback_chat_model: str = os.getenv("FALLBACK_CHAT_MODEL", "gpt-4o-mini")
 
+# Global singleton client (placeholder)
 _client: Optional[OpenAI] = None
+
 def _client_singleton() -> OpenAI:
     global _client
     if _client is None:
