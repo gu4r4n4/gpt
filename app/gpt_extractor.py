@@ -320,7 +320,7 @@ _BASE_HEADER_HINTS = (
 # Strict single-line row pattern with OPTIONAL small "count" column
 _BASE_ROW_RE = re.compile(
     r"^\s*(?P<name>[A-Za-zĀČĒĢĪĶĻŅŌŖŠŪŽāčēģīķļņōŗšūž0-9+/\-()., ]{3,}?)\s+"
-    r"(?:(?P<count>\d{1,4})\s+)?"  # optional 'insured count' column
+    r"(?:(?P<count>\d{1,4})\s+)?"
     r"(?P<sum>(?:[0-9]{1,3}(?:[ .][0-9]{3})*|[0-9]+)(?:[.,][0-9]{1,2})?)\s*(?:€|EUR)?\s+"
     r"(?P<premium>(?:[0-9]{1,3}(?:[ .][0-9]{3})*|[0-9]+)(?:[.,][0-9]{1,2})?)\s*(?:€|EUR)?\s*$",
     re.MULTILINE,
@@ -486,7 +486,7 @@ _AMOUNT_NEAR_RE = re.compile(
     r"""
     (?P<num>
         (?:
-            \d{1,3}(?:[ .]\d{3})+ |   # 1 500 or 1.500 etc.
+            \d{1,3}(?:[ .]\d{3})+ |
             \d+
         )
         (?:[,\.]\d{2})?
@@ -500,9 +500,6 @@ def _txt_clean(t: str) -> str:
     return t.replace("\u00A0", " ").replace("\u00AD", "")
 
 def _pp_section_slice(text: str) -> str:
-    """
-    Extract the Papildprogrammas area to avoid pulling base rows.
-    """
     m_start = re.search(r"\bPAPILDPROGRAMM[AĀ]S?\b|\bPapildprogramma[s]?\b", text, re.IGNORECASE)
     if not m_start:
         return text
@@ -543,10 +540,6 @@ def _present_or_default(match: Optional[re.Match], default: str = "-") -> str:
     return "v" if match else default
 
 def extract_papildprogrammas_features(full_text_raw: str) -> Dict[str, Dict[str, Any]]:
-    """
-    Parse Papildprogrammas and return feature map keyed by _PP_CANON_KEYS.
-    Each value is {value, confidence, provenance}.
-    """
     text = _txt_clean(full_text_raw or "")
     pp_text = _pp_section_slice(text)
 
@@ -600,7 +593,7 @@ def extract_papildprogrammas_features(full_text_raw: str) -> Dict[str, Dict[str,
     else:
         set_default(key)
 
-    # 5) Vakcinācija pret ērcēm un gripu (special rule)
+    # 5) Vakcinācija pret ērcēm un gripu
     key = "Vakcinācija pret ērcēm un gripu"
     vacc = re.search(r"Vakcin[āa]cija.*([eē]r[cč]u|[eē]rc[ēe]m).*grip", pp_text, re.IGNORECASE)
     if vacc:
@@ -660,10 +653,6 @@ def extract_papildprogrammas_features(full_text_raw: str) -> Dict[str, Dict[str,
     return out
 
 def _safe_merge_features(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Merge src feature objects into dst (do NOT overwrite good values).
-    Overwrite only if missing/empty/"-" in dst.
-    """
     out = dict(dst or {})
     for k, v in (src or {}).items():
         dv = out.get(k, {})
@@ -674,52 +663,29 @@ def _safe_merge_features(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, 
     return out
 
 def _apply_global_overrides(features: Dict[str, Any], full_text: str) -> Dict[str, Any]:
-    """
-    Enforce business overrides:
-      - Pakalpojuma apmaksas veids = "Saskaņā ar cenrādi"
-      - Maksas grūtnieču aprūpe: if mentioned anywhere -> "v", else "-"
-      - Pacientu iemaksa: default "100%" if not stated
-    """
     ft = full_text.lower()
-
-    # 1) Payment method override
     features["Pakalpojuma apmaksas veids"] = {"value": "Saskaņā ar cenrādi"}
-
-    # 2) Maksas grūtnieču aprūpe
     preg_match = re.search(r"gr[ūu]tnie[cč][uū]|\bgr[ūu]tniec[īi]ba\b", ft, re.IGNORECASE)
     features["Maksas grūtnieču aprūpe"] = {"value": "v" if preg_match else "-"}
-
-    # 3) Pacientu iemaksa
     cur = features.get("Pacientu iemaksa", {}).get("value")
     if not cur or (isinstance(cur, str) and cur.strip() in {"", "-"}):
         features["Pacientu iemaksa"] = {"value": "100%"}
-
-    # Cap values just in case
     for k, v in features.items():
         if isinstance(v, dict) and isinstance(v.get("value"), str) and len(v["value"]) > 160:
             v["value"] = v["value"][:160]
-
     return features
 
 def _merge_papild_into_programs(payload: Dict[str, Any], pdf_bytes: bytes) -> Dict[str, Any]:
-    """
-    Detect Papildprogrammas and merge their feature values into each base program.
-    We do not alter program counts; we only enrich features.
-    """
     full_text, _ = _pdf_pages_text(pdf_bytes)
     pp = extract_papildprogrammas_features(full_text)
-
     progs = payload.get("programs") or []
     for p in progs:
         feats = p.get("features") or {}
         feats = _safe_merge_features(feats, pp)
         feats = _apply_global_overrides(feats, full_text)
         p["features"] = feats
-
-    # Compose warnings
     if pp:
         payload.setdefault("warnings", []).append("postprocess: merged Papildprogrammas features into base program(s)")
-
     return payload
 
 # =========================
@@ -821,7 +787,6 @@ class ExtractionError(Exception):
     pass
 
 def _normalize_safely(augmented: Dict[str, Any], document_id: str) -> Dict[str, Any]:
-    """Run normalizer; if it collapses synthesized multi-variant programs, restore them (unless KEEP_SYNTH_MULTI=0)."""
     try:
         normalized = normalize_offer_json({**augmented, "document_id": document_id})
     except Exception as e:
@@ -899,33 +864,35 @@ def extract_offer_from_pdf_bytes(pdf_bytes: bytes, document_id: str) -> Dict[str
     if not pdf_bytes or len(pdf_bytes) > 12 * 1024 * 1024:
         raise ExtractionError("PDF too large or empty (limit: 12MB)")
 
-    # Raw extraction
     raw = call_gpt_extractor(document_id=document_id, pdf_bytes=pdf_bytes)
-
-    # Synthesize base variants from PAMATPROGRAMMA if applicable
     augmented = _augment_with_detected_variants(raw, pdf_bytes)
-
-    # Merge Papildprogrammas feature signals (incl. Maksas Operācijas + Optika 50%)
     enriched = _merge_papild_into_programs(augmented, pdf_bytes)
-
-    # Normalize with safety-belt
     normalized = _normalize_safely(enriched, document_id=document_id)
     return normalized
-	
-	
-	# =========================
+
+
+# =========================
 # Six-field fetch helpers (NON-BREAKING ADD-ON)
 # =========================
 
 # Default 6 items (can be overridden via env SIX_FIELDS="a,b,c,d,e,f")
+# IMPORTANT: use canonical key for dentistry (pp) that normalizer outputs.
 _DEFAULT_SIX_FIELDS = [
     "Programmas nosaukums",
     "Apdrošinājuma summa pamatpolisei, EUR",
     "Pamatpolises prēmija 1 darbiniekam, EUR",
     "Maksas Operācijas, limits EUR",
     "Optika 50%, limits EUR",
-    "Zobārstniecība ar 50% atlaidi (pp)",
+    "Zobārstniecība ar 50% atlaidi, apdrošinājuma summa (pp)",  # canonical
 ]
+
+# Alt-key map so the fetcher still works if payload carries legacy/extractor labels.
+_SIX_ALT_KEYS: Dict[str, List[str]] = {
+    "Zobārstniecība ar 50% atlaidi, apdrošinājuma summa (pp)": [
+        "Zobārstniecība ar 50% atlaidi (pp)",
+    ],
+    # add more aliases here if FE/BE labels drift
+}
 
 def _env_six_fields() -> List[str]:
     env = os.getenv("SIX_FIELDS", "")
@@ -934,13 +901,25 @@ def _env_six_fields() -> List[str]:
     parts = [p.strip() for p in env.split(",")]
     return [p for p in parts if p] or list(_DEFAULT_SIX_FIELDS)
 
-def _get_feature_value(prog: Dict[str, Any], key: str) -> Any:
-    """Safely pull a value for a display field from a program."""
-    feats: Dict[str, Any] = prog.get("features") or {}
-    fv = feats.get(key, {})
-    val = fv.get("value") if isinstance(fv, dict) else None
+def _lookup_feature_any(feats: Dict[str, Any], key: str) -> Any:
+    """Lookup key in features with alias fallback."""
+    if key in feats:
+        return feats[key]
+    for alt in _SIX_ALT_KEYS.get(key, []):
+        if alt in feats:
+            return feats[alt]
+    return None
 
-    # Smart fallbacks for the two most common numeric fields
+def _get_feature_value(prog: Dict[str, Any], key: str) -> Any:
+    """Safely pull a value for a display field from a program (with aliasing + fallbacks)."""
+    feats: Dict[str, Any] = prog.get("features") or {}
+    fv = _lookup_feature_any(feats, key)
+    if isinstance(fv, dict):
+        val = fv.get("value")
+    else:
+        val = fv
+
+    # Smart fallbacks for top-level numerics
     if (val in (None, "-", "")) and key == "Apdrošinājuma summa pamatpolisei, EUR":
         top = prog.get("base_sum_eur")
         return top if top not in (None, "") else "-"
