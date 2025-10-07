@@ -1,4 +1,3 @@
-# app/normalizer.py
 from __future__ import annotations
 from typing import Any, Dict, List
 
@@ -54,6 +53,7 @@ FEATURE_KEYS: List[str] = [
 # Map legacy or alternate labels to the canonical ones above
 LEGACY_KEYS_MAP = {
     "Vakcinācija pret ērčiem un gripu": "Vakcinācija pret ērcēm un gripu",
+    # FE/extractor might use the shorter "(pp)" label; map to canonical with "apdrošinājuma summa"
     "Zobārstniecība ar 50% atlaidi (pp)": "Zobārstniecība ar 50% atlaidi, apdrošinājuma summa (pp)",
 }
 
@@ -73,6 +73,7 @@ def _is_missing(v: Any) -> bool:
 
 def _coerce_feature_value(v: Any) -> str:
     s = _unwrap(v)
+    # collapse merged values with semicolons/commas if the model produced them
     if ";" in s:
         parts = [p.strip() for p in s.split(";") if p.strip()]
         s = parts[0] if parts else MISSING
@@ -96,6 +97,7 @@ def _coerce_premium(v: Any) -> str:
     s = s.replace("EUR", "").replace("€", "").strip()
     return s if s else MISSING
 
+# ---------------- Formatting helpers -----------------
 def _fmt_eur(n: Any) -> str:
     try:
         x = float(str(n).replace("€", "").replace(" EUR", "").strip())
@@ -104,8 +106,10 @@ def _fmt_eur(n: Any) -> str:
         return MISSING
 
 def _presence_to_v(value: str) -> str:
+    """For presence-only fields, convert any non-missing content to 'v'."""
     return "v" if value not in (None, "", MISSING, "-") else MISSING
 
+# --------------- Papildprogramma folding ---------------
 def _is_pp_program(name: str) -> bool:
     s = (name or "").lower()
     return ("papildprogram" in s) or any(k in s for k in [
@@ -113,9 +117,14 @@ def _is_pp_program(name: str) -> bool:
     ])
 
 def _fold_papild_into_base(programs: List[Dict[str, Any]], insurer_code: str | None = None) -> List[Dict[str, Any]]:
+    """
+    If the extractor returned multiple 'programs' (some of which are add-ons),
+    fold add-on values into the first non-PP 'base' program.
+    """
     if not programs:
         return programs
 
+    # choose base: first non-PP
     base_idx = 0
     for i, p in enumerate(programs):
         code = _coerce_feature_value(p.get("program_code"))
@@ -140,6 +149,7 @@ def _fold_papild_into_base(programs: List[Dict[str, Any]], insurer_code: str | N
         sum_pp_str = _fmt_eur(sum_pp) if sum_pp != MISSING else MISSING
 
         if "zobārst" in name:
+            # canonical for BE
             set_if(sum_pp_str, "Zobārstniecība ar 50% atlaidi, apdrošinājuma summa (pp)")
         elif "kritisk" in name:
             set_if(sum_pp_str, "Kritiskās saslimšanas")
@@ -155,21 +165,25 @@ def _fold_papild_into_base(programs: List[Dict[str, Any]], insurer_code: str | N
             v = _coerce_feature_value(feats.get("Maksas stacionārie pakalpojumi, limits EUR", MISSING))
             set_if("ir iekļauts" if (v != MISSING or sum_pp != MISSING) else MISSING, "Maksas stacionārie pakalpojumi, limits EUR (pp)")
         elif "operāc" in name:
+            # NEW: operations (if presented as a separate PP)
             v = _coerce_feature_value(feats.get("Maksas Operācijas, limits EUR", MISSING))
             if v != MISSING:
                 set_if(v, "Maksas Operācijas, limits EUR")
             else:
                 set_if(sum_pp_str if sum_pp_str != MISSING else "v", "Maksas Operācijas, limits EUR")
         elif "optik" in name:
+            # NEW: optics 50%
             v = _coerce_feature_value(feats.get("Optika 50%, limits EUR", MISSING))
             if v != MISSING:
                 set_if(v, "Optika 50%, limits EUR")
             else:
-                set_if("v" if sum_pp_str == MISSING else f"ir iekļauts ({sum_pp_str.replace(' EUR','')} EUR)", "Optika 50%, limits EUR")
+                set_if("v" if sum_pp_str == MISSING else f"ir iekļauts ({sum_pp_str.replace(' EUR','') } EUR)", "Optika 50%, limits EUR")
 
+    # Hard default: Pacientu iemaksa = 100% if missing on base
     if base_feats.get("Pacientu iemaksa", MISSING) in (MISSING, "-"):
         base_feats["Pacientu iemaksa"] = "100%"
 
+    # Special case per earlier note: Compensa VA => Maksas diagnostika = 'v' if empty
     ic = (insurer_code or "").lower()
     pc = (base.get("program_code") or "").lower()
     if ("compensa" in ic) and ("va" in pc):
@@ -180,10 +194,12 @@ def _fold_papild_into_base(programs: List[Dict[str, Any]], insurer_code: str | N
     base["features"] = base_feats
     return [base]
 
+# -------------------- Normalization entry -----------------
 def normalize_offer_json(doc: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {
         "document_id": _unwrap(doc.get("document_id")) or MISSING,
         "insurer_code": _unwrap(doc.get("insurer_code")) or MISSING,
+        # optional user-supplied metadata if present
         "insurer": _unwrap(doc.get("insurer")) or MISSING,
         "company": _unwrap(doc.get("company")) or MISSING,
         "insured_count": doc.get("insured_count") if isinstance(doc.get("insured_count"), int) else MISSING,
@@ -199,6 +215,7 @@ def normalize_offer_json(doc: Dict[str, Any]) -> Dict[str, Any]:
     for p in doc.get("programs", []) or []:
         features_in = p.get("features") or {}
 
+        # Map legacy keys to corrected ones if needed
         for old_k, new_k in LEGACY_KEYS_MAP.items():
             if old_k in features_in and new_k not in features_in:
                 features_in[new_k] = features_in.get(old_k)
@@ -207,7 +224,10 @@ def normalize_offer_json(doc: Dict[str, Any]) -> Dict[str, Any]:
         for key in FEATURE_KEYS:
             features_out[key] = _coerce_feature_value(features_in.get(key, MISSING))
 
+        # --- Business rule overrides ---
+        # Pakalpojuma apmaksas veids → always "Saskaņā ar cenrādi"
         features_out["Pakalpojuma apmaksas veids"] = "Saskaņā ar cenrādi"
+        # Maksas grūtnieču aprūpe → presence-only (v / -)
         features_out["Maksas grūtnieču aprūpe"] = _presence_to_v(features_out.get("Maksas grūtnieču aprūpe", MISSING))
 
         program_code_any = p.get("program_code") or features_out.get("Programmas kods") or features_out.get("Programmas nosaukums")
@@ -218,6 +238,7 @@ def normalize_offer_json(doc: Dict[str, Any]) -> Dict[str, Any]:
         base_sum_eur = _coerce_base_sum(p.get("base_sum_eur"))
         premium_eur = _coerce_premium(p.get("premium_eur"))
 
+        # Backfill key figures into feature block when missing
         if features_out.get("Apdrošinājuma summa pamatpolisei, EUR", MISSING) == MISSING and base_sum_eur != MISSING:
             features_out["Apdrošinājuma summa pamatpolisei, EUR"] = str(base_sum_eur)
         if features_out.get("Pamatpolises prēmija 1 darbiniekam, EUR", MISSING) == MISSING and premium_eur != MISSING:
@@ -230,5 +251,7 @@ def normalize_offer_json(doc: Dict[str, Any]) -> Dict[str, Any]:
             "features": features_out,
         })
 
+    # Fold Papildprogrammas programs (if any) into the base one and apply defaults
     out["programs"] = _fold_papild_into_base(out["programs"], insurer_code=out.get("insurer_code"))
+
     return out
