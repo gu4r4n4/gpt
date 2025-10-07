@@ -1,4 +1,3 @@
-# app/gpt_extractor.py
 """
 Robust extractor that:
 
@@ -254,7 +253,7 @@ def _prune_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         out["document_id"] = str(payload.get("document_id") or "uploaded.pdf")
 
     if "warnings" in out and not isinstance(out["warnings"], list):
-        out["warnings"] = [str(out["warnings"])]
+        out["warnings"] = [str(out["warnings")]]
 
     programs = payload.get("programs") or []
     norm_programs: List[Dict[str, Any]] = []
@@ -513,7 +512,7 @@ _PREMIA_LINE_TRIPLE_RE = re.compile(
 )
 # Single premium label variants (for all PP)
 _PREM_SINGLE_PATTERNS = [
-    re.compile(r"Pr[ēe]mija\s*1\s*darb\.?,?\s*(?:EUR)?[^\d]{0,40}([0-9][0-9.,]*)", re.IGNORECASE),
+    re.compile(r"Pr[ēe]mija\s*1\s*darb\.,?\s*(?:EUR)?[^\d]{0,40}([0-9][0-9.,]*)", re.IGNORECASE),
     re.compile(r"Apdrošin[āa]šanas\s*pr[ēe]mija\s*vienam\s*darbiniekam\s*gad[āa],?\s*EUR[^\d]{0,40}([0-9][0-9.,]*)", re.IGNORECASE),
     re.compile(r"vienai\s*personai\s*gad[āa][^\d]{0,40}([0-9][0-9.,]*)", re.IGNORECASE),
     re.compile(r"Pr[ēe]mija\s*1\s*\(?(?:vienai)?\)?\s*pers\.,?\s*EUR[^\d]{0,40}([0-9][0-9.,]*)", re.IGNORECASE),
