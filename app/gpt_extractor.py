@@ -1,3 +1,4 @@
+# app/gpt_extractor.py
 """
 Robust extractor that:
 
@@ -16,6 +17,16 @@ Safe post-process:
 Plus:
 * Parse Papildprogrammas section from raw PDF text and merge specific feature values into each base program,
   including: "Maksas Operācijas, limits EUR" and "Optika 50%, limits EUR".
+
+Tiny extra in this version:
+* Added helper to extract **only the 6 papildprogrammas** you asked for, directly from raw PDF text (no GPT call needed):
+  - "Ambulatorā rehabilitācija (pp)"
+  - "Medikamenti ar 50% atlaidi"
+  - "Kritiskās saslimšanas"
+  - "Maksas stacionārie pakalpojumi, limits EUR (pp)"
+  - "Maksas Operācijas, limits EUR"
+  - "Optika 50%, limits EUR"
+* Slightly broader regex for locating the Papildprogrammas region + a few synonym anchors.
 """
 
 from __future__ import annotations
@@ -30,7 +41,15 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from jsonschema import Draft202012Validator
 from openai import OpenAI
-from pypdf import PdfReader
+
+# pypdf is preferred; fall back to PyPDF2 if needed
+try:
+    from pypdf import PdfReader as _PdfReader
+except Exception:  # pragma: no cover
+    try:
+        from PyPDF2 import PdfReader as _PdfReader  # type: ignore
+    except Exception:  # pragma: no cover
+        _PdfReader = None  # type: ignore
 
 from app.normalizer import normalize_offer_json
 
@@ -195,8 +214,10 @@ Return STRICT JSON conforming to the schema. No markdown or prose.
 # PDF utils & normalization helpers
 # =========================
 def _pdf_to_text_pages(pdf_bytes: bytes, max_pages: int = 100) -> List[str]:
+    if _PdfReader is None:
+        raise RuntimeError("No PDF text extractor available (pypdf/PyPDF2 not installed)")
     pages: List[str] = []
-    reader = PdfReader(io.BytesIO(pdf_bytes))
+    reader = _PdfReader(io.BytesIO(pdf_bytes))
     for page in reader.pages[:max_pages]:
         try:
             txt = page.extract_text() or ""
@@ -253,7 +274,7 @@ def _prune_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         out["document_id"] = str(payload.get("document_id") or "uploaded.pdf")
 
     if "warnings" in out and not isinstance(out["warnings"], list):
-        out["warnings"] = [str(out["warnings")]]
+        out["warnings"] = [str(out["warnings"])]
 
     programs = payload.get("programs") or []
     norm_programs: List[Dict[str, Any]] = []
@@ -398,7 +419,7 @@ def _parse_base_rows_loose(block: str) -> List[Dict[str, Any]]:
             val = _parse_money_like(m.group(0))
             if val is not None:
                 acc_nums.append(val)
-        if re.search(r"\d(?:[.,]\d{2})?\s*(?:€|EUR)?\s*$", ln, re.IGNORECASE):
+        if re.search(r"\d(?:[.,]\d{2})?\s*(?:€|EUR)?\s$", ln, re.IGNORECASE):
             flush()
 
     flush()
@@ -496,6 +517,7 @@ _AMOUNT_NEAR_RE = re.compile(
 )
 
 # --- Keywords & patterns for PP parsing ---
+# (broadened a bit to catch more variants / synonym headings)
 _PP_STAC_KEYWORDS_RE = re.compile(
     r"(Maksas\s+stacion[āa]rie\s+pakalpojumi|MAKSAS\s+STACION[ĀA]RS|Maksas\s+stacion[āa]ra\s+pakalpojumi|Maksas\s+pakalpojumi\s+stacion[āa]r[āa]|Maksas\s+stacion[āa]r[āa]\s+pal[īi]dz[īi]ba)",
     re.IGNORECASE,
@@ -518,23 +540,31 @@ _PREM_SINGLE_PATTERNS = [
     re.compile(r"Pr[ēe]mija\s*1\s*\(?(?:vienai)?\)?\s*pers\.,?\s*EUR[^\d]{0,40}([0-9][0-9.,]*)", re.IGNORECASE),
 ]
 
+# Accept a few more headings to isolate Papildprogrammas slice if it's titled differently
+_PP_START_RE = re.compile(
+    r"\b(PAPILDPROGRAMM[AĀ]S?|Papildprogrammas?|Papildprogramma|Papildu\s+programmas|Papildus\s+programmas|Papildsegumi|Papildu\s+segumi)\b",
+    re.IGNORECASE,
+)
+_PP_END_RE = re.compile(
+    r"\b(PAMATPROGRAMM[AĀ]|Kopsavilkums|Visp[aā]r[īi]gie\s+noteikumi|Noteikumi|Pielikumi?)\b",
+    re.IGNORECASE,
+)
+
 def _txt_clean(t: str) -> str:
     return t.replace("\u00A0", " ").replace("\u00AD", "")
 
 def _pp_section_slice(text: str) -> str:
     """
     Extract the Papildprogrammas area to avoid pulling base rows.
+    Broadened to include a couple of alternative headings used by some insurers.
+    If no heading is found, we return the whole text and rely on feature-level anchors.
     """
-    m_start = re.search(r"\bPAPILDPROGRAMM[AĀ]S?\b|\bPapildprogramma[s]?\b", text, re.IGNORECASE)
+    m_start = _PP_START_RE.search(text)
     if not m_start:
         return text
     start = m_start.start()
-    m_end = re.search(
-        r"\bPAMATPROGRAMM[AĀ]\b|\bKopsavilkums\b|\bVisp[aā]r[īi]gie noteikumi\b|\bNoteikumi\b",
-        text[start:],
-        re.IGNORECASE,
-    )
-    end = start + m_end.start() if m_end else len(text)
+    m_end = _PP_END_RE.search(text, start)
+    end = m_end.start() if m_end else len(text)
     return text[start:end]
 
 def _normalize_num_str(num_str: str) -> str:
@@ -610,7 +640,7 @@ def extract_papildprogrammas_features(full_text_raw: str) -> Dict[str, Dict[str,
 
     # 1) Maksas Operācijas, limits EUR — include premium if found
     key = "Maksas Operācijas, limits EUR"
-    mo = re.search(r"Maksas\s+Oper[āa]cij(?:a|as)", pp_text, re.IGNORECASE)
+    mo = re.search(r"(Maksas\s+)?Oper[āa]cij(?:a|as)", pp_text, re.IGNORECASE)
     if mo:
         special = re.search(r"saska[nņ]ā ar programmas nosac[iī]jumiem", pp_text[mo.start():mo.start()+200], re.IGNORECASE)
         lim = _find_limit_near(pp_text, mo.span())
@@ -628,7 +658,7 @@ def extract_papildprogrammas_features(full_text_raw: str) -> Dict[str, Dict[str,
 
     # 2) Optika 50%, limits EUR — include bracketed sum if present
     key = "Optika 50%, limits EUR"
-    opt = re.search(r"\bOptika\s*50\s*%|\bOptikas?\s*50\s*%", pp_text, re.IGNORECASE)
+    opt = re.search(r"\bOptik[ae]\s*50\s*%|\bOptikas?\s*50\s*%|\bOptika\b", pp_text, re.IGNORECASE)
     if opt:
         amt = _find_amount_near(pp_text, opt.span())
         if amt:
@@ -673,7 +703,7 @@ def extract_papildprogrammas_features(full_text_raw: str) -> Dict[str, Dict[str,
 
     # 6) Ambulatorā rehabilitācija (pp) — include premium if found
     key = "Ambulatorā rehabilitācija (pp)"
-    rehab = re.search(r"Ambulator[āa]\s+rehabilit[āa]cija", pp_text, re.IGNORECASE)
+    rehab = re.search(r"Ambulator[āa]\s+rehabilit[āa]cija|Rehabilit[āa]cija\s*\(ambulator[āa]\)", pp_text, re.IGNORECASE)
     if rehab:
         lim = _find_limit_near(pp_text, rehab.span())
         prem = _find_premium_single_near(pp_text, rehab.span())
@@ -688,7 +718,7 @@ def extract_papildprogrammas_features(full_text_raw: str) -> Dict[str, Dict[str,
 
     # 7) Medikamenti ar 50% atlaidi — include premium if found
     key = "Medikamenti ar 50% atlaidi"
-    meds = re.search(r"\bMedikament[ui]\b|\bMedikamenti\s*B4\b", pp_text, re.IGNORECASE)
+    meds = re.search(r"\bMedikament[ui]\b|\bMedikamenti\s*B4\b|\bMed\.\b", pp_text, re.IGNORECASE)
     if meds:
         lim = _find_limit_near(pp_text, meds.span())
         prem = _find_premium_single_near(pp_text, meds.span())
@@ -729,7 +759,7 @@ def extract_papildprogrammas_features(full_text_raw: str) -> Dict[str, Dict[str,
     stac = _PP_STAC_KEYWORDS_RE.search(pp_text)
     if stac:
         win_start = stac.end()
-        win_end = min(len(pp_text), win_start + 800)
+        win_end = min(len(pp_text), win_start + 1000)
         window = pp_text[win_start:win_end]
 
         lim_m = _LIMITS_LIST_RE.search(window)  # triple
@@ -869,16 +899,22 @@ def _responses_with_pdf(model: str, document_id: str, pdf_bytes: bytes, allow_sc
 
     resp = client.responses.create(**kwargs)
 
+    # Try the structured field first
     payload = getattr(resp, "output_parsed", None)
     if payload is not None:
         return payload
 
+    # Then try to stitch plain-text parts
     texts: List[str] = []
-    for item in getattr(resp, "output", []) or []:
-        t = getattr(item, "content", None)
-        if isinstance(t, str):
-            texts.append(t)
-    raw = "".join(texts).strip() or "{}"
+    try:
+        for item in getattr(resp, "output", []) or []:
+            t = getattr(item, "content", None)
+            if isinstance(t, str):
+                texts.append(t)
+    except Exception:
+        pass
+
+    raw = "".join(texts).strip() or getattr(resp, "output_text", "{}").strip() or "{}"
     return json.loads(raw)
 
 # =========================
@@ -945,6 +981,8 @@ def _normalize_safely(augmented: Dict[str, Any], document_id: str) -> Dict[str, 
         normalized["programs"] = augmented["programs"]
     return normalized
 
+# Public orchestrator
+
 def call_gpt_extractor(document_id: str, pdf_bytes: bytes, cfg: Optional[GPTConfig] = None) -> Dict[str, Any]:
     cfg = cfg or GPTConfig()
     last_err: Optional[Exception] = None
@@ -1002,6 +1040,7 @@ def call_gpt_extractor(document_id: str, pdf_bytes: bytes, cfg: Optional[GPTConf
 
     raise ExtractionError(f"GPT extraction failed: {last_err}")
 
+
 def extract_offer_from_pdf_bytes(pdf_bytes: bytes, document_id: str) -> Dict[str, Any]:
     if not pdf_bytes or len(pdf_bytes) > 12 * 1024 * 1024:
         raise ExtractionError("PDF too large or empty (limit: 12MB)")
@@ -1018,3 +1057,52 @@ def extract_offer_from_pdf_bytes(pdf_bytes: bytes, document_id: str) -> Dict[str
     # Normalize with safety-belt
     normalized = _normalize_safely(enriched, document_id=document_id)
     return normalized
+
+# =========================
+# Convenience: direct 6-feature fetchers (no GPT call)
+# =========================
+
+def extract_six_features_from_pdf_bytes(pdf_bytes: bytes) -> Dict[str, str]:
+    """Return only the six requested papildprogrammas values by parsing the PDF's text layer.
+    NOTE: This relies on a readable text layer; scanned/outlined PDFs will require the GPT path or OCR.
+    """
+    full_text, _ = _pdf_pages_text(pdf_bytes)
+    feats = extract_papildprogrammas_features(full_text)
+    wanted = [
+        "Ambulatorā rehabilitācija (pp)",
+        "Medikamenti ar 50% atlaidi",
+        "Kritiskās saslimšanas",
+        "Maksas stacionārie pakalpojumi, limits EUR (pp)",
+        "Maksas Operācijas, limits EUR",
+        "Optika 50%, limits EUR",
+    ]
+    out: Dict[str, str] = {}
+    for k in wanted:
+        v = (feats.get(k) or {}).get("value", "-")
+        if isinstance(v, (int, float)):
+            out[k] = f"{v}"
+        else:
+            s = str(v).strip()
+            out[k] = s if s else "-"
+    return out
+
+
+def extract_six_features_from_file(path: str) -> Dict[str, str]:
+    if _PdfReader is None:
+        raise RuntimeError("No PDF text extractor available (pypdf/PyPDF2 not installed)")
+    with open(path, "rb") as f:
+        return extract_six_features_from_pdf_bytes(f.read())
+
+
+if __name__ == "__main__":  # handy CLI for quick checks
+    import argparse, json as _json
+    ap = argparse.ArgumentParser(description="Extract six papildprogrammas fields from Latvian health offer PDFs")
+    ap.add_argument("files", nargs="+", help="PDF file paths")
+    args = ap.parse_args()
+    res = {}
+    for p in args.files:
+        try:
+            res[os.path.basename(p)] = extract_six_features_from_file(p)
+        except Exception as e:  # pragma: no cover
+            res[os.path.basename(p)] = {"error": str(e)}
+    print(_json.dumps(res, ensure_ascii=False, indent=2))
