@@ -32,6 +32,8 @@ from pypdf import PdfReader
 
 from app.normalizer import normalize_offer_json
 
+# FIX: define global client placeholder for singleton
+_client: Optional[OpenAI] = None
 
 # =========================
 # STRICT JSON SCHEMA
