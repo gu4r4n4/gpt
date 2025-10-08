@@ -911,9 +911,9 @@ def extract_offer_from_pdf_bytes(pdf_bytes: bytes, document_id: str) -> Dict[str
     # Normalize with safety-belt
     normalized = _normalize_safely(enriched, document_id=document_id)
     return normalized
-
-
-# =========================
+	
+	
+	# =========================
 # Six-field fetch helpers (NON-BREAKING ADD-ON)
 # =========================
 
@@ -974,105 +974,3 @@ def extract_offer_and_fetch_six(pdf_bytes: bytes, document_id: str, fields: Opti
     payload = extract_offer_from_pdf_bytes(pdf_bytes, document_id)
     six = fetch_six_items_from_payload(payload, fields=fields)
     return payload, six
-
-
-# =========================
-# SEVEN-field fetch helpers (alias-aware, NON-BREAKING ADD-ON)
-# =========================
-
-# Canonical default 7 (env SIX_FIELDS can override)
-_DEFAULT_SEVEN_FIELDS = [
-    "Programmas nosaukums",
-    "Apdrošinājuma summa pamatpolisei, EUR",
-    "Pamatpolises prēmija 1 darbiniekam, EUR",
-    "Maksas Operācijas, limits EUR",
-    "Optika 50%, limits EUR",
-    "Zobārstniecība ar 50% atlaidi, apdrošinājuma summa (pp)",  # canonical in normalizer
-    "Maksas stacionārie pakalpojumi, limits EUR (pp)",
-]
-
-# If extractor/normalizer disagree on labels, look here first
-_SEVEN_ALT_KEYS: Dict[str, List[str]] = {
-    # Canonical -> list of accepted aliases
-    "Programmas nosaukums": ["Programmas kods"],
-    "Apdrošinājuma summa pamatpolisei, EUR": ["Apdrošinājuma summa"],
-    "Pamatpolises prēmija 1 darbiniekam, EUR": [
-        "Prēmija 1 darbiniekam",
-        "Prēmija vienai personai, EUR",
-        "Apdrošināšanas prēmija vienam darbiniekam gadā, EUR",
-        "Prēmija 1 pers., EUR",
-    ],
-    "Maksas Operācijas, limits EUR": ["Maksas Operācija, limits EUR", "Operācijas (maksas)"],
-    "Optika 50%, limits EUR": ["Optika 50%", "Optikas pakalpojumi 50%"],
-    # dentistry: accept legacy extractor label and map to canonical
-    "Zobārstniecība ar 50% atlaidi, apdrošinājuma summa (pp)": [
-        "Zobārstniecība ar 50% atlaidi (pp)"
-    ],
-    "Maksas stacionārie pakalpojumi, limits EUR (pp)": [
-        "Maksas stacionārie pakalpojumi, limits EUR",  # sometimes without (pp)
-        "MAKSAS STACIONĀRS",
-        "Maksas stacionārā palīdzība",
-        "Maksas pakalpojumi stacionārā",
-    ],
-}
-
-def _env_seven_fields() -> List[str]:
-    # Spec asks to support SIX_FIELDS env override; if present, we honor it.
-    env = os.getenv("SIX_FIELDS", "")
-    if env.strip():
-        fields = [p.strip() for p in env.split(",") if p.strip()]
-        return fields or list(_DEFAULT_SEVEN_FIELDS)
-    return list(_DEFAULT_SEVEN_FIELDS)
-
-def _get_feature_value_with_alias(prog: Dict[str, Any], canonical_key: str) -> Any:
-    """Fetch feature by canonical key, falling back to defined aliases. Includes smart fallbacks for base/premium."""
-    feats: Dict[str, Any] = prog.get("features") or {}
-    # 1) canonical
-    if canonical_key in feats and isinstance(feats[canonical_key], dict):
-        v = feats[canonical_key].get("value")
-        if v not in (None, "", "-"):
-            return v
-
-    # 2) aliases
-    for alt in _SEVEN_ALT_KEYS.get(canonical_key, []):
-        dv = feats.get(alt, {})
-        v = dv.get("value") if isinstance(dv, dict) else None
-        if v not in (None, "", "-"):
-            return v
-
-    # 3) smart fallbacks for two base key figures
-    if canonical_key == "Apdrošinājuma summa pamatpolisei, EUR":
-        top = prog.get("base_sum_eur")
-        return top if top not in (None, "", "-") else "-"
-    if canonical_key == "Pamatpolises prēmija 1 darbiniekam, EUR":
-        top = prog.get("premium_eur")
-        return top if top not in (None, "", "-") else "-"
-
-    return "-"
-
-def fetch_SEVEN_items_from_payload(payload: Dict[str, Any], fields: Optional[List[str]] = None) -> List[Dict[str, Any]]:
-    """
-    Create a compact list per program with 7 items.
-    - Canonical-first with alias fallback
-    - Smart fallbacks for base_sum/premium
-    - Does NOT modify payload
-    """
-    fields = fields or _env_seven_fields()
-    progs = payload.get("programs") or []
-    out: List[Dict[str, Any]] = []
-    for p in progs:
-        row = {"program_code": p.get("program_code", "-")}
-        for f in fields:
-            row[f] = _get_feature_value_with_alias(p, f)
-        out.append(row)
-    return out
-
-def extract_offer_and_fetch_SEVEN(pdf_bytes: bytes, document_id: str, fields: Optional[List[str]] = None) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    """
-    Convenience wrapper:
-      - runs the full extractor (unchanged)
-      - returns (full_payload, seven_items_list)
-    """
-    payload = extract_offer_from_pdf_bytes(pdf_bytes, document_id)
-    seven = fetch_SEVEN_items_from_payload(payload, fields=fields)
-    return payload, seven
