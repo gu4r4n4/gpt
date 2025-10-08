@@ -56,8 +56,6 @@ LEGACY_KEYS_MAP = {
     "Vakcinācija pret ērčiem un gripu": "Vakcinācija pret ērcēm un gripu",
     # FE/extractor might use the shorter "(pp)" label; map to canonical with "apdrošinājuma summa"
     "Zobārstniecība ar 50% atlaidi (pp)": "Zobārstniecība ar 50% atlaidi, apdrošinājuma summa (pp)",
-    # keep other existing mappings (e.g., diacritics drift)
-    "Vakcinācija pret ercem un gripu": "Vakcinācija pret ērcēm un gripu",
 }
 
 def _unwrap(v: Any) -> str:
