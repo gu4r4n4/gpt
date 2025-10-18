@@ -42,3 +42,42 @@ def create_batch(payload: dict = Body(...)):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"batches.create failed: {e}")
 
+
+@router.get("/{token}")
+def get_batch(token: str):
+    try:
+        with get_db_connection() as conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, org_id, token, title, status, created_at, expires_at
+                FROM public.offer_batches
+                WHERE token = %s
+                LIMIT 1
+            """, (token,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Batch not found")
+            batch_id = row[0]
+            cur.execute("""
+                SELECT id, filename, retrieval_file_id, embeddings_ready
+                FROM public.offer_files
+                WHERE batch_id = %s
+                ORDER BY id DESC
+            """, (batch_id,))
+            files = [
+                {"id": r[0], "filename": r[1], "retrieval_file_id": r[2], "embeddings_ready": bool(r[3])}
+                for r in cur.fetchall()
+            ]
+            return JSONResponse({
+                "batch": {
+                    "id": row[0], "org_id": row[1], "token": row[2], "title": row[3],
+                    "status": row[4], "created_at": row[5], "expires_at": row[6],
+                },
+                "files": files
+            })
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("[GET /api/batches/{token}] error:", repr(e))
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
