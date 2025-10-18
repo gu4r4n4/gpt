@@ -313,20 +313,138 @@ async def upload_offer_file(
     # Check for duplicates
     existing = check_duplicate(org_id, sha256)
     if existing:
-        print(f"Duplicate file found: {existing['id']}")
-        payload = {
-            "id": existing["id"],
-            "filename": existing["filename"],
-            "retrieval_file_id": existing["retrieval_file_id"],
-            "vector_store_id": existing["vector_store_id"],
-            "storage_path": existing["storage_path"],
-            "sha256": sha256,
-            "size_bytes": file_size,
-            "duplicate": True
-        }
-        if batch_token:
-            payload["batch_token"] = batch_token
-        return JSONResponse(payload)
+        try:
+            # existing is a dict-like row (id, filename, storage_path, vector_store_id, retrieval_file_id, batch_id, ...)
+            existing_id = existing["id"]
+            existing_vs_id = existing.get("vector_store_id")
+            existing_retrieval_id = existing.get("retrieval_file_id")
+            existing_batch_id = existing.get("batch_id")
+
+            # 1) If batch_token provided, resolve and link the existing file to that batch (idempotent)
+            resolved_batch_id = None
+            if batch_token:
+                try:
+                    resolved_batch_id = resolve_batch_id_by_token(batch_token, org_id)
+                except HTTPException as e:
+                    # bubble the 404/400 batch errors
+                    raise
+
+                if existing_batch_id is None or existing_batch_id != resolved_batch_id:
+                    with get_db_connection() as conn, conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE public.offer_files SET batch_id = %s WHERE id = %s",
+                            (resolved_batch_id, existing_id),
+                        )
+                        conn.commit()
+                    existing_batch_id = resolved_batch_id
+
+            # 2) Ensure the file is attached to the org's vector store.
+            #    If retrieval_file_id is missing, create + attach now (idempotent).
+            #    Always rely on org mapping (org_vector_stores) for the current vector_store_id.
+            with get_db_connection() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT vector_store_id FROM public.org_vector_stores WHERE org_id = %s",
+                    (org_id,),
+                )
+                row = cur.fetchone()
+                if not row or not row[0]:
+                    raise HTTPException(status_code=502, detail="No vector store configured for this org.")
+                vector_store_id = row[0]
+
+            if not existing_retrieval_id:
+                # Read file bytes from storage_path and upload to OpenAI
+                storage_path = existing["storage_path"]
+                try:
+                    with open(storage_path, "rb") as fh:
+                        fbytes = fh.read()
+                except Exception as e:
+                    print("[duplicate reattach] failed to read storage file:", storage_path, repr(e))
+                    traceback.print_exc()
+                    raise HTTPException(status_code=500, detail=f"Failed to read stored file for duplicate attach: {str(e)}")
+
+                try:
+                    # Create file in OpenAI
+                    created_file = openai_client.files.create(
+                        file=(existing["filename"], fbytes, existing["mime_type"]),
+                        purpose="assistants",
+                    )
+                    retrieval_file_id = created_file.id if hasattr(created_file, "id") else created_file["id"]
+
+                    # Attach to vector store (stable first, then fallback)
+                    attach_to_vector_store(vector_store_id=vector_store_id, file_id=retrieval_file_id)
+
+                    # Update DB with retrieval_file_id + vector_store_id + embeddings_ready
+                    with get_db_connection() as conn, conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            UPDATE public.offer_files
+                               SET retrieval_file_id = %s,
+                                   vector_store_id    = %s,
+                                   embeddings_ready   = TRUE
+                             WHERE id = %s
+                            """,
+                            (retrieval_file_id, vector_store_id, existing_id),
+                        )
+                        conn.commit()
+
+                    existing_retrieval_id = retrieval_file_id
+                    existing_vs_id = vector_store_id
+
+                except Exception as e:
+                    print("[duplicate reattach] OpenAI error:", repr(e))
+                    traceback.print_exc()
+                    raise HTTPException(status_code=502, detail=f"OpenAI error re-attaching duplicate file: {str(e)}")
+
+            # 3) Re-select and return the full, up-to-date row
+            with get_db_connection() as conn, conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, org_id, created_by_user_id, offer_id, batch_id,
+                           filename, mime_type, size_bytes, sha256, storage_path,
+                           extracted_text, raw_json, embeddings_ready, created_at,
+                           vector_store_id, retrieval_file_id
+                      FROM public.offer_files
+                     WHERE id = %s
+                    """,
+                    (existing_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=500, detail="Duplicate file row not found after update.")
+
+            payload = {
+                "id": row[0],
+                "org_id": row[1],
+                "created_by_user_id": row[2],
+                "offer_id": row[3],
+                "batch_id": row[4],
+                "filename": row[5],
+                "mime_type": row[6],
+                "size_bytes": row[7],
+                "sha256": row[8],
+                "storage_path": row[9],
+                "extracted_text": row[10],
+                "raw_json": row[11],
+                "embeddings_ready": row[12],
+                "created_at": row[13].isoformat() if row[13] else None,
+                "vector_store_id": row[14],
+                "retrieval_file_id": row[15],
+                "duplicate": True,
+            }
+            if batch_token:
+                payload["batch_token"] = batch_token
+
+            print(f"[upload] duplicate hit -> id={existing_id}, batch_token={batch_token}, will_link_batch={bool(resolved_batch_id)}")
+            print(f"[upload] duplicate had retrieval? {bool(existing_retrieval_id)}; ensured vs_id={existing_vs_id}")
+
+            return JSONResponse(status_code=200, content=payload)
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            print("[duplicate handling] unexpected error:", repr(e))
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=str(e))
     
     # ---- batch resolution (optional) ----
     batch_id: Optional[int] = None
