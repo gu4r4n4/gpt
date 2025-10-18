@@ -1,0 +1,343 @@
+"""
+File upload endpoint for offer documents with vector store integration.
+"""
+import hashlib
+import os
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, Dict, Any
+from urllib.parse import quote
+
+import psycopg2
+import psycopg2.extras
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
+from openai import OpenAI
+
+# Configuration
+MAX_FILE_SIZE = 25 * 1024 * 1024  # 25MB
+ALLOWED_MIME_TYPES = {
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.ms-excel",
+    "application/json",
+    "text/xml",
+    "application/xml",
+    "text/plain",
+}
+
+# Environment variables
+DATABASE_URL = os.getenv("DATABASE_URL")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+STORAGE_ROOT = os.getenv("STORAGE_ROOT", "/var/app/uploads")
+S3_BUCKET = os.getenv("S3_BUCKET")
+
+# Initialize OpenAI client
+openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+router = APIRouter(prefix="/api/offers", tags=["offers"])
+
+
+def validate_environment():
+    """Validate required environment variables."""
+    if not DATABASE_URL:
+        raise HTTPException(status_code=500, detail="DATABASE_URL not configured")
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY not configured")
+
+
+def safe_filename(filename: str) -> str:
+    """Sanitize filename for safe storage."""
+    # Remove path components and dangerous characters
+    safe = os.path.basename(filename)
+    # Replace unsafe characters with underscores
+    safe = "".join(c if c.isalnum() or c in ".-_" else "_" for c in safe)
+    # Limit length
+    safe = safe[:100] if len(safe) > 100 else safe
+    return safe or "uploaded_file"
+
+
+def validate_size(file_size: int) -> None:
+    """Validate file size."""
+    if file_size > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large. Maximum size: {MAX_FILE_SIZE // (1024*1024)}MB"
+        )
+
+
+def validate_mime(mime_type: str, filename: str) -> None:
+    """Validate MIME type against allowlist."""
+    # Try to detect MIME type from filename extension as fallback
+    ext_mime_map = {
+        ".pdf": "application/pdf",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".doc": "application/msword",
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".xls": "application/vnd.ms-excel",
+        ".json": "application/json",
+        ".xml": "text/xml",
+        ".txt": "text/plain",
+    }
+    
+    mime_lower = mime_type.lower() if mime_type else ""
+    allowed_lower = {m.lower() for m in ALLOWED_MIME_TYPES}
+    
+    # Check if MIME type is allowed
+    if mime_lower in allowed_lower:
+        return
+    
+    # Fallback to extension-based detection
+    ext = Path(filename).suffix.lower()
+    if ext in ext_mime_map and ext_mime_map[ext].lower() in allowed_lower:
+        return
+    
+    raise HTTPException(
+        status_code=415,
+        detail=f"Unsupported file type: {mime_type}. Allowed: {', '.join(ALLOWED_MIME_TYPES)}"
+    )
+
+
+def ensure_dir(path: Path) -> None:
+    """Ensure directory exists."""
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def compute_sha256(content: bytes) -> str:
+    """Compute SHA-256 hash of content."""
+    return hashlib.sha256(content).hexdigest()
+
+
+def scan_antivirus(file_path: str) -> bool:
+    """TODO: Implement antivirus scanning."""
+    # Stub implementation - always return True
+    return True
+
+
+def scrub_pii(content: bytes) -> bytes:
+    """TODO: Implement PII redaction."""
+    # Stub implementation - return content unchanged
+    return content
+
+
+def get_db_connection():
+    """Get database connection."""
+    return psycopg2.connect(DATABASE_URL)
+
+
+def check_duplicate(org_id: int, sha256: str) -> Optional[Dict[str, Any]]:
+    """Check if file with same org_id and sha256 already exists."""
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id, filename, retrieval_file_id, vector_store_id, storage_path
+                FROM public.offer_files
+                WHERE org_id = %s AND sha256 = %s
+                LIMIT 1
+                """,
+                (org_id, sha256)
+            )
+            result = cur.fetchone()
+            return dict(result) if result else None
+
+
+def get_org_vector_store(org_id: int) -> str:
+    """Get vector store ID for organization."""
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT vector_store_id FROM public.org_vector_stores WHERE org_id = %s",
+                (org_id,)
+            )
+            result = cur.fetchone()
+            if not result:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"No vector store found for org_id {org_id}"
+                )
+            return result[0]
+
+
+def save_to_storage(content: bytes, org_id: int, filename: str) -> str:
+    """Save file to storage (local or S3)."""
+    now = datetime.now()
+    year, month = now.year, now.month
+    file_uuid = str(uuid.uuid4())
+    safe_name = safe_filename(filename)
+    final_filename = f"{file_uuid}-{safe_name}"
+    
+    if S3_BUCKET:
+        # S3 storage
+        import boto3
+        s3_client = boto3.client('s3')
+        s3_key = f"offers/{org_id}/{year}/{month:02d}/{final_filename}"
+        
+        s3_client.put_object(
+            Bucket=S3_BUCKET,
+            Key=s3_key,
+            Body=content,
+            ContentType='application/octet-stream'
+        )
+        
+        storage_path = f"s3://{S3_BUCKET}/{s3_key}"
+        print(f"Saved to S3: {storage_path}")
+    else:
+        # Local storage
+        storage_dir = Path(STORAGE_ROOT) / "offers" / str(org_id) / str(year) / f"{month:02d}"
+        ensure_dir(storage_dir)
+        storage_path = storage_dir / final_filename
+        
+        storage_path.write_bytes(content)
+        storage_path = str(storage_path)
+        print(f"Saved to local storage: {storage_path}")
+    
+    return storage_path
+
+
+def upload_to_openai(content: bytes, filename: str) -> str:
+    """Upload file to OpenAI and return file ID."""
+    # Create a temporary file for OpenAI upload
+    import tempfile
+    with tempfile.NamedTemporaryFile(delete=False, suffix=Path(filename).suffix) as tmp_file:
+        tmp_file.write(content)
+        tmp_file.flush()
+        
+        try:
+            with open(tmp_file.name, 'rb') as f:
+                file_obj = openai_client.files.create(
+                    file=f,
+                    purpose="assistants"
+                )
+            return file_obj.id
+        finally:
+            os.unlink(tmp_file.name)
+
+
+def attach_to_vector_store(vector_store_id: str, file_id: str) -> None:
+    """Attach file to vector store."""
+    openai_client.beta.vector_stores.files.create(
+        vector_store_id=vector_store_id,
+        file_id=file_id
+    )
+
+
+@router.post("/upload")
+async def upload_offer_file(
+    org_id: int = Form(...),
+    created_by_user_id: int = Form(...),
+    offer_id: Optional[int] = Form(None),
+    file: UploadFile = File(...)
+):
+    """Upload offer file and create vector store attachment."""
+    validate_environment()
+    
+    # Validate file
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No filename provided")
+    
+    # Read file content
+    content = await file.read()
+    file_size = len(content)
+    
+    # Validate size and MIME type
+    validate_size(file_size)
+    validate_mime(file.content_type, file.filename)
+    
+    # Compute SHA-256
+    sha256 = compute_sha256(content)
+    
+    # Check for duplicates
+    existing = check_duplicate(org_id, sha256)
+    if existing:
+        print(f"Duplicate file found: {existing['id']}")
+        return {
+            "id": existing["id"],
+            "filename": existing["filename"],
+            "retrieval_file_id": existing["retrieval_file_id"],
+            "vector_store_id": existing["vector_store_id"],
+            "storage_path": existing["storage_path"],
+            "sha256": sha256,
+            "size_bytes": file_size,
+            "duplicate": True
+        }
+    
+    # TODO: Antivirus scan
+    if not scan_antivirus(file.filename):
+        raise HTTPException(status_code=400, detail="File failed antivirus scan")
+    
+    # TODO: PII redaction
+    content = scrub_pii(content)
+    
+    # Get vector store ID
+    vector_store_id = get_org_vector_store(org_id)
+    
+    # Save to storage
+    storage_path = save_to_storage(content, org_id, file.filename)
+    
+    # Insert into database
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO public.offer_files
+                (filename, mime_type, size_bytes, sha256, storage_path, 
+                 org_id, created_by_user_id, offer_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (file.filename, file.content_type, file_size, sha256, storage_path,
+                 org_id, created_by_user_id, offer_id)
+            )
+            file_record_id = cur.fetchone()["id"]
+            conn.commit()
+    
+    print(f"Inserted offer_file record: {file_record_id}")
+    
+    try:
+        # Upload to OpenAI
+        retrieval_file_id = upload_to_openai(content, file.filename)
+        print(f"Uploaded to OpenAI: {retrieval_file_id}")
+        
+        # Attach to vector store
+        attach_to_vector_store(vector_store_id, retrieval_file_id)
+        print(f"Attached to vector store: {vector_store_id}")
+        
+        # Update database with OpenAI IDs
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE public.offer_files
+                    SET retrieval_file_id = %s, vector_store_id = %s, embeddings_ready = true
+                    WHERE id = %s
+                    """,
+                    (retrieval_file_id, vector_store_id, file_record_id)
+                )
+                conn.commit()
+        
+        print(f"Updated database with OpenAI IDs for record: {file_record_id}")
+        
+    except Exception as e:
+        print(f"OpenAI upload failed: {e}")
+        # Still return success but mark as not ready
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE public.offer_files SET embeddings_ready = false WHERE id = %s",
+                    (file_record_id,)
+                )
+                conn.commit()
+    
+    return {
+        "id": file_record_id,
+        "filename": file.filename,
+        "retrieval_file_id": retrieval_file_id if 'retrieval_file_id' in locals() else None,
+        "vector_store_id": vector_store_id,
+        "storage_path": storage_path,
+        "sha256": sha256,
+        "size_bytes": file_size,
+        "embeddings_ready": 'retrieval_file_id' in locals()
+    }

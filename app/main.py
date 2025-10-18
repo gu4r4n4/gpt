@@ -27,6 +27,7 @@ from app.gpt_extractor import extract_offer_from_pdf_bytes, ExtractionError
 from app.routes.offers_by_documents import router as offers_by_documents_router
 from app.routes.debug_db import router as debug_db_router
 from app.routes.ingest import router as ingest_router
+from backend.api.routes.offers_upload import router as offers_upload_router
 
 APP_NAME = "GPT Offer Extractor"
 APP_VERSION = "1.0.0"
@@ -42,6 +43,7 @@ app = FastAPI(title=APP_NAME, version=APP_VERSION)
 app.include_router(offers_by_documents_router)  # SQLAlchemy router
 app.include_router(debug_db_router)
 app.include_router(ingest_router)
+app.include_router(offers_upload_router)  # File upload with vector store integration
 
 # -------------------------------
 # CORS (adjust for production)

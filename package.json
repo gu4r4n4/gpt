@@ -1,0 +1,23 @@
+{
+  "name": "gpt-offer-extractor",
+  "version": "1.0.0",
+  "description": "Backend service for GPT-powered PDF offer extraction",
+  "type": "module",
+  "scripts": {
+    "create:vector-stores": "tsx backend/scripts/create-vector-stores.ts",
+    "dev": "uvicorn app.main:app --reload --host 0.0.0.0 --port 8000",
+    "start": "uvicorn app.main:app --host 0.0.0.0 --port 8000"
+  },
+  "dependencies": {
+    "openai": "^4.0.0",
+    "pg": "^8.11.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.0.0",
+    "@types/node": "^20.0.0",
+    "@types/pg": "^8.10.0"
+  },
+  "keywords": ["fastapi", "openai", "pdf", "extraction", "insurance"],
+  "author": "",
+  "license": "ISC"
+}
