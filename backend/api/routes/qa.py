@@ -1,6 +1,7 @@
 import os
 import json
 import traceback
+import time
 from typing import List, Dict, Any, Optional
 
 import psycopg2
@@ -20,7 +21,7 @@ def get_db_connection():
         raise RuntimeError("Missing DATABASE_URL")
     return psycopg2.connect(DATABASE_URL)
 
-def resolve_batch(org_id: int, batch_token: str) -> Dict[str, Any]:
+def resolve_batch_by_token(org_id: int, batch_token: str) -> Dict[str, Any]:
     """Get batch row by token and org; ensure exists and not expired/deleted."""
     sql = """
         SELECT id, org_id, token, status, expires_at
@@ -72,26 +73,12 @@ def get_org_vector_store_id(org_id: int) -> str:
         row = cur.fetchone()
     return row[0] if row and row[0] else None
 
-def insert_qa_log(batch_id: int, org_id: int, asked_by_user_id: int, question: str,
-                  answer_summary: str, sources: List[Dict[str, Any]]) -> int:
-    sql = """
-        INSERT INTO public.offer_qa_logs (batch_id, org_id, asked_by_user_id, question, answer_summary, sources)
-        VALUES (%s, %s, %s, %s, %s, %s)
-        RETURNING id
-    """
-    with get_db_connection() as conn, conn.cursor() as cur:
-        cur.execute(sql, (batch_id, org_id, asked_by_user_id, question, answer_summary, json.dumps(sources)))
-        new_id = cur.fetchone()[0]
-        conn.commit()
-        return new_id
 
 
 @router.post("/ask")
-def ask(
-    payload: Dict[str, Any] = Body(...)
-):
+def ask(payload: Dict[str, Any] = Body(...)):
     """
-    POST /api/qa/ask
+    Input:
     {
       "org_id": 1,
       "batch_token": "bt_manual_test_001",
@@ -99,144 +86,214 @@ def ask(
       "question": "What's the annual premium and deductible?"
     }
     """
+
+    # 1) validate payload
+    # 2) resolve batch_id by token + org_id, check status not expired/deleted
+    # 3) fetch ready files in this batch => rows of {id, filename, retrieval_file_id}
+    # 4) get org vector_store_id (502 if missing)
+    # 5) Build Assistants v2: create thread with user message (question) and ATTACHMENTS (the batch file_ids).
+    #    Attachment format for threads.create messages:
+    #       {"role":"user","content":[{"type":"input_text","text":question}],
+    #        "attachments":[{"file_id": rid, "tools":[{"type":"file_search"}]} for rid in retrieval_ids]}
+    # 6) Create a run with model=<OPENAI_MODEL or gpt-4.1-mini>, tools=[{"type":"file_search"}],
+    #    tool_resources={"file_search":{"vector_store_ids":[vs_id]}}
+    # 7) Poll runs until status == "completed" or "failed"/"expired"/"cancelled" (timeout ~60s)
+    # 8) On completed: list messages (limit ~10), find latest assistant message; extract answer text
+    #    - Try message.content[*].text.value
+    # 9) Extract citations by walking annotations in message.content[*].text.annotations[*].file_id
+    #    Map OpenAI file_ids -> DB file rows from step (3)
+    # 10) Insert into offer_qa_logs (question, short summary (<=240 chars), sources JSON, org_id, batch_id, asked_by_user_id)
+    # 11) Return JSON with {answer, sources, log_id, batch_token, usage? (optional)}
+
     try:
-        org_id = int(payload.get("org_id", 0))
+        org_id = int(payload.get("org_id") or 0)
         batch_token = (payload.get("batch_token") or "").strip()
-        asked_by_user_id = int(payload.get("asked_by_user_id", 0))
+        asked_by_user_id = int(payload.get("asked_by_user_id") or 0)
         question = (payload.get("question") or "").strip()
 
         if not org_id or not batch_token or not asked_by_user_id or not question:
-            raise HTTPException(status_code=400, detail="org_id, batch_token, asked_by_user_id and question are required")
+            raise HTTPException(status_code=400, detail="Missing required fields: org_id, batch_token, asked_by_user_id, question")
 
-        if not OPENAI_API_KEY:
-            raise HTTPException(status_code=500, detail="Missing OPENAI_API_KEY")
+        # resolve batch
+        batch = resolve_batch_by_token(org_id, batch_token)
+        if not batch:
+            raise HTTPException(status_code=404, detail="Batch not found for org")
+        if batch["status"] in ("expired", "deleted"):
+            raise HTTPException(status_code=410, detail=f"Batch status={batch['status']}")
 
-        # Resolve batch
-        batch = resolve_batch(org_id, batch_token)
         batch_id = batch["id"]
 
-        # Get vector store ID
+        # ready files
+        files = get_batch_retrieval_files(batch_id)
+        print(f"[qa] batch_id={batch_id} ready_files={len(files)}")
+        if not files:
+            raise HTTPException(status_code=400, detail="No ready files (retrieval_file_id) found for this batch")
+
+        retrieval_ids = [f["retrieval_file_id"] for f in files if f.get("retrieval_file_id")]
+        sample_ids = retrieval_ids[:3]
+        print(f"[qa] org={org_id} batch_id={batch_id} files={len(retrieval_ids)}")
+        print(f"[qa] sample file_ids={sample_ids}")
+
+        # vector store
         vs_id = get_org_vector_store_id(org_id)
         if not vs_id:
             raise HTTPException(status_code=502, detail="No vector store configured for org")
 
-        # Get files scoped to this batch
-        files = get_batch_retrieval_files(batch_id)
-        if not files:
-            print(f"[qa] no ready files for batch_id={batch_id}, token={batch_token}")
-            raise HTTPException(status_code=400, detail="No ready files (retrieval_file_id) found for this batch")
-
-        # Basic envelope log
         openai_model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
-        retrieval_ids = [f["retrieval_file_id"] for f in files]
-        print(f"[qa] org={org_id} batch_id={batch_id} files={len(files)} model={openai_model} vs={vs_id}")
-        
-        # Build attachments from batch's retrieval_file_ids
-        attachments = [{"file_id": rid, "tools": [{"type": "file_search"}]} for rid in retrieval_ids]
-        print(f"[qa] attachments prepared: {len(attachments)}")
-        print(f"[qa] building responses.create with {len(retrieval_ids)} file_ids; sample={retrieval_ids[:3]}")
+        client = OpenAI()
 
-        # Build the Responses API call (file_search tool, restricted to this batch's files)
-        # NOTE: responses.create + attachments is sufficient to scope search; vs_id not required here.
-        resp = client.responses.create(
-            model=openai_model,
-            input=question,
-            tools=[{"type": "file_search"}],
-            attachments=attachments,
+        # ---- Assistants v2: threads + runs ----
+        # create thread with user message and attached batch files
+        attachments = [{"file_id": rid, "tools": [{"type": "file_search"}]} for rid in retrieval_ids]
+        thread = client.beta.threads.create(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": question},
+                    ],
+                    "attachments": attachments,
+                }
+            ],
             metadata={
                 "org_id": str(org_id),
                 "batch_token": batch_token
-            },
+            }
         )
 
-        # Robustly extract answer text and citations from the Responses API result
-        answer_text = None
-        try:
-            answer_text = getattr(resp, "output_text", None)
-            if not answer_text:
-                # Fallback: traverse top-level messages if available
-                msg = (getattr(resp, "output", None) or
-                       getattr(resp, "message", None) or
-                       None)
-                # If SDK shape differs, fall back to stringifying
-                answer_text = str(resp) if not answer_text else answer_text
-        except Exception as e:
-            print("[qa] answer extraction error:", repr(e))
-            answer_text = str(resp)
+        # create run with file_search, targeting the vector store id
+        run = client.beta.threads.runs.create(
+            thread_id=thread.id,
+            model=openai_model,
+            tools=[{"type": "file_search"}],
+            tool_resources={
+                "file_search": {
+                    "vector_store_ids": [vs_id]
+                }
+            }
+        )
+
+        # poll until complete (timeout ~60s)
+        started = time.time()
+        while True:
+            run = client.beta.threads.runs.retrieve(thread_id=thread.id, run_id=run.id)
+            if run.status in ("completed", "failed", "cancelled", "expired"):
+                break
+            if time.time() - started > 60:
+                raise HTTPException(status_code=504, detail="Run timeout")
+            time.sleep(0.8)
+
+        if run.status != "completed":
+            raise HTTPException(status_code=500, detail=f"Run failed with status={run.status}")
+
+        # fetch messages and find the newest assistant answer
+        msgs = client.beta.threads.messages.list(thread_id=thread.id, order="desc", limit=10)
+        answer_text = ""
+        primary_msg = None
+        for m in msgs.data:
+            if m.role == "assistant":
+                primary_msg = m
+                # Extract text: m.content is a list of blocks (text, citations, etc.)
+                for blk in m.content:
+                    if getattr(blk, "type", None) == "output_text" or getattr(blk, "type", None) == "text":
+                        # SDK types may differ; try both .text.value and .text for safety
+                        txt = ""
+                        try:
+                            txt = getattr(blk, "text", None)
+                            if hasattr(txt, "value"):
+                                txt = txt.value
+                            elif isinstance(txt, dict) and "value" in txt:
+                                txt = txt["value"]
+                        except Exception:
+                            txt = None
+                        if isinstance(txt, str) and txt.strip():
+                            answer_text = txt.strip()
+                            break
+                if answer_text:
+                    break
 
         if not answer_text:
             answer_text = "(no answer text returned)"
 
-        # Source extraction (best-effort)
-        sources = []
-        # Try to read any citations/cited_file_ids if available in resp
-        cited = set()
-        try:
-            # Many SDKs expose tool outputs or annotations. Best-effort scan:
-            # Convert to dict and look for "file_ids" arrays
-            import json
-            resp_dict = json.loads(resp.model_dump_json()) if hasattr(resp, "model_dump_json") else json.loads(str(resp))
-            def walk(obj):
-                if isinstance(obj, dict):
-                    for k,v in obj.items():
-                        if k in ("file_ids", "cited_file_ids") and isinstance(v, list):
-                            for fid in v:
-                                if isinstance(fid, str):
-                                    cited.add(fid)
-                        # Also look for annotation objects and citations blocks
-                        elif k in ("annotation", "annotations", "citations") and isinstance(v, (dict, list)):
-                            if isinstance(v, dict) and "file_id" in v:
-                                if isinstance(v["file_id"], str):
-                                    cited.add(v["file_id"])
-                            elif isinstance(v, list):
-                                for item in v:
-                                    if isinstance(item, dict) and "file_id" in item:
-                                        if isinstance(item["file_id"], str):
-                                            cited.add(item["file_id"])
-                        walk(v)
-                elif isinstance(obj, list):
-                    for it in obj:
-                        walk(it)
-            walk(resp_dict)
-        except Exception as e:
-            print("[qa] citation parse warning:", repr(e))
+        # citations: walk annotations on text blocks to collect file_ids
+        cited_file_ids = set()
+        if primary_msg and hasattr(primary_msg, "content"):
+            for blk in primary_msg.content:
+                # in many SDKs blk.type == "text" and blk.text.annotations exists
+                try:
+                    t = getattr(blk, "text", None)
+                    annotations = []
+                    if hasattr(t, "annotations"):
+                        annotations = t.annotations or []
+                    elif isinstance(t, dict) and "annotations" in t:
+                        annotations = t["annotations"] or []
+                    for ann in annotations:
+                        # try common fields
+                        fid = getattr(ann, "file_id", None) or (ann.get("file_id") if isinstance(ann, dict) else None)
+                        if fid:
+                            cited_file_ids.add(fid)
+                except Exception:
+                    pass
 
-        # Build file map
-        by_retrieval = {f["retrieval_file_id"]: f for f in files}
-        if cited:
-            for rid in cited:
-                if rid in by_retrieval:
-                    f = by_retrieval[rid]
+        # map citations to DB rows; fallback = first 5 searched files
+        id_map = {f["retrieval_file_id"]: f for f in files}
+        sources = []
+        for fid in cited_file_ids:
+            row = id_map.get(fid)
+            if row:
+                sources.append({
+                    "file_id": row["id"],
+                    "retrieval_file_id": fid,
+                    "filename": row["filename"],
+                    "score": None
+                })
+        if not sources:
+            for rid in retrieval_ids[:5]:
+                row = id_map.get(rid)
+                if row:
                     sources.append({
-                        "file_id": f["id"],
+                        "file_id": row["id"],
                         "retrieval_file_id": rid,
-                        "filename": f["filename"],
+                        "filename": row["filename"],
+                        "score": None
                     })
 
-        # As fallback, if no citations came back, include the searched files (capped)
-        if not sources:
-            for f in files[:5]:
-                sources.append({
-                    "file_id": f["id"],
-                    "retrieval_file_id": f["retrieval_file_id"],
-                    "filename": f["filename"],
-                })
-
-        # Usage parsing (defensive)
+        # usage (best-effort; Assistants v2 usage may be None in some SDKs)
         usage = {}
         try:
-            # Some SDKs expose usage as resp.usage or under meta
-            u = getattr(resp, "usage", None)
-            if u and isinstance(u, dict):
-                usage = {"input_tokens": u.get("input_tokens"), "output_tokens": u.get("output_tokens")}
+            if getattr(run, "usage", None):
+                usage = {
+                    "input_tokens": getattr(run.usage, "input_tokens", None),
+                    "output_tokens": getattr(run.usage, "output_tokens", None),
+                    "total_tokens": getattr(run.usage, "total_tokens", None),
+                }
+        except Exception:
+            usage = {}
+
+        # insert into offer_qa_logs
+        answer_summary = (answer_text or "")[:240]
+        log_id = None
+        try:
+            conn = get_db_connection()
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO public.offer_qa_logs
+                          (batch_id, org_id, asked_by_user_id, question, answer_summary, sources)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        RETURNING id
+                        """,
+                        (batch_id, org_id, asked_by_user_id, question, answer_summary, json.dumps(sources))
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        log_id = row[0]
         except Exception as e:
-            print("[qa] usage parse warning:", repr(e))
+            print("[/api/qa/ask] failed to log QA:", repr(e))
+            traceback.print_exc()
 
-        # Insert into public.offer_qa_logs AFTER we have a non-empty answer_text
-        summary = answer_text[:240].strip()  # first 240 chars
-        log_id = insert_qa_log(batch_id, org_id, asked_by_user_id, question, summary, sources)
-
-        print(f"[qa] OK org={org_id} batch_id={batch_id} attachments={len(attachments)} answer_len={len(answer_text)} sources={len(sources)}")
+        print(f"[qa] OK org={org_id} batch_id={batch_id} attachments={len(retrieval_ids)} answer_len={len(answer_text)} sources={len(sources)}")
 
         return JSONResponse({
             "answer": answer_text,
@@ -251,4 +308,4 @@ def ask(
     except Exception as e:
         print("[/api/qa/ask] fatal error:", repr(e))
         traceback.print_exc()
-        return JSONResponse(status_code=500, content={"detail": "QA internal error"})
+        raise HTTPException(status_code=500, detail="Q&A failed")
