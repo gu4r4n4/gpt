@@ -43,10 +43,11 @@ router = APIRouter(prefix="/api/offers", tags=["offers"])
 
 def validate_environment():
     """Validate required environment variables."""
-    if not DATABASE_URL:
-        raise HTTPException(status_code=500, detail="DATABASE_URL not configured")
-    if not OPENAI_API_KEY:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY not configured")
+    missing = []
+    if not os.getenv("DATABASE_URL"): missing.append("DATABASE_URL")
+    if not os.getenv("OPENAI_API_KEY"): missing.append("OPENAI_API_KEY")
+    if missing:
+        raise HTTPException(status_code=500, detail=f"Missing environment: {', '.join(missing)}")
 
 
 def safe_filename(filename: str) -> str:
@@ -297,7 +298,15 @@ async def upload_offer_file(
     vector_store_id = get_org_vector_store(org_id)
     
     # Save to storage
-    storage_path = save_to_storage(content, org_id, file.filename)
+    try:
+        storage_path = save_to_storage(content, org_id, file.filename)
+    except Exception as e:
+        print("[save_to_storage] error:", repr(e))
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Storage error: {str(e)}. If S3_BUCKET is set, ensure AWS credentials & region are configured, or unset S3_BUCKET to use local /tmp."
+        )
     
     # Insert into database
     with get_db_connection() as conn:
