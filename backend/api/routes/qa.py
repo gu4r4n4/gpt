@@ -1,14 +1,10 @@
-import os
-import json
-import traceback
-import time
-from typing import List, Dict, Any, Optional
-
-import psycopg2
-from fastapi import APIRouter, HTTPException, Body
+import os, json, time, traceback
+from typing import Any, Dict, List, Optional
+from fastapi import APIRouter, HTTPException, Body, Query
 from fastapi.responses import JSONResponse
-from openai import OpenAI
 from pydantic import BaseModel, Field
+import psycopg2
+from openai import OpenAI
 
 router = APIRouter(prefix="/api/qa", tags=["qa"])
 
@@ -35,6 +31,7 @@ class AskResponse(BaseModel):
     log_id: Optional[int] = Field(None, example=42)
     batch_token: str = Field(..., example="bt_manual_test_001")
     usage: Optional[Dict[str, Any]] = Field(None, example={"input_tokens": 150, "output_tokens": 75})
+    debug: Optional[Dict[str, Any]] = None
 
 def get_db_connection():
     if not DATABASE_URL:
@@ -93,10 +90,30 @@ def get_org_vector_store_id(org_id: int) -> str:
         row = cur.fetchone()
     return row[0] if row and row[0] else None
 
+def _insert_qa_log(conn, batch_id, org_id, user_id, question, answer_summary, sources_json):
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO public.offer_qa_logs (batch_id, org_id, asked_by_user_id, question, answer_summary, sources)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING id
+            """, (
+                batch_id, org_id, user_id, question,
+                (answer_summary or "")[:240],
+                json.dumps(sources_json or [])
+            ))
+            row = cur.fetchone()
+            conn.commit()
+            return row[0] if row else None
+    except Exception as e:
+        print("[qa] failed to insert qa log:", repr(e))
+        traceback.print_exc()
+        return None
+
 
 
 @router.post("/ask", response_model=AskResponse, tags=["qa"], summary="Ask a question scoped to a batch")
-def ask(payload: AskRequest = Body(...)):
+def ask(payload: AskRequest = Body(...), debug: int = Query(0)):
     """
     Input:
     {
@@ -106,24 +123,6 @@ def ask(payload: AskRequest = Body(...)):
       "question": "What's the annual premium and deductible?"
     }
     """
-
-    # 1) validate payload
-    # 2) resolve batch_id by token + org_id, check status not expired/deleted
-    # 3) fetch ready files in this batch => rows of {id, filename, retrieval_file_id}
-    # 4) get org vector_store_id (502 if missing)
-    # 5) Build Assistants v2: create thread with user message (question) and ATTACHMENTS (the batch file_ids).
-    #    Attachment format for threads.create messages:
-    #       {"role":"user","content":[{"type":"input_text","text":question}],
-    #        "attachments":[{"file_id": rid, "tools":[{"type":"file_search"}]} for rid in retrieval_ids]}
-    # 6) Create a run with model=<OPENAI_MODEL or gpt-4.1-mini>, tools=[{"type":"file_search"}],
-    #    tool_resources={"file_search":{"vector_store_ids":[vs_id]}}
-    # 7) Poll runs until status == "completed" or "failed"/"expired"/"cancelled" (timeout ~60s)
-    # 8) On completed: list messages (limit ~10), find latest assistant message; extract answer text
-    #    - Try message.content[*].text.value
-    # 9) Extract citations by walking annotations in message.content[*].text.annotations[*].file_id
-    #    Map OpenAI file_ids -> DB file rows from step (3)
-    # 10) Insert into offer_qa_logs (question, short summary (<=240 chars), sources JSON, org_id, batch_id, asked_by_user_id)
-    # 11) Return JSON with {answer, sources, log_id, batch_token, usage? (optional)}
 
     try:
         org_id = payload.org_id
@@ -165,95 +164,89 @@ def ask(payload: AskRequest = Body(...)):
         # ---- Assistants v2: threads + runs ----
         # create thread with user message and attached batch files
         attachments = [{"file_id": rid, "tools": [{"type": "file_search"}]} for rid in retrieval_ids]
+        print(f"[qa] attachments prepared: {len(attachments)}")
+
+        # 1) Create thread with user message
         thread = client.beta.threads.create(
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": question},
-                    ],
-                    "attachments": attachments,
-                }
-            ],
-            metadata={
-                "org_id": str(org_id),
-                "batch_token": batch_token
-            }
+            messages=[{
+                "role": "user",
+                "content": question,   # <-- plain string, NOT {"type":"input_text"}
+                "attachments": attachments
+            }]
         )
 
-        # create run with file_search, targeting the vector store id
+        # 2) Create run (NO tool_resources); file_search tool is fine here
         run = client.beta.threads.runs.create(
             thread_id=thread.id,
             model=openai_model,
             tools=[{"type": "file_search"}],
-            tool_resources={
-                "file_search": {
-                    "vector_store_ids": [vs_id]
-                }
-            }
         )
 
-        # poll until complete (timeout ~60s)
-        started = time.time()
+        # POLLING: make the polling block show the real failure details and time out with 504
+        start = time.time()
         while True:
             run = client.beta.threads.runs.retrieve(thread_id=thread.id, run_id=run.id)
             if run.status in ("completed", "failed", "cancelled", "expired"):
                 break
-            if time.time() - started > 60:
-                raise HTTPException(status_code=504, detail="Run timeout")
+            if time.time() - start > 60:
+                raise HTTPException(status_code=504, detail="Q&A timed out after 60s")
             time.sleep(0.8)
 
         if run.status != "completed":
-            raise HTTPException(status_code=500, detail=f"Run failed with status={run.status}")
+            # Try to surface model/tooling errors
+            last_error = getattr(run, "last_error", None)
+            msg = f"Run status={run.status}"
+            if last_error:
+                msg += f"; code={getattr(last_error, 'code', None)} message={getattr(last_error, 'message', None)}"
+            print("[/api/qa/ask] run failed:", msg)
+            # Still log the question with error summary
+            conn = get_db_connection()
+            _log_id = _insert_qa_log(conn, batch_id, org_id, asked_by_user_id, question, f"(run failed) {msg}", None)
+            raise HTTPException(status_code=500, detail=msg)
 
-        # fetch messages and find the newest assistant answer
+        # MESSAGE EXTRACTION: fetch assistant messages and extract answer text defensively
         msgs = client.beta.threads.messages.list(thread_id=thread.id, order="desc", limit=10)
         answer_text = ""
-        primary_msg = None
         for m in msgs.data:
             if m.role == "assistant":
-                primary_msg = m
-                # Extract text: m.content is a list of blocks (text, citations, etc.)
-                for blk in m.content:
-                    if getattr(blk, "type", None) == "output_text" or getattr(blk, "type", None) == "text":
-                        # SDK types may differ; try both .text.value and .text for safety
-                        txt = ""
-                        try:
-                            txt = getattr(blk, "text", None)
-                            if hasattr(txt, "value"):
-                                txt = txt.value
-                            elif isinstance(txt, dict) and "value" in txt:
-                                txt = txt["value"]
-                        except Exception:
-                            txt = None
-                        if isinstance(txt, str) and txt.strip():
-                            answer_text = txt.strip()
-                            break
-                if answer_text:
-                    break
-
+                # New SDK returns content as list of blocks; find a text block
+                try:
+                    parts = getattr(m, "content", []) or []
+                    for p in parts:
+                        if isinstance(p, dict):
+                            if p.get("type") == "output_text" and "text" in p:
+                                answer_text = p["text"]
+                                break
+                            if p.get("type") == "text" and "text" in p:
+                                answer_text = p["text"]
+                                break
+                        else:
+                            # Some SDK versions may return objects; fallback
+                            t = getattr(p, "text", None)
+                            if t:
+                                answer_text = t
+                                break
+                    if answer_text:
+                        break
+                except Exception:
+                    traceback.print_exc()
         if not answer_text:
             answer_text = "(no answer text returned)"
 
-        # citations: walk annotations on text blocks to collect file_ids
+        # CITATIONS: walk messages to collect `file_id`s from annotations/citations if present
         cited_file_ids = set()
-        if primary_msg and hasattr(primary_msg, "content"):
-            for blk in primary_msg.content:
-                # in many SDKs blk.type == "text" and blk.text.annotations exists
-                try:
-                    t = getattr(blk, "text", None)
-                    annotations = []
-                    if hasattr(t, "annotations"):
-                        annotations = t.annotations or []
-                    elif isinstance(t, dict) and "annotations" in t:
-                        annotations = t["annotations"] or []
-                    for ann in annotations:
-                        # try common fields
-                        fid = getattr(ann, "file_id", None) or (ann.get("file_id") if isinstance(ann, dict) else None)
-                        if fid:
-                            cited_file_ids.add(fid)
-                except Exception:
-                    pass
+        try:
+            for m in msgs.data:
+                if m.role == "assistant":
+                    parts = getattr(m, "content", []) or []
+                    for p in parts:
+                        if isinstance(p, dict) and p.get("type") == "text":
+                            annotations = p.get("text", {}).get("annotations", [])
+                            for ann in annotations:
+                                if isinstance(ann, dict) and "file_id" in ann:
+                                    cited_file_ids.add(ann["file_id"])
+        except Exception:
+            pass
 
         # map citations to DB rows; fallback = first 5 searched files
         id_map = {f["retrieval_file_id"]: f for f in files}
@@ -278,8 +271,8 @@ def ask(payload: AskRequest = Body(...)):
                         "score": None
                     })
 
-        # usage (best-effort; Assistants v2 usage may be None in some SDKs)
-        usage = {}
+        # USAGE: If usage is not available from run, set usage = None (don't crash)
+        usage = None
         try:
             if getattr(run, "usage", None):
                 usage = {
@@ -288,39 +281,30 @@ def ask(payload: AskRequest = Body(...)):
                     "total_tokens": getattr(run.usage, "total_tokens", None),
                 }
         except Exception:
-            usage = {}
+            usage = None
 
-        # insert into offer_qa_logs
-        answer_summary = (answer_text or "")[:240]
-        log_id = None
-        try:
-            conn = get_db_connection()
-            with conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        INSERT INTO public.offer_qa_logs
-                          (batch_id, org_id, asked_by_user_id, question, answer_summary, sources)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                        RETURNING id
-                        """,
-                        (batch_id, org_id, asked_by_user_id, question, answer_summary, json.dumps(sources))
-                    )
-                    row = cur.fetchone()
-                    if row:
-                        log_id = row[0]
-        except Exception as e:
-            print("[/api/qa/ask] failed to log QA:", repr(e))
-            traceback.print_exc()
+        # ALWAYS LOG to `public.offer_qa_logs` even on success
+        conn = get_db_connection()
+        log_id = _insert_qa_log(conn, batch_id, org_id, asked_by_user_id, question, answer_text, sources)
+
+        # RETURN: build AskResponse. If debug=1, include thread/run ids and first message id
+        debug_payload = None
+        if debug:
+            debug_payload = {
+                "thread_id": thread.id,
+                "run_id": run.id,
+                "run_status": run.status
+            }
 
         print(f"[qa] OK org={org_id} batch_id={batch_id} attachments={len(retrieval_ids)} answer_len={len(answer_text)} sources={len(sources)}")
 
         return AskResponse(
             answer=answer_text,
-            sources=sources,        # list of dicts is fine; Pydantic will coerce
+            sources=sources,
             log_id=log_id,
             batch_token=batch_token,
-            usage=usage or None
+            usage=usage,
+            debug=debug_payload
         )
 
     except HTTPException:
