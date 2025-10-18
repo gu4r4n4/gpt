@@ -352,20 +352,52 @@ async def upload_offer_file(
                 vector_store_id = row[0]
 
             if not existing_retrieval_id:
-                # Read file bytes from storage_path and upload to OpenAI
-                storage_path = existing["storage_path"]
+                # Prefer disk read; if missing, self-heal from in-memory 'content'
+                storage_path = existing.get("storage_path")
+                fbytes = None
+
                 try:
-                    with open(storage_path, "rb") as fh:
-                        fbytes = fh.read()
+                    if storage_path:
+                        with open(storage_path, "rb") as fh:
+                            fbytes = fh.read()
+                except FileNotFoundError:
+                    print(f"[duplicate reattach] storage file missing at {storage_path}; will self-heal")
                 except Exception as e:
-                    print("[duplicate reattach] failed to read storage file:", storage_path, repr(e))
+                    print("[duplicate reattach] error reading storage file:", storage_path, repr(e))
                     traceback.print_exc()
-                    raise HTTPException(status_code=500, detail=f"Failed to read stored file for duplicate attach: {str(e)}")
+
+                # If we couldn't read from disk, fall back to the just-uploaded in-memory bytes
+                if not fbytes:
+                    try:
+                        # Ensure we have bytes from the current request
+                        # 'content' was already read to compute sha256; use it here
+                        if not content:
+                            # Extremely unlikely, but be defensive
+                            content = await file.read()
+                        # Re-save to current storage root and update DB path
+                        healed_storage_path = save_to_storage(content, org_id, existing["filename"])
+                        with get_db_connection() as conn, conn.cursor() as cur:
+                            cur.execute(
+                                "UPDATE public.offer_files SET storage_path = %s WHERE id = %s",
+                                (healed_storage_path, existing_id),
+                            )
+                            conn.commit()
+                        storage_path = healed_storage_path
+                        fbytes = content
+                        print(f"[duplicate reattach] self-healed storage_path -> {healed_storage_path}")
+                    except Exception as e:
+                        print("[duplicate reattach] self-heal failed:", repr(e))
+                        traceback.print_exc()
+                        raise HTTPException(
+                            status_code=500,
+                            detail=f"Failed to recover missing storage file for duplicate attach: {str(e)}"
+                        )
 
                 try:
                     # Create file in OpenAI
+                    mime = existing.get("mime_type") or (file.content_type if 'file' in locals() else "application/octet-stream")
                     created_file = openai_client.files.create(
-                        file=(existing["filename"], fbytes, existing["mime_type"]),
+                        file=(existing["filename"], fbytes, mime),
                         purpose="assistants",
                     )
                     retrieval_file_id = created_file.id if hasattr(created_file, "id") else created_file["id"]
@@ -434,8 +466,8 @@ async def upload_offer_file(
             if batch_token:
                 payload["batch_token"] = batch_token
 
-            print(f"[upload] duplicate hit -> id={existing_id}, batch_token={batch_token}, will_link_batch={bool(resolved_batch_id)}")
-            print(f"[upload] duplicate had retrieval? {bool(existing_retrieval_id)}; ensured vs_id={existing_vs_id}")
+            print(f"[upload] duplicate hit -> id={existing_id}, batch_token={batch_token}")
+            print(f"[upload] duplicate had retrieval? {bool(existing_retrieval_id)}; ensured vs={existing_vs_id}")
 
             return JSONResponse(status_code=200, content=payload)
 
