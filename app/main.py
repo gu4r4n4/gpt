@@ -28,6 +28,7 @@ from app.routes.offers_by_documents import router as offers_by_documents_router
 from app.routes.debug_db import router as debug_db_router
 from app.routes.ingest import router as ingest_router
 from backend.api.routes.offers_upload import router as offers_upload_router
+from backend.api.routes.batches import router as batches_router
 
 APP_NAME = "GPT Offer Extractor"
 APP_VERSION = "1.0.0"
@@ -44,6 +45,7 @@ app.include_router(offers_by_documents_router)  # SQLAlchemy router
 app.include_router(debug_db_router)
 app.include_router(ingest_router)
 app.include_router(offers_upload_router)  # File upload with vector store integration
+app.include_router(batches_router)  # Batch management endpoints
 
 # -------------------------------
 # CORS (adjust for production)
