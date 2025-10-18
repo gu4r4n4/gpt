@@ -3,6 +3,7 @@ File upload endpoint for offer documents with vector store integration.
 """
 import hashlib
 import os
+import traceback
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -217,12 +218,32 @@ def upload_to_openai(content: bytes, filename: str) -> str:
 
 
 def attach_to_vector_store(vector_store_id: str, file_id: str) -> None:
-    """Attach file to vector store (OpenAI SDK 2.2.0 syntax)."""
-    # NOTE: openai==2.2.0 -> use .vector_stores.* (no .beta)
-    openai_client.vector_stores.files.create(
-        vector_store_id=vector_store_id,
-        file_id=file_id,
-    )
+    """
+    Attach file to vector store.
+    Tries stable path first, then beta path for older/newer SDKs.
+    """
+    try:
+        # Try stable (no .beta)
+        if hasattr(openai_client, "vector_stores"):
+            openai_client.vector_stores.files.create(
+                vector_store_id=vector_store_id,
+                file_id=file_id,
+            )
+            return
+        # Fallback: beta namespace
+        if hasattr(openai_client, "beta") and hasattr(openai_client.beta, "vector_stores"):
+            openai_client.beta.vector_stores.files.create(
+                vector_store_id=vector_store_id,
+                file_id=file_id,
+            )
+            return
+        raise RuntimeError("OpenAI client has no vector_stores API (stable or beta)")
+    except Exception as e:
+        # Log full traceback for diagnostics
+        print("[attach_to_vector_store] error:", repr(e))
+        traceback.print_exc()
+        # Re-raise to caller; caller will convert to HTTP 502
+        raise
 
 
 @router.post("/upload")
@@ -323,15 +344,17 @@ async def upload_offer_file(
         print(f"Updated database with OpenAI IDs for record: {file_record_id}")
         
     except Exception as e:
-        print(f"OpenAI upload failed: {e}")
-        # Still return success but mark as not ready
         with get_db_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE public.offer_files SET embeddings_ready = false WHERE id = %s",
-                    (file_record_id,)
-                )
+                cur.execute("UPDATE public.offer_files SET embeddings_ready = false WHERE id = %s", (file_record_id,))
                 conn.commit()
+        print("[upload_offer_file] OpenAI error:", repr(e))
+        traceback.print_exc()
+        # Surface a concise reason; common cases: invalid OPENAI_API_KEY, bad vector_store_id
+        raise HTTPException(
+            status_code=502,
+            detail=f"OpenAI error during upload/attach: {str(e)}"
+        )
     
     return {
         "id": file_record_id,
