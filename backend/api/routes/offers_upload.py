@@ -31,7 +31,7 @@ ALLOWED_MIME_TYPES = {
 # Environment variables
 DATABASE_URL = os.getenv("DATABASE_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-STORAGE_ROOT = os.getenv("STORAGE_ROOT", "/var/app/uploads")
+STORAGE_ROOT = os.getenv("STORAGE_ROOT", "/tmp")
 S3_BUCKET = os.getenv("S3_BUCKET")
 
 # Initialize OpenAI client
@@ -217,10 +217,11 @@ def upload_to_openai(content: bytes, filename: str) -> str:
 
 
 def attach_to_vector_store(vector_store_id: str, file_id: str) -> None:
-    """Attach file to vector store."""
-    openai_client.beta.vector_stores.files.create(
+    """Attach file to vector store (OpenAI SDK 2.2.0 syntax)."""
+    # NOTE: openai==2.2.0 -> use .vector_stores.* (no .beta)
+    openai_client.vector_stores.files.create(
         vector_store_id=vector_store_id,
-        file_id=file_id
+        file_id=file_id,
     )
 
 
@@ -303,6 +304,7 @@ async def upload_offer_file(
         
         # Attach to vector store
         attach_to_vector_store(vector_store_id, retrieval_file_id)
+        print(f"[upload] attached file {retrieval_file_id} to vector store {vector_store_id}")
         print(f"Attached to vector store: {vector_store_id}")
         
         # Update database with OpenAI IDs
