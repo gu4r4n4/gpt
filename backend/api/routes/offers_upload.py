@@ -12,7 +12,8 @@ from urllib.parse import quote
 
 import psycopg2
 import psycopg2.extras
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, Request, JSONResponse
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, Request
+from fastapi.responses import JSONResponse
 from openai import OpenAI
 
 # ---- BATCH SUPPORT (add near other imports/constants) ----
