@@ -12,12 +12,47 @@ from urllib.parse import quote
 
 import psycopg2
 import psycopg2.extras
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, Request, JSONResponse
 from openai import OpenAI
+
+# ---- BATCH SUPPORT (add near other imports/constants) ----
+DATABASE_URL = os.getenv("DATABASE_URL")
+BATCH_TTL_DAYS = int(os.getenv("BATCH_TTL_DAYS", "30"))
+
+def get_db_connection():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL not set")
+    return psycopg2.connect(DATABASE_URL)
+
+def resolve_batch_id_by_token(token: str, org_id: int | None) -> int | None:
+    """Return offer_batches.id for token+org, or None if missing."""
+    if not token:
+        return None
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                if org_id:
+                    cur.execute("""
+                        SELECT id FROM public.offer_batches
+                        WHERE token = %s AND org_id = %s AND status = 'active'
+                        LIMIT 1
+                    """, (token, org_id))
+                else:
+                    # fallback: no org in header/form – resolve by token only
+                    cur.execute("""
+                        SELECT id FROM public.offer_batches
+                        WHERE token = %s AND status = 'active'
+                        LIMIT 1
+                    """, (token,))
+                row = cur.fetchone()
+                return int(row[0]) if row else None
+    except Exception as e:
+        print("[resolve_batch_id_by_token] error:", repr(e))
+        traceback.print_exc()
+        return None
 
 # Configuration
 MAX_FILE_SIZE = 25 * 1024 * 1024  # 25MB
-BATCH_TTL_DAYS = int(os.getenv("BATCH_TTL_DAYS", "30"))
 ALLOWED_MIME_TYPES = {
     "application/pdf",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -125,55 +160,8 @@ def scrub_pii(content: bytes) -> bytes:
     return content
 
 
-def get_db_connection():
-    """Get database connection."""
-    return psycopg2.connect(DATABASE_URL)
 
 
-def generate_batch_token() -> str:
-    """Generate a secure random batch token."""
-    import secrets
-    return secrets.token_urlsafe(16)
-
-
-def resolve_batch_token(batch_token: str, org_id: int) -> Optional[int]:
-    """Resolve batch token to batch_id, validating org_id."""
-    if not batch_token:
-        return None
-    
-    with get_db_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT id FROM public.offer_batches
-                WHERE batch_token = %s AND org_id = %s AND status = 'active'
-                """,
-                (batch_token, org_id)
-            )
-            result = cur.fetchone()
-            return result[0] if result else None
-
-
-def create_batch_for_org(org_id: int) -> tuple[str, int]:
-    """Create a new batch for the organization."""
-    batch_token = generate_batch_token()
-    title = f"Offer batch {datetime.now().strftime('%Y-%m-%d')}"
-    expires_at = datetime.utcnow() + timedelta(days=BATCH_TTL_DAYS)
-    
-    with get_db_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO public.offer_batches (batch_token, org_id, title, expires_at, status)
-                VALUES (%s, %s, %s, %s, 'active')
-                RETURNING id
-                """,
-                (batch_token, org_id, title, expires_at)
-            )
-            batch_id = cur.fetchone()[0]
-            conn.commit()
-    
-    return batch_token, batch_id
 
 
 def check_duplicate(org_id: int, sha256: str) -> Optional[Dict[str, Any]]:
@@ -296,11 +284,12 @@ def attach_to_vector_store(vector_store_id: str, file_id: str) -> None:
 
 @router.post("/upload")
 async def upload_offer_file(
+    request: Request,
     org_id: int = Form(...),
     created_by_user_id: int = Form(...),
+    file: UploadFile = File(...),
     offer_id: Optional[int] = Form(None),
     batch_token: Optional[str] = Form(None),
-    file: UploadFile = File(...)
 ):
     """Upload offer file and create vector store attachment."""
     validate_environment()
@@ -324,7 +313,7 @@ async def upload_offer_file(
     existing = check_duplicate(org_id, sha256)
     if existing:
         print(f"Duplicate file found: {existing['id']}")
-        return {
+        payload = {
             "id": existing["id"],
             "filename": existing["filename"],
             "retrieval_file_id": existing["retrieval_file_id"],
@@ -334,19 +323,20 @@ async def upload_offer_file(
             "size_bytes": file_size,
             "duplicate": True
         }
+        if batch_token:
+            payload["batch_token"] = batch_token
+        return JSONResponse(payload)
     
-    # Handle batch token
-    batch_id = None
-    returned_batch_token = None
-    
+    # ---- batch resolution (optional) ----
+    batch_id: Optional[int] = None
     if batch_token:
-        # Resolve existing batch
-        batch_id = resolve_batch_token(batch_token, org_id)
-        if not batch_id:
-            raise HTTPException(status_code=404, detail="Batch token not found or org mismatch")
-    else:
-        # Auto-create new batch
-        returned_batch_token, batch_id = create_batch_for_org(org_id)
+        batch_id = resolve_batch_id_by_token(batch_token, org_id)
+        if batch_id is None:
+            # Surface a clear error instead of generic 500s
+            raise HTTPException(
+                status_code=404,
+                detail=f"batch_token '{batch_token}' not found or not active for org_id={org_id}"
+            )
     
     # TODO: Antivirus scan
     if not scan_antivirus(file.filename):
@@ -370,23 +360,28 @@ async def upload_offer_file(
         )
     
     # Insert into database
-    with get_db_connection() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(
-                """
-                INSERT INTO public.offer_files
-                (filename, mime_type, size_bytes, sha256, storage_path, 
-                 org_id, created_by_user_id, offer_id, batch_id)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING id
-                """,
-                (file.filename, file.content_type, file_size, sha256, storage_path,
-                 org_id, created_by_user_id, offer_id, batch_id)
-            )
-            file_record_id = cur.fetchone()["id"]
-            conn.commit()
-    
-    print(f"Inserted offer_file record: {file_record_id}")
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    INSERT INTO public.offer_files
+                    (filename, mime_type, size_bytes, sha256, storage_path, 
+                     org_id, created_by_user_id, offer_id, batch_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (file.filename, file.content_type, file_size, sha256, storage_path,
+                     org_id, created_by_user_id, offer_id, batch_id)
+                )
+                file_record_id = cur.fetchone()["id"]
+                conn.commit()
+        
+        print(f"Inserted offer_file record: {file_record_id}")
+    except Exception as e:
+        print("[upload_offer_file] DB insert error:", repr(e))
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"DB insert failed: {e}")
     
     try:
         # Upload to OpenAI
@@ -426,7 +421,7 @@ async def upload_offer_file(
             detail=f"OpenAI error during upload/attach: {str(e)}"
         )
     
-    response = {
+    payload = {
         "id": file_record_id,
         "filename": file.filename,
         "retrieval_file_id": retrieval_file_id if 'retrieval_file_id' in locals() else None,
@@ -436,8 +431,7 @@ async def upload_offer_file(
         "size_bytes": file_size,
         "embeddings_ready": 'retrieval_file_id' in locals()
     }
-    
-    if returned_batch_token:
-        response["batch_token"] = returned_batch_token
-    
-    return response
+    if batch_token:
+        payload["batch_token"] = batch_token
+
+    return JSONResponse(payload)
