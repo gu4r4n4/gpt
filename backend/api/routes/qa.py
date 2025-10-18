@@ -45,7 +45,9 @@ def resolve_batch(org_id: int, batch_token: str) -> Dict[str, Any]:
     return b
 
 def get_batch_retrieval_files(batch_id: int) -> List[Dict[str, Any]]:
-    """Return files in the batch that have retrieval_file_id (ready for search)."""
+    """
+    Return files in the batch that have retrieval_file_id (ready for search).
+    """
     sql = """
         SELECT id, filename, retrieval_file_id
         FROM public.offer_files
@@ -54,8 +56,14 @@ def get_batch_retrieval_files(batch_id: int) -> List[Dict[str, Any]]:
     """
     with get_db_connection() as conn, conn.cursor() as cur:
         cur.execute(sql, (batch_id,))
-        rows = cur.fetchall()
-    return [{"id": r[0], "filename": r[1], "retrieval_file_id": r[2]}] if rows else []
+        rows = cur.fetchall() or []
+    files = [
+        {"id": row[0], "filename": row[1], "retrieval_file_id": row[2]}
+        for row in rows
+        if row and row[2]
+    ]
+    print(f"[qa] batch_id={batch_id} ready_files={len(files)}")
+    return files
 
 def get_org_vector_store_id(org_id: int) -> str:
     sql = "SELECT vector_store_id FROM public.org_vector_stores WHERE org_id = %s LIMIT 1"
@@ -183,6 +191,7 @@ def ask(
         # Get files scoped to this batch
         files = get_batch_retrieval_files(batch_id)
         if not files:
+            print(f"[qa] no ready files for batch_id={batch_id}, token={batch_token}")
             raise HTTPException(status_code=400, detail="No ready files (retrieval_file_id) found for this batch")
 
         retrieval_ids = [f["retrieval_file_id"] for f in files]
