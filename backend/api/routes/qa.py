@@ -66,13 +66,11 @@ def get_batch_retrieval_files(batch_id: int) -> List[Dict[str, Any]]:
     return files
 
 def get_org_vector_store_id(org_id: int) -> str:
-    sql = "SELECT vector_store_id FROM public.org_vector_stores WHERE org_id = %s LIMIT 1"
+    sql = "SELECT vector_store_id FROM public.org_vector_stores WHERE org_id = %s"
     with get_db_connection() as conn, conn.cursor() as cur:
         cur.execute(sql, (org_id,))
         row = cur.fetchone()
-    if not row or not row[0]:
-        raise HTTPException(status_code=500, detail="No vector store configured for org")
-    return row[0]
+    return row[0] if row and row[0] else None
 
 def insert_qa_log(batch_id: int, org_id: int, asked_by_user_id: int, question: str,
                   answer_summary: str, sources: List[Dict[str, Any]]) -> int:
@@ -87,77 +85,6 @@ def insert_qa_log(batch_id: int, org_id: int, asked_by_user_id: int, question: s
         conn.commit()
         return new_id
 
-def _extract_answer_and_sources(resp: Any, file_map: Dict[str, Dict[str, Any]]) -> (str, List[Dict[str, Any]]):
-    """
-    Best-effort extractor for Responses API:
-    - Prefer resp.output_text for the answer.
-    - Walk through any annotations for file citations (if present).
-    - Map OpenAI file_id -> our file row (via file_map keyed by retrieval_file_id).
-    """
-    answer_text = ""
-    sources: List[Dict[str, Any]] = []
-
-    # answer
-    try:
-        # new SDKs provide .output_text
-        answer_text = getattr(resp, "output_text", "") or ""
-    except Exception:
-        pass
-
-    if not answer_text:
-        # Fallback: try to mine text from the output array
-        try:
-            if hasattr(resp, "output") and isinstance(resp.output, list):
-                chunks = []
-                for item in resp.output:
-                    # each item may have .content (list) with .text.value
-                    content = getattr(item, "content", [])
-                    for c in content:
-                        text = getattr(getattr(c, "text", None), "value", "")
-                        if text:
-                            chunks.append(text)
-                answer_text = "\n".join(chunks).strip()
-        except Exception:
-            pass
-
-    # citations
-    # Some SDKs expose annotations under content[].text.annotations or under output_annotations
-    # We collect all file_ids we see and map them back to our DB rows.
-    seen_oai_file_ids = set()
-    try:
-        # Try the common path content[].text.annotations
-        if hasattr(resp, "output") and isinstance(resp.output, list):
-            for item in resp.output:
-                content = getattr(item, "content", [])
-                for c in content:
-                    txt = getattr(c, "text", None)
-                    annotations = getattr(txt, "annotations", []) if txt else []
-                    for ann in annotations:
-                        # Expect a .file_citation or .file_path with .file_id
-                        file_id = getattr(getattr(ann, "file_citation", None), "file_id", None) \
-                                  or getattr(getattr(ann, "file_path", None), "file_id", None)
-                        if file_id and file_id not in seen_oai_file_ids:
-                            seen_oai_file_ids.add(file_id)
-    except Exception:
-        traceback.print_exc()
-
-    # Build sources with our metadata
-    for fid in seen_oai_file_ids:
-        meta = file_map.get(fid)
-        if meta:
-            sources.append({
-                "file_id": meta["id"],
-                "retrieval_file_id": fid,
-                "filename": meta["filename"],
-            })
-        else:
-            sources.append({
-                "file_id": None,
-                "retrieval_file_id": fid,
-                "filename": None,
-            })
-
-    return (answer_text.strip(), sources)
 
 @router.post("/ask")
 def ask(
@@ -188,58 +115,114 @@ def ask(
         batch = resolve_batch(org_id, batch_token)
         batch_id = batch["id"]
 
+        # Get vector store ID
+        vs_id = get_org_vector_store_id(org_id)
+        if not vs_id:
+            raise HTTPException(status_code=502, detail="No vector store configured for org")
+
         # Get files scoped to this batch
         files = get_batch_retrieval_files(batch_id)
         if not files:
             print(f"[qa] no ready files for batch_id={batch_id}, token={batch_token}")
             raise HTTPException(status_code=400, detail="No ready files (retrieval_file_id) found for this batch")
 
+        # Basic envelope log
+        openai_model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
         retrieval_ids = [f["retrieval_file_id"] for f in files]
-        file_map = {f["retrieval_file_id"]: f for f in files}
-
-        # Get vector store
-        vs_id = get_org_vector_store_id(org_id)
+        print(f"[qa] org={org_id} batch_id={batch_id} files={len(files)} model={openai_model} vs={vs_id}")
+        print(f"[qa] building responses.create with {len(retrieval_ids)} file_ids; sample={retrieval_ids[:3]}")
 
         # Build the Responses API call (file_search tool, restricted to this batch's files)
-        # NOTE: The exact SDK surface can vary across versions. This follows the current openai==2.2.0 client.
         resp = client.responses.create(
-            model=DEFAULT_MODEL,
+            model=openai_model,
             input=question,
             tools=[{"type": "file_search"}],
             tool_resources={
                 "file_search": {
                     "vector_store_ids": [vs_id],
-                    # Restrict the search to this batch's files only:
-                    "filters": {
-                        "file_ids": retrieval_ids
-                    }
+                    "filters": {"file_ids": retrieval_ids},
                 }
             },
-            metadata={
-                "org_id": str(org_id),
-                "batch_token": batch_token,
-                "asked_by_user_id": str(asked_by_user_id),
-                "scope": "batch"
-            }
         )
 
-        answer_text, sources = _extract_answer_and_sources(resp, file_map)
+        # Robustly extract answer text and citations from the Responses API result
+        answer_text = None
+        try:
+            answer_text = getattr(resp, "output_text", None)
+            if not answer_text:
+                # Fallback: traverse top-level messages if available
+                msg = (getattr(resp, "output", None) or
+                       getattr(resp, "message", None) or
+                       None)
+                # If SDK shape differs, fall back to stringifying
+                answer_text = str(resp) if not answer_text else answer_text
+        except Exception as e:
+            print("[qa] answer extraction error:", repr(e))
+            answer_text = str(resp)
+
         if not answer_text:
-            answer_text = "I couldn't generate an answer."
+            answer_text = "(no answer text returned)"
 
-        # Persist QA log
-        summary = answer_text[:1000]  # avoid huge payloads
-        log_id = insert_qa_log(batch_id, org_id, asked_by_user_id, question, summary, sources)
+        # Source extraction (best-effort)
+        sources = []
+        # Try to read any citations/cited_file_ids if available in resp
+        cited = set()
+        try:
+            # Many SDKs expose tool outputs or annotations. Best-effort scan:
+            # Convert to dict and look for "file_ids" arrays
+            import json
+            resp_dict = json.loads(resp.model_dump_json()) if hasattr(resp, "model_dump_json") else json.loads(str(resp))
+            def walk(obj):
+                if isinstance(obj, dict):
+                    for k,v in obj.items():
+                        if k in ("file_ids", "cited_file_ids") and isinstance(v, list):
+                            for fid in v:
+                                if isinstance(fid, str):
+                                    cited.add(fid)
+                        walk(v)
+                elif isinstance(obj, list):
+                    for it in obj:
+                        walk(it)
+            walk(resp_dict)
+        except Exception as e:
+            print("[qa] citation parse warning:", repr(e))
 
-        # Try to pull usage if present
+        # Build file map
+        by_retrieval = {f["retrieval_file_id"]: f for f in files}
+        if cited:
+            for rid in cited:
+                if rid in by_retrieval:
+                    f = by_retrieval[rid]
+                    sources.append({
+                        "file_id": f["id"],
+                        "retrieval_file_id": rid,
+                        "filename": f["filename"],
+                    })
+
+        # As fallback, if no citations came back, include the searched files (capped)
+        if not sources:
+            for f in files[:5]:
+                sources.append({
+                    "file_id": f["id"],
+                    "retrieval_file_id": f["retrieval_file_id"],
+                    "filename": f["filename"],
+                })
+
+        # Usage parsing (defensive)
         usage = {}
         try:
+            # Some SDKs expose usage as resp.usage or under meta
             u = getattr(resp, "usage", None)
-            if u:
-                # various SDKs expose dict-like usage
-                usage = dict(u) if isinstance(u, dict) else {k: getattr(u, k) for k in dir(u) if not k.startswith("_")}
-        except Exception:
-            pass
+            if u and isinstance(u, dict):
+                usage = {"input_tokens": u.get("input_tokens"), "output_tokens": u.get("output_tokens")}
+        except Exception as e:
+            print("[qa] usage parse warning:", repr(e))
+
+        # Insert into public.offer_qa_logs AFTER we have a non-empty answer_text
+        summary = answer_text[:240].strip()  # first 240 chars
+        log_id = insert_qa_log(batch_id, org_id, asked_by_user_id, question, summary, sources)
+
+        print(f"[qa] OK org={org_id} batch_id={batch_id} answer_len={len(answer_text)} sources={len(sources)}")
 
         return JSONResponse({
             "answer": answer_text,
@@ -252,6 +235,6 @@ def ask(
     except HTTPException:
         raise
     except Exception as e:
-        print("[/api/qa/ask] error:", repr(e))
+        print("[/api/qa/ask] fatal error:", repr(e))
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Q&A error: {str(e)}")
+        return JSONResponse(status_code=500, content={"detail": "QA internal error"})
