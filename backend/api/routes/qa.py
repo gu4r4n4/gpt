@@ -130,18 +130,22 @@ def ask(
         openai_model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
         retrieval_ids = [f["retrieval_file_id"] for f in files]
         print(f"[qa] org={org_id} batch_id={batch_id} files={len(files)} model={openai_model} vs={vs_id}")
+        
+        # Build attachments from batch's retrieval_file_ids
+        attachments = [{"file_id": rid, "tools": [{"type": "file_search"}]} for rid in retrieval_ids]
+        print(f"[qa] attachments prepared: {len(attachments)}")
         print(f"[qa] building responses.create with {len(retrieval_ids)} file_ids; sample={retrieval_ids[:3]}")
 
         # Build the Responses API call (file_search tool, restricted to this batch's files)
+        # NOTE: responses.create + attachments is sufficient to scope search; vs_id not required here.
         resp = client.responses.create(
             model=openai_model,
             input=question,
             tools=[{"type": "file_search"}],
-            tool_resources={
-                "file_search": {
-                    "vector_store_ids": [vs_id],
-                    "filters": {"file_ids": retrieval_ids},
-                }
+            attachments=attachments,
+            metadata={
+                "org_id": str(org_id),
+                "batch_token": batch_token
             },
         )
 
@@ -179,6 +183,16 @@ def ask(
                             for fid in v:
                                 if isinstance(fid, str):
                                     cited.add(fid)
+                        # Also look for annotation objects and citations blocks
+                        elif k in ("annotation", "annotations", "citations") and isinstance(v, (dict, list)):
+                            if isinstance(v, dict) and "file_id" in v:
+                                if isinstance(v["file_id"], str):
+                                    cited.add(v["file_id"])
+                            elif isinstance(v, list):
+                                for item in v:
+                                    if isinstance(item, dict) and "file_id" in item:
+                                        if isinstance(item["file_id"], str):
+                                            cited.add(item["file_id"])
                         walk(v)
                 elif isinstance(obj, list):
                     for it in obj:
@@ -222,7 +236,7 @@ def ask(
         summary = answer_text[:240].strip()  # first 240 chars
         log_id = insert_qa_log(batch_id, org_id, asked_by_user_id, question, summary, sources)
 
-        print(f"[qa] OK org={org_id} batch_id={batch_id} answer_len={len(answer_text)} sources={len(sources)}")
+        print(f"[qa] OK org={org_id} batch_id={batch_id} attachments={len(attachments)} answer_len={len(answer_text)} sources={len(sources)}")
 
         return JSONResponse({
             "answer": answer_text,
