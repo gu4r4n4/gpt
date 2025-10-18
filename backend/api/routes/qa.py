@@ -8,6 +8,7 @@ import psycopg2
 from fastapi import APIRouter, HTTPException, Body
 from fastapi.responses import JSONResponse
 from openai import OpenAI
+from pydantic import BaseModel, Field
 
 router = APIRouter(prefix="/api/qa", tags=["qa"])
 
@@ -15,6 +16,25 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")  # keep aligned with healthz
 client = OpenAI(api_key=OPENAI_API_KEY)
+
+class QASource(BaseModel):
+    file_id: int
+    retrieval_file_id: str
+    filename: str
+    score: Optional[float] = None
+
+class AskRequest(BaseModel):
+    org_id: int = Field(..., example=1)
+    batch_token: str = Field(..., example="bt_manual_test_001")
+    asked_by_user_id: int = Field(..., example=1)
+    question: str = Field(..., example="What's the annual premium and deductible?")
+
+class AskResponse(BaseModel):
+    answer: str = Field(..., example="The annual premium is €1,200 and the deductible is €500.")
+    sources: List[QASource]
+    log_id: Optional[int] = Field(None, example=42)
+    batch_token: str = Field(..., example="bt_manual_test_001")
+    usage: Optional[Dict[str, Any]] = Field(None, example={"input_tokens": 150, "output_tokens": 75})
 
 def get_db_connection():
     if not DATABASE_URL:
@@ -75,8 +95,8 @@ def get_org_vector_store_id(org_id: int) -> str:
 
 
 
-@router.post("/ask")
-def ask(payload: Dict[str, Any] = Body(...)):
+@router.post("/ask", response_model=AskResponse, tags=["qa"], summary="Ask a question scoped to a batch")
+def ask(payload: AskRequest = Body(...)):
     """
     Input:
     {
@@ -106,10 +126,10 @@ def ask(payload: Dict[str, Any] = Body(...)):
     # 11) Return JSON with {answer, sources, log_id, batch_token, usage? (optional)}
 
     try:
-        org_id = int(payload.get("org_id") or 0)
-        batch_token = (payload.get("batch_token") or "").strip()
-        asked_by_user_id = int(payload.get("asked_by_user_id") or 0)
-        question = (payload.get("question") or "").strip()
+        org_id = payload.org_id
+        batch_token = payload.batch_token.strip()
+        asked_by_user_id = payload.asked_by_user_id
+        question = payload.question.strip()
 
         if not org_id or not batch_token or not asked_by_user_id or not question:
             raise HTTPException(status_code=400, detail="Missing required fields: org_id, batch_token, asked_by_user_id, question")
@@ -295,13 +315,13 @@ def ask(payload: Dict[str, Any] = Body(...)):
 
         print(f"[qa] OK org={org_id} batch_id={batch_id} attachments={len(retrieval_ids)} answer_len={len(answer_text)} sources={len(sources)}")
 
-        return JSONResponse({
-            "answer": answer_text,
-            "sources": sources,
-            "log_id": log_id,
-            "batch_token": batch_token,
-            "usage": usage
-        })
+        return AskResponse(
+            answer=answer_text,
+            sources=sources,        # list of dicts is fine; Pydantic will coerce
+            log_id=log_id,
+            batch_token=batch_token,
+            usage=usage or None
+        )
 
     except HTTPException:
         raise
