@@ -1,6 +1,7 @@
 import os
 from openai import OpenAI
 from psycopg2.extensions import connection as _Conn
+from app.services.openai_compat import create_vector_store
 
 client = OpenAI()
 
@@ -22,11 +23,11 @@ def ensure_tc_vs(conn: _Conn, org_id: int, product_line: str) -> str:
                        WHERE org_id=%s AND product_line=%s""", (org_id, product_line))
         row = cur.fetchone()
         if row: return row["vector_store_id"]
-        vs = client.beta.vector_stores.create(name=f"org_{org_id}_{product_line}".lower())
+        vs_id = create_vector_store(client, name=f"org_{org_id}_{product_line}".lower())
         cur.execute("""INSERT INTO public.org_vector_stores(org_id, product_line, vector_store_id)
-                       VALUES (%s,%s,%s)""", (org_id, product_line, vs.id))
+                       VALUES (%s,%s,%s)""", (org_id, product_line, vs_id))
         conn.commit()
-        return vs.id
+        return vs_id
 
 def ensure_offer_vs(conn: _Conn, org_id: int, batch_token: str) -> str:
     """org × batch_token vector store (offer files)."""
@@ -45,11 +46,11 @@ def ensure_offer_vs(conn: _Conn, org_id: int, batch_token: str) -> str:
                        WHERE org_id=%s AND batch_token=%s""", (org_id, batch_token))
         row = cur.fetchone()
         if row: return row["vector_store_id"]
-        vs = client.beta.vector_stores.create(name=f"org_{org_id}_offer_{batch_token}".lower())
+        vs_id = create_vector_store(client, name=f"org_{org_id}_offer_{batch_token}".lower())
         cur.execute("""INSERT INTO public.org_batch_vector_stores(org_id, batch_token, vector_store_id)
-                       VALUES (%s,%s,%s)""", (org_id, batch_token, vs.id))
+                       VALUES (%s,%s,%s)""", (org_id, batch_token, vs_id))
         conn.commit()
-        return vs.id
+        return vs_id
 
 def get_tc_vs(conn: _Conn, org_id: int, product_line: str) -> str | None:
     with conn.cursor() as cur:

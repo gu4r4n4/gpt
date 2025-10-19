@@ -7,6 +7,7 @@ from pathlib import Path
 import os, json, psycopg2, traceback
 from psycopg2.extras import RealDictCursor
 from openai import OpenAI
+from app.services.openai_compat import attach_file_to_vector_store, create_vector_store
 
 router = APIRouter(prefix="/api/admin/tc", tags=["admin-tc"])
 client = OpenAI()
@@ -96,25 +97,22 @@ def ensure_vs(conn, org_id: int, product_line: str) -> str:
             return row["vector_store_id"]
 
         # 4) Create a new vector store and persist mapping
-        vs = client.beta.vector_stores.create(name=f"org_{org_id}_{product_line}".lower())
+        vs_id = create_vector_store(client, name=f"org_{org_id}_{product_line}".lower())
         cur.execute("""
             INSERT INTO public.org_vector_stores (org_id, product_line, vector_store_id)
             VALUES (%s, %s, %s)
             ON CONFLICT (org_id, product_line) DO UPDATE
             SET vector_store_id = EXCLUDED.vector_store_id
-        """, (org_id, product_line, vs.id))
+        """, (org_id, product_line, vs_id))
         conn.commit()
-        return vs.id
+        return vs_id
 
-def push_file(vector_store_id: str, local_path: str) -> str:
+def push_file(vector_store_id: str, local_path: str, attributes: dict | None = None) -> str:
     try:
         with open(local_path, "rb") as f:
             up = client.files.create(file=f, purpose="assistants")
-        # NOTE: if attributes are unsupported in your SDK, omit them
-        client.beta.vector_stores.files.create(
-            vector_store_id=vector_store_id,
-            file_id=up.id,
-        )
+        # attributes not guaranteed in all SDKs; ignore for compatibility
+        attach_file_to_vector_store(client, vector_store_id, up.id)
         return up.id
     except Exception as e:
         traceback.print_exc()
