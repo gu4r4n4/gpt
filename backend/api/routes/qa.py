@@ -57,9 +57,9 @@ def ask(req: AskRequest, conn = Depends(get_db)):
     tc_vs = get_tc_vs(conn, req.org_id, req.product_line)
     offer_vs = get_offer_vs(conn, req.org_id, req.batch_token)
     if not tc_vs:
-        raise HTTPException(404, Quiz: f"No T&C vector store for {req.product_line}")
+        raise HTTPException(status_code=404, detail=f"No T&C vector store for {req.product_line}")
     if not offer_vs:
-        raise HTTPException(404, f"No offer vector store for batch_token={req.batch_token}")
+        raise HTTPException(status_code=404, detail=f"No offer vector store for batch_token={req.batch_token}")
 
     # 1) create thread with user message
     thread = client.beta.threads.create(messages=[{"role":"system","content":SYSTEM_INSTRUCTIONS},
@@ -78,7 +78,7 @@ def ask(req: AskRequest, conn = Depends(get_db)):
         if r.status in ("completed","failed","cancelled","expired","requires_action"): break
 
     if r.status != "completed":
-        raise HTTPException(502, f"Run failed: {r.status}")
+        raise HTTPException(status_code=502, detail=f"Run failed: {r.status}")
 
     # 4) read last message, parse JSON
     msgs = client.beta.threads.messages.list(thread_id=thread.id, order="desc", limit=1)
@@ -92,7 +92,7 @@ def ask(req: AskRequest, conn = Depends(get_db)):
         parsed = json.loads(content)
         top3 = Top3Response(**parsed)  # validation
     except Exception as e:
-        raise HTTPException(502, f"Model did not return valid Top-3 JSON: {e}")
+        raise HTTPException(status_code=502, detail=f"Model did not return valid Top-3 JSON: {e}")
 
     # 5) log
     with conn.cursor() as cur:
