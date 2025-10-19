@@ -3,18 +3,45 @@ from pydantic import BaseModel
 from typing import List, Optional
 from hashlib import sha256
 from datetime import datetime, timezone
+from pathlib import Path
 import os, json, psycopg2, traceback
 from psycopg2.extras import RealDictCursor
 from openai import OpenAI
 
 router = APIRouter(prefix="/api/admin/tc", tags=["admin-tc"])
 client = OpenAI()
-UPLOAD_ROOT = os.getenv("UPLOAD_ROOT", "/var/app/uploads")
+
+# ✅ use a writable default on Render
+UPLOAD_ROOT = os.getenv("UPLOAD_ROOT", "/tmp/uploads")
 
 def get_db():
     conn = psycopg2.connect(os.getenv("DATABASE_URL"), cursor_factory=RealDictCursor)
     try: yield conn
     finally: conn.close()
+
+def safe_name(name: str) -> str:
+    # very basic filename hardening
+    return name.replace("..", "").replace("\\", "/").split("/")[-1]
+
+def parse_dt(s: str | None) -> str | None:
+    if not s:
+        return None
+    s = s.strip()
+    try:
+        if len(s) == 10 and s.count("-") == 2:
+            dt = datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            return dt.isoformat()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat()
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid date format. Use YYYY-MM-DD or ISO-8601 (e.g. 2025-10-22T10:21:20Z).")
+
+def ensure_dir(p: str) -> None:
+    Path(p).mkdir(parents=True, exist_ok=True)
 
 # --- Vector store management: one per org × product_line ---
 def ensure_vs(conn, org_id: int, product_line: str) -> str:
@@ -39,19 +66,17 @@ def ensure_vs(conn, org_id: int, product_line: str) -> str:
         conn.commit()
         return vs.id
 
-def push_file(vector_store_id: str, local_path: str, attributes: dict) -> str:
+def push_file(vector_store_id: str, local_path: str) -> str:
     try:
         with open(local_path, "rb") as f:
             up = client.files.create(file=f, purpose="assistants")
-        # NOTE: if your SDK version doesn't support attributes yet, comment 'attributes=attributes'
+        # NOTE: if attributes are unsupported in your SDK, omit them
         client.beta.vector_stores.files.create(
             vector_store_id=vector_store_id,
             file_id=up.id,
-            # attributes=attributes  # comment this if unsupported in your SDK
         )
         return up.id
     except Exception as e:
-        # log server-side and raise a 502 so you see the cause in the response
         traceback.print_exc()
         raise HTTPException(status_code=502, detail=f"Vector-store push failed: {e}")
 
@@ -75,103 +100,113 @@ class TcList(BaseModel):
 async def upload_tc(
     org_id: int = Form(...),
     insurer_code: str = Form(...),
-    product_line: str = Form(...),                    # e.g., HEALTH | MTPL | CASCO
-    expires_at: Optional[str] = Form(None),           # ISO date (YYYY-MM-DD)
+    product_line: str = Form(...),
+    expires_at: Optional[str] = Form(None),
     effective_from: Optional[str] = Form(None),
     version_label: Optional[str] = Form(None),
     created_by_user_id: Optional[int] = Form(None),
     files: List[UploadFile] = File(...),
+    debug: Optional[int] = Form(0),
     conn = Depends(get_db),
 ):
-    # Validate insurer exists
-    with conn.cursor() as cur:
-        cur.execute("SELECT 1 FROM public.insurers WHERE org_id=%s AND code=%s", (org_id, insurer_code.upper()))
-        if not cur.fetchone():
-            raise HTTPException(422, detail="Unknown insurer_code for this org")
+    try:
+        insurer_code = insurer_code.upper()
+        product_line = product_line.upper()
 
-    # Parse dates
-    def parse_dt(s: str | None) -> str | None:
-        if not s:
-            return None
-        s = s.strip()
-        try:
-            # Accept "YYYY-MM-DD" (date only) -> 00:00:00Z
-            if len(s) == 10 and s.count("-") == 2:
-                dt = datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                return dt.isoformat()
-            # Normalize trailing Z to +00:00 for fromisoformat
-            if s.endswith("Z"):
-                s = s[:-1] + "+00:00"
-            dt = datetime.fromisoformat(s)
-            # If no tzinfo, assume UTC
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt.astimezone(timezone.utc).isoformat()
-        except Exception:
-            raise HTTPException(status_code=422, detail="Invalid date format. Use YYYY-MM-DD or full ISO-8601 (e.g. 2025-10-22T10:21:20Z).")
-    
-    eff = parse_dt(effective_from)
-    exp = parse_dt(expires_at)
-
-    vs_id = ensure_vs(conn, org_id, product_line.upper())
-
-    out = []
-    for uf in files:
-        raw = await uf.read()
-        file_sha = sha256(raw).hexdigest()
-
-        # de-dup by (org_id, sha256, product_line, insurer_code)
+        # 1) insurer exists?
         with conn.cursor() as cur:
-            cur.execute("""
-                SELECT id, retrieval_file_id, filepath FROM public.offer_files
-                WHERE org_id=%s AND sha256=%s AND product_line=%s AND insurer_code=%s
-                LIMIT 1
-            """, (org_id, file_sha, product_line.upper(), insurer_code.upper()))
-            existing = cur.fetchone()
+            cur.execute("SELECT 1 FROM public.insurers WHERE org_id=%s AND code=%s", (org_id, insurer_code))
+            if not cur.fetchone():
+                raise HTTPException(422, detail="Unknown insurer_code for this org")
 
+        # 2) parse dates
+        eff = parse_dt(effective_from)
+        exp = parse_dt(expires_at)
+
+        # 3) ensure vector store per org×product_line
+        vs_id = ensure_vs(conn, org_id, product_line)
+
+        out = []
+        # 4) disk base
         datedir = datetime.utcnow().strftime("%Y/%m/%d")
-        orgdir = os.path.join(UPLOAD_ROOT, f"org_{org_id}", "tc", product_line.upper(), datedir)
-        os.makedirs(orgdir, exist_ok=True)
-        local_path = os.path.join(orgdir, uf.filename)
+        base_dir = os.path.join(UPLOAD_ROOT, f"org_{org_id}", "tc", product_line, datedir)
+        ensure_dir(base_dir)
 
-        if existing:
-            # ensure file exists on disk; if not, restore
-            if not os.path.exists(existing["filepath"]):
-                with open(local_path, "wb") as outfp: outfp.write(raw)
-            retrieval_file_id = existing["retrieval_file_id"]
-        else:
-            with open(local_path, "wb") as outfp: outfp.write(raw)
-            retrieval_file_id = push_file(
-                vs_id,
-                local_path,
-                attributes={
-                    "org_id": org_id,
-                    "product_line": product_line.upper(),
-                    "insurer_code": insurer_code.upper(),
-                    "version_label": version_label or "",
-                    "effective_from": eff or "",
-                    "expires_at": exp or "",
-                    "type": "TANDC"
-                }
-            )
+        for uf in files:
+            # a) read + hash
+            raw = await uf.read()
+            if not raw:
+                raise HTTPException(422, detail=f"Empty file: {uf.filename}")
+            file_sha = sha256(raw).hexdigest()
+            filename = safe_name(uf.filename)
+            local_path = os.path.join(base_dir, filename)
 
+            # b) dedupe
             with conn.cursor() as cur:
                 cur.execute("""
-                    INSERT INTO public.offer_files
-                      (org_id, filename, sha256, size_bytes, filepath,
-                       vector_store_id, retrieval_file_id, is_permanent,
-                       insurer_code, product_line, effective_from, expires_at, version_label, created_by_user_id)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,true,%s,%s,%s,%s,%s,%s)
-                    RETURNING id
-                """, (org_id, uf.filename, file_sha, len(raw), local_path,
-                      vs_id, retrieval_file_id, insurer_code.upper(), product_line.upper(),
-                      eff, exp, version_label, created_by_user_id))
-                new_id = cur.fetchone()["id"]
-                conn.commit()
+                    SELECT id, retrieval_file_id, filepath
+                    FROM public.offer_files
+                    WHERE org_id=%s AND sha256=%s AND product_line=%s AND insurer_code=%s
+                    LIMIT 1
+                """, (org_id, file_sha, product_line, insurer_code))
+                existing = cur.fetchone()
 
-        out.append({"filename": uf.filename, "retrieval_file_id": retrieval_file_id})
+            if existing:
+                # ensure file exists on disk
+                try:
+                    if not os.path.exists(existing["filepath"]):
+                        with open(local_path, "wb") as outfp: outfp.write(raw)
+                    retrieval_file_id = existing["retrieval_file_id"]
+                except Exception as e:
+                    traceback.print_exc()
+                    raise HTTPException(500, detail=f"Local restore failed: {e}")
+            else:
+                # c) write file
+                try:
+                    with open(local_path, "wb") as outfp:
+                        outfp.write(raw)
+                except Exception as e:
+                    traceback.print_exc()
+                    raise HTTPException(500, detail=f"Disk write failed (check UPLOAD_ROOT): {e}")
 
-    return {"ok": True, "files": out, "vector_store_id": vs_id}
+                # d) push to vector store (can be toggled off for diagnostics)
+                if os.getenv("TC_UPLOAD_SKIP_OPENAI", "0") == "1":
+                    retrieval_file_id = f"skipped_{file_sha[:8]}"
+                else:
+                    retrieval_file_id = push_file(vs_id, local_path)
+
+                # e) db insert
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            INSERT INTO public.offer_files
+                              (org_id, filename, sha256, size_bytes, filepath,
+                               vector_store_id, retrieval_file_id, is_permanent,
+                               insurer_code, product_line, effective_from, expires_at, version_label, created_by_user_id)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,true,%s,%s,%s,%s,%s,%s)
+                            RETURNING id
+                        """, (org_id, filename, file_sha, len(raw), local_path,
+                              vs_id, retrieval_file_id, insurer_code, product_line,
+                              eff, exp, version_label, created_by_user_id))
+                        new_id = cur.fetchone()["id"]
+                        conn.commit()
+                except Exception as e:
+                    traceback.print_exc()
+                    raise HTTPException(500, detail=f"DB insert failed: {e}")
+
+            out.append({"filename": filename, "retrieval_file_id": retrieval_file_id})
+
+        return {"ok": True, "files": out, "vector_store_id": vs_id}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        # last-resort safety net (with optional echo)
+        traceback.print_exc()
+        msg = f"Unexpected error: {e}"
+        if debug:
+            msg += " (see server logs for traceback)"
+        raise HTTPException(500, detail=msg)
 
 @router.get("", response_model=TcList)
 def list_tc(
