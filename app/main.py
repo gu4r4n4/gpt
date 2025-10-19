@@ -670,14 +670,54 @@ async def extract_multiple_async(request: Request, background_tasks: BackgroundT
     with _JOBS_LOCK:
         _jobs[job_id] = {"total": len(files), "done": 0, "errors": [], "docs": [], "timings": {}}
 
+    # Create batch for sidecar (once per job)
+    batch_id = None
+    batch_token = None
+    if org_id and user_id:
+        try:
+            batch_token, batch_id = create_offer_batch(org_id, user_id, title=f"PAS Upload - {company or 'Unknown'}")
+            print(f"[sidecar] Created batch {batch_id} for job {job_id}")
+        except Exception as e:
+            print(f"[sidecar] Failed to create batch: {e}")
+            batch_id = None
+            batch_token = None
+
     doc_ids: List[str] = []
-    batch_id = None  # Track batch for sidecar
     
     for idx, f in enumerate(files, start=1):
         filename = f.filename or "uploaded.pdf"
         doc_id = _make_doc_id(job_id, idx, filename)
         doc_ids.append(doc_id)
         data = await f.read()
+        
+        # --- NEW: persist file to disk + offer_files row ---
+        if batch_token and batch_id and org_id and user_id:
+            STORAGE_ROOT = os.getenv("STORAGE_ROOT", "/app/storage")
+            batch_dir = os.path.join(STORAGE_ROOT, "offers", batch_token)
+            os.makedirs(batch_dir, exist_ok=True)
+
+            safe_name = _safe_filename(filename)
+            abs_path = os.path.join(batch_dir, safe_name)
+            try:
+                with open(abs_path, "wb") as wf:
+                    wf.write(data)
+                print(f"[sidecar] saved {abs_path}")
+                
+                # insert offer_files row
+                with get_db_connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            INSERT INTO public.offer_files (org_id, created_by_user_id, batch_id, filename, mime_type, size_bytes, storage_path, insurer_code, is_permanent, product_line)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,false,NULL)
+                            RETURNING id
+                        """, (org_id, user_id, batch_id, safe_name, f.content_type or "application/pdf", len(data), abs_path, insurers[idx-1] or None))
+                        _ = cur.fetchone()
+                        conn.commit()
+                print(f"[sidecar] offer_file row inserted for {safe_name}")
+            except Exception as e:
+                print(f"[sidecar] persist failed for {filename}: {e}")
+        # --- END NEW ---
+        
         EXEC.submit(
             _process_pdf_bytes,
             data=data,
@@ -692,15 +732,6 @@ async def extract_multiple_async(request: Request, background_tasks: BackgroundT
             org_id=org_id,
             user_id=user_id,
         )
-        
-        # Create batch for sidecar (only once per job)
-        if batch_id is None and org_id and user_id:
-            try:
-                batch_token, batch_id = create_offer_batch(org_id, user_id, title=f"PAS Upload - {company or 'Unknown'}")
-                print(f"[sidecar] Created batch {batch_id} for job {job_id}")
-            except Exception as e:
-                print(f"[sidecar] Failed to create batch: {e}")
-                batch_id = None
 
     with _JOBS_LOCK:
         _jobs[job_id]["docs"] = doc_ids
@@ -790,40 +821,6 @@ def job_status(job_id: str):
             raise HTTPException(status_code=404, detail="job not found")
         return job
 
-@app.get("/offers/by-job/{job_id}")
-def offers_by_job(job_id: str):
-    """Get grouped offers for a job by looking up document IDs and extracting from _LAST_RESULTS."""
-    with _JOBS_LOCK:
-        job = _jobs.get(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail="Job not found")
-        
-        doc_ids = job.get("docs", [])
-    
-    # Get offers from _LAST_RESULTS (v1 format)
-    offers = []
-    for doc_id in doc_ids:
-        result = _LAST_RESULTS.get(doc_id)
-        if result:
-            # Convert to the format expected by FE
-            offer = {
-                "document_id": doc_id,
-                "filename": result.get("original_filename", "unknown"),
-                "status": "completed" if result.get("programs") else "error",
-                "error": result.get("_error"),
-                "company_name": result.get("company_name"),
-                "employee_count": result.get("employee_count"),
-                "insurer_hint": result.get("insurer_hint"),
-                "programs": result.get("programs", [])
-            }
-            offers.append(offer)
-    
-    return {
-        "job_id": job_id,
-        "total": len(doc_ids),
-        "completed": len([o for o in offers if o["status"] == "completed"]),
-        "offers": offers
-    }
 
 # -------------------------------
 # Templates API (create/list/instantiate)

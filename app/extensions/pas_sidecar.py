@@ -80,6 +80,7 @@ def run_batch_ingest_sidecar(org_id: int, batch_id: int) -> None:
         print(f"[sidecar] Found {len(files_to_process)} files to process")
         
         # Step d) Process each file
+        processed_count = 0
         for file_row in files_to_process:
             file_id = file_row["id"]
             storage_path = file_row["storage_path"]
@@ -108,13 +109,14 @@ def run_batch_ingest_sidecar(org_id: int, batch_id: int) -> None:
                         conn.commit()
                 
                 print(f"[sidecar] Success file {file_id}: retrieval_file_id={retrieval_file_id}")
+                processed_count += 1
                 
             except Exception as e:
                 print(f"[sidecar] Failed file {file_id} ({filename}): {e}")
                 # Continue processing other files
                 continue
         
-        print(f"[sidecar] Completed batch {batch_id}")
+        print(f"[sidecar] Completed batch {batch_id} - processed {processed_count}/{len(files_to_process)} files")
         
     except Exception as e:
         print(f"[sidecar] Fatal error for batch {batch_id}: {e}")
