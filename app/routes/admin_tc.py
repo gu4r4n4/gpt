@@ -45,24 +45,62 @@ def ensure_dir(p: str) -> None:
 
 # --- Vector store management: one per org × product_line ---
 def ensure_vs(conn, org_id: int, product_line: str) -> str:
-    # dedicated table recommended; fall back to organizations.vector_store_id if needed
     with conn.cursor() as cur:
+        # Ensure table exists
         cur.execute("""
             CREATE TABLE IF NOT EXISTS public.org_vector_stores (
-              org_id INTEGER NOT NULL,
-              product_line TEXT NOT NULL,
+              org_id BIGINT NOT NULL,
               vector_store_id TEXT NOT NULL,
-              PRIMARY KEY (org_id, product_line)
+              created_at TIMESTAMPTZ NOT NULL DEFAULT now()
             )
         """)
         conn.commit()
-        cur.execute("SELECT vector_store_id FROM public.org_vector_stores WHERE org_id=%s AND product_line=%s",
-                    (org_id, product_line))
+
+        # 🔧 Self-heal schema to have product_line + composite PK
+        cur.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='org_vector_stores'")
+        cols = {r[0] for r in cur.fetchall()}
+        if "product_line" not in cols:
+            cur.execute("ALTER TABLE public.org_vector_stores ADD COLUMN product_line TEXT")
+            conn.commit()
+        # ensure PK is (org_id, product_line)
+        cur.execute("""
+            SELECT conname FROM pg_constraint
+            WHERE conrelid='public.org_vector_stores'::regclass AND contype='p'
+        """)
+        pk = cur.fetchone()
+        if pk and pk[0] != "org_vector_stores_pkey":  # unlikely name mismatch
+            pass
+        # Drop any PK then add our composite one (idempotent)
+        cur.execute("""
+            DO $$
+            BEGIN
+              IF EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conname = 'org_vector_stores_pkey'
+                  AND conrelid = 'public.org_vector_stores'::regclass
+              ) THEN
+                ALTER TABLE public.org_vector_stores DROP CONSTRAINT org_vector_stores_pkey;
+              END IF;
+            END $$;
+        """)
+        cur.execute("ALTER TABLE public.org_vector_stores ADD CONSTRAINT org_vector_stores_pkey PRIMARY KEY (org_id, product_line)")
+        conn.commit()
+
+        # Try fetch
+        cur.execute("""
+            SELECT vector_store_id FROM public.org_vector_stores
+            WHERE org_id=%s AND product_line=%s
+        """, (org_id, product_line))
         row = cur.fetchone()
-        if row: return row["vector_store_id"]
+        if row:
+            return row[0]
+
+        # Create & persist
         vs = client.beta.vector_stores.create(name=f"org_{org_id}_{product_line}".lower())
-        cur.execute("INSERT INTO public.org_vector_stores(org_id, product_line, vector_store_id) VALUES (%s,%s,%s)",
-                    (org_id, product_line, vs.id))
+        cur.execute("""
+            INSERT INTO public.org_vector_stores(org_id, product_line, vector_store_id)
+            VALUES (%s,%s,%s)
+        """, (org_id, product_line, vs.id))
         conn.commit()
         return vs.id
 
@@ -144,7 +182,7 @@ async def upload_tc(
             # b) dedupe
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT id, retrieval_file_id, filepath
+                    SELECT id, retrieval_file_id, storage_path
                     FROM public.offer_files
                     WHERE org_id=%s AND sha256=%s AND product_line=%s AND insurer_code=%s
                     LIMIT 1
@@ -154,7 +192,7 @@ async def upload_tc(
             if existing:
                 # ensure file exists on disk
                 try:
-                    if not os.path.exists(existing["filepath"]):
+                    if not os.path.exists(existing["storage_path"]):
                         with open(local_path, "wb") as outfp: outfp.write(raw)
                     retrieval_file_id = existing["retrieval_file_id"]
                 except Exception as e:
@@ -180,12 +218,12 @@ async def upload_tc(
                     with conn.cursor() as cur:
                         cur.execute("""
                             INSERT INTO public.offer_files
-                              (org_id, filename, sha256, size_bytes, filepath,
+                              (org_id, filename, mime_type, size_bytes, sha256, storage_path,
                                vector_store_id, retrieval_file_id, is_permanent,
                                insurer_code, product_line, effective_from, expires_at, version_label, created_by_user_id)
-                            VALUES (%s,%s,%s,%s,%s,%s,%s,true,%s,%s,%s,%s,%s,%s)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,true,%s,%s,%s,%s,%s,%s)
                             RETURNING id
-                        """, (org_id, filename, file_sha, len(raw), local_path,
+                        """, (org_id, filename, uf.content_type or "application/pdf", len(raw), file_sha, local_path,
                               vs_id, retrieval_file_id, insurer_code, product_line,
                               eff, exp, version_label, created_by_user_id))
                         new_id = cur.fetchone()["id"]
