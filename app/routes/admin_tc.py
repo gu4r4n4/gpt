@@ -7,7 +7,7 @@ from pathlib import Path
 import os, json, psycopg2, traceback
 from psycopg2.extras import RealDictCursor
 from openai import OpenAI
-from app.services.openai_compat import attach_file_to_vector_store, create_vector_store
+from app.services.openai_compat import attach_file_to_vector_store, create_vector_store, delete_file_from_vector_store
 
 router = APIRouter(prefix="/api/admin/tc", tags=["admin-tc"])
 client = OpenAI()
@@ -295,4 +295,41 @@ def patch_tc(id: int, payload: TcPatch, conn = Depends(get_db)):
         cur.execute(f"UPDATE public.offer_files SET {', '.join(sets)} WHERE id=%s RETURNING id", (*vals, id))
         if not cur.fetchone(): raise HTTPException(404, "Not found")
         conn.commit()
+    return {"ok": True}
+
+@router.delete("/{tc_id}")
+def delete_tc(
+    tc_id: int,
+    org_id: int,
+    conn = Depends(get_db),
+):
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+          SELECT id, org_id, filename, storage_path, vector_store_id, retrieval_file_id
+          FROM public.offer_files
+          WHERE id=%s AND org_id=%s AND is_permanent=true
+          LIMIT 1
+        """, (tc_id, org_id))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="T&C not found")
+
+        # best-effort vector store cleanup
+        try:
+            if row.get("vector_store_id") and row.get("retrieval_file_id"):
+                delete_file_from_vector_store(client, row["vector_store_id"], row["retrieval_file_id"])
+        except Exception:
+            pass
+
+        # best-effort disk cleanup
+        try:
+            p = row.get("storage_path")
+            if p and os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
+
+        cur.execute("DELETE FROM public.offer_files WHERE id=%s", (tc_id,))
+        conn.commit()
+
     return {"ok": True}
