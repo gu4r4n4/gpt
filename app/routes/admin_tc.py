@@ -45,61 +45,49 @@ def ensure_dir(p: str) -> None:
 
 # --- Vector store management: one per org × product_line ---
 def ensure_vs(conn, org_id: int, product_line: str) -> str:
+    """Return vector_store_id for org×product_line.
+    Creates the table/column/row as needed. No fragile introspection."""
     with conn.cursor() as cur:
-        # Ensure table exists
+        # 1) Ensure table + column exist (idempotent)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS public.org_vector_stores (
               org_id BIGINT NOT NULL,
               vector_store_id TEXT NOT NULL,
-              created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+              created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+              product_line TEXT
             )
         """)
-        conn.commit()
-
-        # 🔧 Self-heal schema to have product_line + composite PK
-        cur.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='org_vector_stores'")
-        cols = {r[0] for r in cur.fetchall()}
-        if "product_line" not in cols:
-            cur.execute("ALTER TABLE public.org_vector_stores ADD COLUMN product_line TEXT")
-            conn.commit()
-        # ensure PK is (org_id, product_line)
-        cur.execute("""
-            SELECT conname FROM pg_constraint
-            WHERE conrelid='public.org_vector_stores'::regclass AND contype='p'
-        """)
-        pk = cur.fetchone()
-        if pk and pk[0] != "org_vector_stores_pkey":  # unlikely name mismatch
-            pass
-        # Drop any PK then add our composite one (idempotent)
+        # Ensure composite PK (safe even if it already exists due to our migration)
         cur.execute("""
             DO $$
             BEGIN
-              IF EXISTS (
-                SELECT 1 FROM pg_constraint
-                WHERE conname = 'org_vector_stores_pkey'
-                  AND conrelid = 'public.org_vector_stores'::regclass
-              ) THEN
-                ALTER TABLE public.org_vector_stores DROP CONSTRAINT org_vector_stores_pkey;
-              END IF;
+              BEGIN
+                ALTER TABLE public.org_vector_stores
+                ADD CONSTRAINT org_vector_stores_pkey PRIMARY KEY (org_id, product_line);
+              EXCEPTION WHEN duplicate_object THEN
+                -- already has the PK; ignore
+                NULL;
+              END;
             END $$;
         """)
-        cur.execute("ALTER TABLE public.org_vector_stores ADD CONSTRAINT org_vector_stores_pkey PRIMARY KEY (org_id, product_line)")
-        conn.commit()
 
-        # Try fetch
+        # 2) Try to fetch
         cur.execute("""
-            SELECT vector_store_id FROM public.org_vector_stores
+            SELECT vector_store_id
+            FROM public.org_vector_stores
             WHERE org_id=%s AND product_line=%s
         """, (org_id, product_line))
         row = cur.fetchone()
         if row:
-            return row[0]
+            return row["vector_store_id"]
 
-        # Create & persist
+        # 3) Create vector store and persist
         vs = client.beta.vector_stores.create(name=f"org_{org_id}_{product_line}".lower())
         cur.execute("""
-            INSERT INTO public.org_vector_stores(org_id, product_line, vector_store_id)
+            INSERT INTO public.org_vector_stores (org_id, product_line, vector_store_id)
             VALUES (%s,%s,%s)
+            ON CONFLICT (org_id, product_line) DO UPDATE
+              SET vector_store_id = EXCLUDED.vector_store_id
         """, (org_id, product_line, vs.id))
         conn.commit()
         return vs.id
