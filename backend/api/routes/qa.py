@@ -1,11 +1,17 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field, conlist, validator
+from pydantic import BaseModel, Field
 from typing import List, Optional
 import os, json, psycopg2
 from psycopg2.extras import RealDictCursor
 from openai import OpenAI
 from datetime import datetime
 from app.services.vectorstores import get_tc_vs, get_offer_vs
+
+# Compat: pydantic v1 uses @validator, v2 uses @field_validator
+try:
+    from pydantic import field_validator as _validator
+except ImportError:  # pydantic v1
+    from pydantic import validator as _validator  # type: ignore
 
 router = APIRouter(prefix="/api/qa", tags=["qa"])
 client = OpenAI()
@@ -15,20 +21,33 @@ def get_db():
     try: yield conn
     finally: conn.close()
 
-# ---- Strict schema for Top-3 ----
 class RankedInsurer(BaseModel):
     insurer_code: str = Field(..., description="e.g. BALTA, BTA")
     score: float = Field(..., ge=0, le=1)
     reason: str
-    sources: conlist(str, min_items=1)  # retrieval_file_id or filename(s)
+    sources: List[str]  # validate length via validator below
+
+    @_validator("sources")
+    def _min_one_source(cls, v):
+        if not v or len(v) < 1:
+            raise ValueError("at least one source is required")
+        return v
+
 
 class Top3Response(BaseModel):
     product_line: str
-    top3: conlist(RankedInsurer, min_items=3, max_items=3)
+    top3: List[RankedInsurer]
     notes: Optional[str] = None
 
-    @validator("product_line")
-    def upcase_pl(cls, v): return v.upper()
+    @_validator("product_line")
+    def _upcase_pl(cls, v):
+        return (v or "").upper()
+
+    @_validator("top3")
+    def _exact_three(cls, v):
+        if not isinstance(v, list) or len(v) != 3:
+            raise ValueError("top3 must contain exactly 3 items")
+        return v
 
 class AskRequest(BaseModel):
     org_id: int
