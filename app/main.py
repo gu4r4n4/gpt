@@ -54,10 +54,16 @@ async def resolve_request_context(
     org_id_form: Optional[int] = None,
     created_by_user_id_form: Optional[int] = None,
 ) -> Tuple[int, int]:
+    # also read raw headers (in case CORS/proxy strips the annotated ones)
+    h_org = request.headers.get("x-org-id")
+    h_user = request.headers.get("x-user-id")
+
     st_org_id = getattr(request.state, "org_id", None)
     st_user_id = getattr(request.state, "user_id", None)
-    org_id = _coalesce_int(st_org_id, x_org_id, org_id_form)
-    user_id = _coalesce_int(st_user_id, x_user_id, created_by_user_id_form)
+
+    org_id = _coalesce_int(st_org_id, x_org_id, h_org, org_id_form)
+    user_id = _coalesce_int(st_user_id, x_user_id, h_user, created_by_user_id_form)
+
     if org_id is None or user_id is None:
         raise HTTPException(status_code=400, detail="Missing org_id or user_id (X-Org-Id/X-User-Id headers or form fields).")
     return org_id, user_id
@@ -111,10 +117,12 @@ app.include_router(admin_tc_router)  # Admin terms & conditions management
 # -------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten in production (e.g., ["https://vis.ongo.lv"])
+    allow_origins=["*"],                 # or your FE origin(s)
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*", "X-Org-Id", "X-User-Id"],  # IMPORTANT
+    expose_headers=["X-Request-Id"],     # optional
+    max_age=86400,
 )
 
 # -------------------------------
