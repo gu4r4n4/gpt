@@ -52,10 +52,16 @@ class Top3Response(BaseModel):
 class AskRequest(BaseModel):
     org_id: int
     batch_token: str
-    product_line: str = Field(..., regex="^[A-Za-z]+$")
+    product_line: str  # validate with decorator (letters only)
     asked_by_user_id: int
     question: str
     debug: Optional[int] = 0
+
+    @_validator("product_line")
+    def _pl_letters_only(cls, v: str) -> str:
+        if not v or not v.isalpha():
+            raise ValueError("product_line must contain only letters (e.g., HEALTH)")
+        return v.upper()
 
 SYSTEM_INSTRUCTIONS = """You are an insurance underwriting analyst.
 Return STRICT JSON only, no prose. Output format:
