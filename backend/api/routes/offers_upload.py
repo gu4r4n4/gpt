@@ -15,6 +15,7 @@ import psycopg2.extras
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, Request
 from fastapi.responses import JSONResponse
 from openai import OpenAI
+from app.services.vectorstores import ensure_offer_vs
 
 # ---- BATCH SUPPORT (add near other imports/constants) ----
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -478,16 +479,18 @@ async def upload_offer_file(
             traceback.print_exc()
             raise HTTPException(status_code=500, detail=str(e))
     
-    # ---- batch resolution (optional) ----
+    # ---- batch resolution (required) ----
+    if not batch_token:
+        raise HTTPException(status_code=422, detail="batch_token is required for offer uploads")
+    
     batch_id: Optional[int] = None
-    if batch_token:
-        batch_id = resolve_batch_id_by_token(batch_token, org_id)
-        if batch_id is None:
-            # Surface a clear error instead of generic 500s
-            raise HTTPException(
-                status_code=404,
-                detail=f"batch_token '{batch_token}' not found or not active for org_id={org_id}"
-            )
+    batch_id = resolve_batch_id_by_token(batch_token, org_id)
+    if batch_id is None:
+        # Surface a clear error instead of generic 500s
+        raise HTTPException(
+            status_code=404,
+            detail=f"batch_token '{batch_token}' not found or not active for org_id={org_id}"
+        )
     
     # TODO: Antivirus scan
     if not scan_antivirus(file.filename):
@@ -496,8 +499,9 @@ async def upload_offer_file(
     # TODO: PII redaction
     content = scrub_pii(content)
     
-    # Get vector store ID
-    vector_store_id = get_org_vector_store(org_id)
+    # Get vector store ID for offer batch
+    with get_db_connection() as conn:
+        vector_store_id = ensure_offer_vs(conn, org_id, batch_token)
     
     # Save to storage
     try:

@@ -5,6 +5,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 import psycopg2
 from openai import OpenAI
+from app.services.vectorstores import get_tc_vs, get_offer_vs
 
 router = APIRouter(prefix="/api/qa", tags=["qa"])
 
@@ -22,8 +23,10 @@ class QASource(BaseModel):
 class AskRequest(BaseModel):
     org_id: int = Field(..., example=1)
     batch_token: str = Field(..., example="bt_manual_test_001")
+    product_line: str = Field(..., pattern="^[A-Za-z]+$", example="HEALTH")
     asked_by_user_id: int = Field(..., example=1)
     question: str = Field(..., example="What's the annual premium and deductible?")
+    debug: Optional[int] = 0
 
 class AskResponse(BaseModel):
     answer: str = Field(..., example="The annual premium is €1,200 and the deductible is €500.")
@@ -119,19 +122,23 @@ def ask(payload: AskRequest = Body(...), debug: int = Query(0)):
     {
       "org_id": 1,
       "batch_token": "bt_manual_test_001",
+      "product_line": "HEALTH",
       "asked_by_user_id": 1,
-      "question": "What's the annual premium and deductible?"
+      "question": "What's the annual premium and deductible?",
+      "debug": 0
     }
     """
 
     try:
         org_id = payload.org_id
         batch_token = payload.batch_token.strip()
+        product_line = payload.product_line.strip()
         asked_by_user_id = payload.asked_by_user_id
         question = payload.question.strip()
+        debug_flag = payload.debug or debug
 
-        if not org_id or not batch_token or not asked_by_user_id or not question:
-            raise HTTPException(status_code=400, detail="Missing required fields: org_id, batch_token, asked_by_user_id, question")
+        if not org_id or not batch_token or not product_line or not asked_by_user_id or not question:
+            raise HTTPException(status_code=400, detail="Missing required fields: org_id, batch_token, product_line, asked_by_user_id, question")
 
         # resolve batch
         batch = resolve_batch_by_token(org_id, batch_token)
@@ -153,33 +160,35 @@ def ask(payload: AskRequest = Body(...), debug: int = Query(0)):
         print(f"[qa] org={org_id} batch_id={batch_id} files={len(retrieval_ids)}")
         print(f"[qa] sample file_ids={sample_ids}")
 
-        # vector store
-        vs_id = get_org_vector_store_id(org_id)
-        if not vs_id:
-            raise HTTPException(status_code=502, detail="No vector store configured for org")
+        # Get both vector stores
+        conn = get_db_connection()
+        tc_vs = get_tc_vs(conn, org_id, product_line)
+        offer_vs = get_offer_vs(conn, org_id, batch_token)
+        
+        if not tc_vs:
+            raise HTTPException(404, detail=f"No T&C vector store for {product_line}")
+        if not offer_vs:
+            raise HTTPException(404, detail=f"No offer vector store for batch_token={batch_token}")
+        
+        vector_store_ids = [tc_vs, offer_vs]
 
         openai_model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
         client = OpenAI()
 
         # ---- Assistants v2: threads + runs ----
-        # create thread with user message and attached batch files
-        attachments = [{"file_id": rid, "tools": [{"type": "file_search"}]} for rid in retrieval_ids]
-        print(f"[qa] attachments prepared: {len(attachments)}")
+        # Create thread with system and user messages
+        thread = client.beta.threads.create(messages=[
+            {"role": "system", "content": "You are a helpful assistant that answers questions about insurance offers and terms & conditions. Use the provided documents to give accurate, detailed answers."},
+            {"role": "user", "content": question}
+        ])
 
-        # 1) Create thread with user message
-        thread = client.beta.threads.create(
-            messages=[{
-                "role": "user",
-                "content": question,   # <-- plain string, NOT {"type":"input_text"}
-                "attachments": attachments
-            }]
-        )
-
-        # 2) Create run (NO tool_resources); file_search tool is fine here
+        # Create run with file_search tool and both vector stores
         run = client.beta.threads.runs.create(
             thread_id=thread.id,
-            model=openai_model,
-            tools=[{"type": "file_search"}],
+            assistant_id=os.getenv("ASSISTANT_ID_TOP3"),
+            tool_resources={
+                "file_search": { "vector_store_ids": vector_store_ids }
+            }
         )
 
         # POLLING: make the polling block show the real failure details and time out with 504
@@ -289,11 +298,13 @@ def ask(payload: AskRequest = Body(...), debug: int = Query(0)):
 
         # RETURN: build AskResponse. If debug=1, include thread/run ids and first message id
         debug_payload = None
-        if debug:
+        if debug_flag:
             debug_payload = {
                 "thread_id": thread.id,
                 "run_id": run.id,
-                "run_status": run.status
+                "run_status": run.status,
+                "tc_vector_store": tc_vs,
+                "offer_vector_store": offer_vs
             }
 
         print(f"[qa] OK org={org_id} batch_id={batch_id} attachments={len(retrieval_ids)} answer_len={len(answer_text)} sources={len(sources)}")
