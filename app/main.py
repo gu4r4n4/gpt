@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Dict, Any, Tuple
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Request, Body, Header
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Request, Body, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -33,6 +33,7 @@ from backend.api.routes.qa import router as qa_router
 from app.routes.admin_insurers import router as admin_insurers_router
 from app.routes.admin_tc import router as admin_tc_router
 from app.services.vector_batches import ensure_batch_vector_store, add_file_to_batch_vs, compute_sha256
+from app.extensions.pas_sidecar import run_batch_ingest_sidecar, infer_batch_token_for_docs
 
 APP_NAME = "GPT Offer Extractor"
 APP_VERSION = "1.0.0"
@@ -655,41 +656,30 @@ async def extract_multiple(request: Request):
 
 
 @app.post("/extract/multiple-async", status_code=202)
-async def extract_multiple_async(
-    request: Request,
-    files: List[UploadFile] = File(...),
-    insurers: List[str] = Form(...),
-    company: Optional[str] = Form(None),
-    insured_count: Optional[int] = Form(None),
-    inquiry_id: Optional[int] = Form(None),
-    # swagger/dev fallbacks
-    org_id_form: Optional[int] = Form(None),
-    created_by_user_id_form: Optional[int] = Form(None),
-):
-    org_id, user_id = await resolve_request_context(request, org_id_form=org_id_form, created_by_user_id_form=created_by_user_id_form)
+async def extract_multiple_async(request: Request, background_tasks: BackgroundTasks):
+    org_id, user_id = _ctx_ids(request)
 
-    # Create batch for this extraction job
-    batch_token, batch_id = create_offer_batch(org_id, user_id, title=f"PAS Upload - {company or 'Unknown'}")
-    
-    # Ensure vector store exists for this batch
-    vector_store_id = ensure_batch_vector_store(org_id, batch_token)
+    parsed = await _parse_upload_form(request)
+    files: List[UploadFile] = parsed["files"]
+    insurers: List[str] = parsed["insurers"]
+    company: str = parsed["company"]
+    insured_count: int = parsed["insured_count"]
+    inquiry_id: str = parsed["inquiry_id"]
 
     job_id = str(uuid.uuid4())
     with _JOBS_LOCK:
-        _jobs[job_id] = {"total": len(files), "done": 0, "errors": [], "docs": [], "timings": {}, "batch_token": batch_token, "vector_store_id": vector_store_id}
+        _jobs[job_id] = {"total": len(files), "done": 0, "errors": [], "docs": [], "timings": {}}
 
     doc_ids: List[str] = []
-    file_data_map = {}  # Store file data for vector store processing
+    batch_id = None  # Track batch for sidecar
     
     for idx, f in enumerate(files, start=1):
         filename = f.filename or "uploaded.pdf"
         doc_id = _make_doc_id(job_id, idx, filename)
         doc_ids.append(doc_id)
         data = await f.read()
-        file_data_map[doc_id] = data  # Store for vector store processing
-        
         EXEC.submit(
-            _process_pdf_bytes_with_batch,
+            _process_pdf_bytes,
             data=data,
             doc_id=doc_id,
             insurer=insurers[idx - 1] or "",
@@ -701,170 +691,25 @@ async def extract_multiple_async(
             enq_ts=time.monotonic(),
             org_id=org_id,
             user_id=user_id,
-            batch_id=batch_id,
-            vector_store_id=vector_store_id,
-            batch_token=batch_token,
         )
+        
+        # Create batch for sidecar (only once per job)
+        if batch_id is None and org_id and user_id:
+            try:
+                batch_token, batch_id = create_offer_batch(org_id, user_id, title=f"PAS Upload - {company or 'Unknown'}")
+                print(f"[sidecar] Created batch {batch_id} for job {job_id}")
+            except Exception as e:
+                print(f"[sidecar] Failed to create batch: {e}")
+                batch_id = None
 
     with _JOBS_LOCK:
         _jobs[job_id]["docs"] = doc_ids
-        _jobs[job_id]["file_data"] = file_data_map  # Store file data for vector processing
     
-    return {
-        "job_id": job_id, 
-        "accepted": len(files), 
-        "documents": doc_ids,
-        "batch_token": batch_token,
-        "vector_store_id": vector_store_id
-    }
-
-
-def _process_pdf_bytes_with_batch(
-    data: bytes,
-    doc_id: str,
-    insurer: str,
-    company: str,
-    insured_count: int,
-    job_id: str,
-    inquiry_id_raw: str,
-    original_name: str,
-    enq_ts: float,
-    org_id: Optional[int],
-    user_id: Optional[int],
-    batch_id: int,
-    vector_store_id: str,
-    batch_token: str,
-):
-    """Process PDF bytes with batch and vector store integration."""
-    t_start = time.monotonic()
-    with _JOBS_LOCK:
-        rec = _jobs.get(job_id)
-        if rec is not None:
-            rec.setdefault("timings", {})
-            rec["timings"].setdefault(doc_id, {})["queue_s"] = round(t_start - float(enq_ts), 3)
-
-    try:
-        # 1. Create offer_files record first
-        file_sha256 = compute_sha256(data)
-        file_size = len(data)
-        
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                # Check for duplicates first
-                cur.execute("""
-                    SELECT id, vector_store_id, retrieval_file_id 
-                    FROM public.offer_files 
-                    WHERE org_id = %s AND sha256 = %s
-                    LIMIT 1
-                """, (org_id, file_sha256))
-                existing = cur.fetchone()
-                
-                if existing:
-                    # Link existing file to this batch
-                    cur.execute("""
-                        UPDATE public.offer_files 
-                        SET batch_id = %s 
-                        WHERE id = %s
-                    """, (batch_id, existing[0]))
-                    conn.commit()
-                    print(f"[batch] Linked existing file {existing[0]} to batch {batch_id}")
-                else:
-                    # Create new offer_files record
-                    cur.execute("""
-                        INSERT INTO public.offer_files
-                        (org_id, created_by_user_id, batch_id, filename, mime_type, size_bytes, 
-                         sha256, storage_path, insurer_code, embeddings_ready, vector_store_id, retrieval_file_id)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        RETURNING id
-                    """, (org_id, user_id, batch_id, original_name, "application/pdf", file_size,
-                          file_sha256, None, insurer, False, None, None))
-                    file_id = cur.fetchone()[0]
-                    conn.commit()
-                    print(f"[batch] Created offer_files record {file_id} for {original_name}")
-
-        # 2. Process PDF extraction (original logic)
-        t_llm0 = time.monotonic()
-        payload = extract_offer_from_pdf_bytes(data, document_id=doc_id)
-        t_llm = time.monotonic() - t_llm0
-
-        t_db0 = time.monotonic()
-        payload["original_filename"] = original_name
-        payload["_org_id"] = org_id
-        payload["_user_id"] = user_id
-        _inject_meta(payload, insurer=insurer, company=company, insured_count=insured_count, inquiry_id=inquiry_id_raw)
-        ok, err = save_to_supabase(payload)
-        t_db = time.monotonic() - t_db0
-
-        # 3. Vector store processing (non-blocking)
-        try:
-            if not existing:  # Only process new files
-                retrieval_file_id = add_file_to_batch_vs(vector_store_id, data, original_name)
-                
-                # Update offer_files with vector store info
-                with get_db_connection() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute("""
-                            UPDATE public.offer_files 
-                            SET vector_store_id = %s, retrieval_file_id = %s, embeddings_ready = true
-                            WHERE org_id = %s AND batch_id = %s AND filename = %s
-                        """, (vector_store_id, retrieval_file_id, org_id, batch_id, original_name))
-                        conn.commit()
-                
-                print(f"[batch] Successfully processed {original_name} -> retrieval_file_id: {retrieval_file_id}")
-            else:
-                print(f"[batch] Skipped vector store processing for duplicate file {original_name}")
-                
-        except Exception as e:
-            print(f"[batch] Vector store processing failed for {original_name}: {e}")
-            # Update with error info
-            try:
-                with get_db_connection() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute("""
-                            UPDATE public.offer_files 
-                            SET raw_json = COALESCE(raw_json, '{}'::jsonb) || jsonb_build_object('embedding_error', %s)
-                            WHERE org_id = %s AND batch_id = %s AND filename = %s
-                        """, (str(e), org_id, batch_id, original_name))
-                        conn.commit()
-            except Exception as db_err:
-                print(f"[batch] Failed to update error info: {db_err}")
-
-        payload["_timings"] = {
-            "llm_s": round(t_llm, 3),
-            "db_s": round(t_db, 3),
-            "total_s": round(time.monotonic() - t_start, 3),
-        }
-        _LAST_RESULTS[doc_id] = payload
-
-        with _JOBS_LOCK:
-            rec = _jobs.get(job_id)
-            if rec is not None:
-                rec["timings"].setdefault(doc_id, {}).update(payload["_timings"])
-                if not ok:
-                    rec["errors"].append({"document_id": doc_id, "error": f"supabase_insert: {err}"})
-                    
-    except Exception as e:
-        with _JOBS_LOCK:
-            rec = _jobs.get(job_id)
-            if rec is not None:
-                rec["errors"].append({"document_id": doc_id, "error": f"extract: {e}"})
-                rec["timings"].setdefault(doc_id, {})["total_s"] = round(time.monotonic() - t_start, 3)
-        payload = {
-            "document_id": doc_id,
-            "original_filename": original_name,
-            "programs": [],
-            "_error": f"extract: {e}",
-            "_timings": {"total_s": round(time.monotonic() - t_start, 3)},
-            "_org_id": org_id,
-            "_user_id": user_id,
-        }
-        _inject_meta(payload, insurer=insurer, company=company, insured_count=insured_count, inquiry_id=inquiry_id_raw)
-        _LAST_RESULTS[doc_id] = payload
-    finally:
-        with _JOBS_LOCK:
-            rec = _jobs.get(job_id)
-            if rec is not None:
-                rec["done"] += 1
+    # Add sidecar task if batch was created
+    if batch_id and org_id:
+        background_tasks.add_task(run_batch_ingest_sidecar, org_id, batch_id)
+    
+    return {"job_id": job_id, "accepted": len(files), "documents": doc_ids}
 
 
 def _process_pdf_bytes(
@@ -947,67 +792,37 @@ def job_status(job_id: str):
 
 @app.get("/offers/by-job/{job_id}")
 def offers_by_job(job_id: str):
-    """Get grouped offers for a job by looking up the batch and associated files."""
+    """Get grouped offers for a job by looking up document IDs and extracting from _LAST_RESULTS."""
     with _JOBS_LOCK:
         job = _jobs.get(job_id)
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
         
-        batch_token = job.get("batch_token")
-        if not batch_token:
-            raise HTTPException(status_code=404, detail="Job not found")
+        doc_ids = job.get("docs", [])
     
-    # Get batch info and associated files
-    with get_db_connection() as conn:
-        with conn.cursor() as cur:
-            # Get batch info
-            cur.execute("""
-                SELECT id, org_id, created_by_user_id, title, status, created_at, expires_at
-                FROM public.offer_batches 
-                WHERE token = %s
-            """, (batch_token,))
-            batch_row = cur.fetchone()
-            if not batch_row:
-                raise HTTPException(status_code=404, detail="Batch not found")
-            
-            batch_id = batch_row[0]
-            
-            # Get files in this batch
-            cur.execute("""
-                SELECT id, filename, insurer_code, size_bytes, embeddings_ready, created_at
-                FROM public.offer_files 
-                WHERE batch_id = %s
-                ORDER BY created_at DESC
-            """, (batch_id,))
-            files = cur.fetchall()
-    
-    # Return grouped offers data (matching FE expectations)
-    grouped_offers = []
-    for file_row in files:
-        file_id, filename, insurer_code, size_bytes, embeddings_ready, created_at = file_row
-        
-        # Create a grouped offer entry
-        grouped_offer = {
-            "id": f"batch_{batch_id}_file_{file_id}",
-            "filename": filename,
-            "insurer": insurer_code or "Unknown",
-            "company_hint": insurer_code or "Unknown",
-            "program_code": "BATCH_UPLOAD",
-            "source": "batch_upload",
-            "status": "completed" if embeddings_ready else "processing",
-            "created_at": created_at.isoformat() if created_at else None,
-            "size_bytes": size_bytes,
-            "embeddings_ready": embeddings_ready,
-            "programs": []  # Could be populated from extraction results if needed
-        }
-        grouped_offers.append(grouped_offer)
+    # Get offers from _LAST_RESULTS (v1 format)
+    offers = []
+    for doc_id in doc_ids:
+        result = _LAST_RESULTS.get(doc_id)
+        if result:
+            # Convert to the format expected by FE
+            offer = {
+                "document_id": doc_id,
+                "filename": result.get("original_filename", "unknown"),
+                "status": "completed" if result.get("programs") else "error",
+                "error": result.get("_error"),
+                "company_name": result.get("company_name"),
+                "employee_count": result.get("employee_count"),
+                "insurer_hint": result.get("insurer_hint"),
+                "programs": result.get("programs", [])
+            }
+            offers.append(offer)
     
     return {
-        "batch_token": batch_token,
-        "batch_id": batch_id,
-        "total_files": len(files),
-        "files_ready": sum(1 for f in files if f[4]),  # embeddings_ready count
-        "offers": grouped_offers
+        "job_id": job_id,
+        "total": len(doc_ids),
+        "completed": len([o for o in offers if o["status"] == "completed"]),
+        "offers": offers
     }
 
 # -------------------------------
@@ -1320,6 +1135,14 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
         # never block share creation on derivation issues
         pass
 
+    # Try to infer batch_token if not provided
+    inferred_batch_token = body.batch_token
+    if not inferred_batch_token and body.document_ids:
+        try:
+            inferred_batch_token = infer_batch_token_for_docs(body.document_ids)
+        except Exception as e:
+            print(f"[shares] Failed to infer batch_token: {e}")
+    
     payload = {
         "mode": mode,
         "title": body.title,
@@ -1331,7 +1154,7 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
         "role": body.role,
         "allow_edit_fields": body.allow_edit_fields,
         "insurer_only": body.insurer_only,
-        "batch_token": body.batch_token,  # Include batch token for vector store access
+        "batch_token": inferred_batch_token,  # Include batch token for vector store access
         "view_prefs": body.view_prefs or {},
     }
 
