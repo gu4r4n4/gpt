@@ -48,6 +48,14 @@ def _coalesce_int(*vals) -> Optional[int]:
         except: pass
     return None
 
+def _ctx_or_defaults(org_id: Optional[int], user_id: Optional[int]) -> tuple[Optional[int], Optional[int]]:
+    """Apply environment defaults if org_id/user_id are None."""
+    try_env_org = int(os.getenv("DEFAULT_ORG_ID", "0") or 0)
+    try_env_user = int(os.getenv("DEFAULT_USER_ID", "0") or 0)
+    if org_id is None and try_env_org > 0: org_id = try_env_org
+    if user_id is None and try_env_user > 0: user_id = try_env_user
+    return org_id, user_id
+
 async def resolve_request_context(
     request: Request,
     x_org_id: Optional[int] = Header(None, convert_underscores=False),
@@ -658,6 +666,7 @@ async def extract_multiple(request: Request):
 @app.post("/extract/multiple-async", status_code=202)
 async def extract_multiple_async(request: Request, background_tasks: BackgroundTasks):
     org_id, user_id = _ctx_ids(request)
+    org_id, user_id = _ctx_or_defaults(org_id, user_id)
 
     parsed = await _parse_upload_form(request)
     files: List[UploadFile] = parsed["files"]
@@ -676,11 +685,13 @@ async def extract_multiple_async(request: Request, background_tasks: BackgroundT
     if org_id and user_id:
         try:
             batch_token, batch_id = create_offer_batch(org_id, user_id, title=f"PAS Upload - {company or 'Unknown'}")
-            print(f"[sidecar] Created batch {batch_id} for job {job_id}")
+            print("[sidecar] batch-created", batch_id, batch_token)
         except Exception as e:
             print(f"[sidecar] Failed to create batch: {e}")
             batch_id = None
             batch_token = None
+    else:
+        print("[sidecar] skip batch: missing org/user")
 
     doc_ids: List[str] = []
     
@@ -691,31 +702,29 @@ async def extract_multiple_async(request: Request, background_tasks: BackgroundT
         data = await f.read()
         
         # --- NEW: persist file to disk + offer_files row ---
-        if batch_token and batch_id and org_id and user_id:
-            STORAGE_ROOT = os.getenv("STORAGE_ROOT", "/app/storage")
+        if batch_id is not None:
+            STORAGE_ROOT = os.getenv("STORAGE_ROOT", "/tmp")
             batch_dir = os.path.join(STORAGE_ROOT, "offers", batch_token)
             os.makedirs(batch_dir, exist_ok=True)
-
             safe_name = _safe_filename(filename)
             abs_path = os.path.join(batch_dir, safe_name)
-            try:
-                with open(abs_path, "wb") as wf:
-                    wf.write(data)
-                print(f"[sidecar] saved {abs_path}")
-                
-                # insert offer_files row
-                with get_db_connection() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute("""
-                            INSERT INTO public.offer_files (org_id, created_by_user_id, batch_id, filename, mime_type, size_bytes, storage_path, insurer_code, is_permanent, product_line)
-                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,false,NULL)
-                            RETURNING id
-                        """, (org_id, user_id, batch_id, safe_name, f.content_type or "application/pdf", len(data), abs_path, insurers[idx-1] or None))
-                        _ = cur.fetchone()
-                        conn.commit()
-                print(f"[sidecar] offer_file row inserted for {safe_name}")
-            except Exception as e:
-                print(f"[sidecar] persist failed for {filename}: {e}")
+            with open(abs_path, "wb") as wf:
+                wf.write(data)
+            print("[sidecar] saved", abs_path)
+
+            # Insert offer_files row
+            with get_db_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO public.offer_files
+                        (org_id, created_by_user_id, batch_id, filename, mime_type, size_bytes, storage_path, insurer_code, is_permanent, product_line)
+                        VALUES
+                        (%s,%s,%s,%s,%s,%s,%s,%s,false,NULL)
+                    """, (org_id, user_id, batch_id, safe_name, f.content_type or "application/pdf", len(data), abs_path, insurers[idx-1] or None))
+                    conn.commit()
+            print("[sidecar] offer-file-inserted", safe_name)
+        else:
+            print("[sidecar] skip persist: no batch_id")
         # --- END NEW ---
         
         EXEC.submit(
@@ -739,6 +748,7 @@ async def extract_multiple_async(request: Request, background_tasks: BackgroundT
     # Add sidecar task if batch was created
     if batch_id and org_id:
         background_tasks.add_task(run_batch_ingest_sidecar, org_id, batch_id)
+        print("[sidecar] scheduled", batch_id)
     
     return {"job_id": job_id, "accepted": len(files), "documents": doc_ids}
 

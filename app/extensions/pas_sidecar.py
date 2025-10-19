@@ -40,7 +40,7 @@ def run_batch_ingest_sidecar(org_id: int, batch_id: int) -> None:
     This runs in background after v1 response is returned.
     All errors are caught and logged - never thrown to client.
     """
-    print(f"[sidecar] start org={org_id} batch_id={batch_id}")
+    print("[sidecar] start", org_id, batch_id)
     
     try:
         # Step a) Get batch token
@@ -57,12 +57,12 @@ def run_batch_ingest_sidecar(org_id: int, batch_id: int) -> None:
                     return
                 
                 batch_token = batch_row["token"]
-                print(f"[sidecar] token={batch_token}")
+                print("[sidecar] token", batch_token)
         
         # Step b) Ensure vector store
         try:
             vector_store_id = ensure_batch_vector_store(org_id, batch_token)
-            print(f"[sidecar] Vector store ready: {vector_store_id}")
+            print("[sidecar] vs-ready", vector_store_id)
         except Exception as e:
             print(f"[sidecar] Failed to ensure vector store: {e}")
             return
@@ -77,7 +77,7 @@ def run_batch_ingest_sidecar(org_id: int, batch_id: int) -> None:
                 """, (batch_id,))
                 files_to_process = cur.fetchall()
         
-        print(f"[sidecar] Found {len(files_to_process)} files to process")
+        print("[sidecar] files", len(files_to_process))
         
         # Step d) Process each file
         processed_count = 0
@@ -108,15 +108,15 @@ def run_batch_ingest_sidecar(org_id: int, batch_id: int) -> None:
                         """, (vector_store_id, retrieval_file_id, file_id))
                         conn.commit()
                 
-                print(f"[sidecar] Success file {file_id}: retrieval_file_id={retrieval_file_id}")
+                print("[sidecar] file-ok", file_id, retrieval_file_id)
                 processed_count += 1
                 
             except Exception as e:
-                print(f"[sidecar] Failed file {file_id} ({filename}): {e}")
+                print("[sidecar] file-fail", file_id, e)
                 # Continue processing other files
                 continue
         
-        print(f"[sidecar] Completed batch {batch_id} - processed {processed_count}/{len(files_to_process)} files")
+        print("[sidecar] done", batch_id)
         
     except Exception as e:
         print(f"[sidecar] Fatal error for batch {batch_id}: {e}")
