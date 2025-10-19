@@ -3,7 +3,7 @@ from pydantic import BaseModel
 from typing import List, Optional
 from hashlib import sha256
 from datetime import datetime
-import os, json, psycopg2
+import os, json, psycopg2, traceback
 from psycopg2.extras import RealDictCursor
 from openai import OpenAI
 
@@ -40,15 +40,20 @@ def ensure_vs(conn, org_id: int, product_line: str) -> str:
         return vs.id
 
 def push_file(vector_store_id: str, local_path: str, attributes: dict) -> str:
-    # Upload file to OpenAI, then attach with attributes for later filtering.
-    with open(local_path, "rb") as f:
-        up = client.files.create(file=f, purpose="assistants")
-    client.beta.vector_stores.files.create(
-        vector_store_id=vector_store_id,
-        file_id=up.id,
-        attributes=attributes  # searchable metadata for retrieval filters
-    )
-    return up.id
+    try:
+        with open(local_path, "rb") as f:
+            up = client.files.create(file=f, purpose="assistants")
+        # NOTE: if your SDK version doesn't support attributes yet, comment 'attributes=attributes'
+        client.beta.vector_stores.files.create(
+            vector_store_id=vector_store_id,
+            file_id=up.id,
+            # attributes=attributes  # comment this if unsupported in your SDK
+        )
+        return up.id
+    except Exception as e:
+        # log server-side and raise a 502 so you see the cause in the response
+        traceback.print_exc()
+        raise HTTPException(status_code=502, detail=f"Vector-store push failed: {e}")
 
 class TcItem(BaseModel):
     id: int
@@ -85,8 +90,18 @@ async def upload_tc(
             raise HTTPException(422, detail="Unknown insurer_code for this org")
 
     # Parse dates
-    def parse_dt(s): 
-        return datetime.fromisoformat(s).isoformat() if s else None
+    def parse_dt(s: str | None) -> str | None:
+        if not s:
+            return None
+        s = s.strip()
+        # normalize trailing Z to +00:00 for fromisoformat
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        # allow date-only
+        if len(s) == 10 and s.count("-") == 2:
+            s = s + "T00:00:00+00:00"
+        return datetime.fromisoformat(s).isoformat()
+    
     eff = parse_dt(effective_from)
     exp = parse_dt(expires_at)
 
