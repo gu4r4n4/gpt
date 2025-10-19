@@ -2,7 +2,7 @@ from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, Q
 from pydantic import BaseModel
 from typing import List, Optional
 from hashlib import sha256
-from datetime import datetime
+from datetime import datetime, timezone
 import os, json, psycopg2, traceback
 from psycopg2.extras import RealDictCursor
 from openai import OpenAI
@@ -94,13 +94,21 @@ async def upload_tc(
         if not s:
             return None
         s = s.strip()
-        # normalize trailing Z to +00:00 for fromisoformat
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        # allow date-only
-        if len(s) == 10 and s.count("-") == 2:
-            s = s + "T00:00:00+00:00"
-        return datetime.fromisoformat(s).isoformat()
+        try:
+            # Accept "YYYY-MM-DD" (date only) -> 00:00:00Z
+            if len(s) == 10 and s.count("-") == 2:
+                dt = datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                return dt.isoformat()
+            # Normalize trailing Z to +00:00 for fromisoformat
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s)
+            # If no tzinfo, assume UTC
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc).isoformat()
+        except Exception:
+            raise HTTPException(status_code=422, detail="Invalid date format. Use YYYY-MM-DD or full ISO-8601 (e.g. 2025-10-22T10:21:20Z).")
     
     eff = parse_dt(effective_from)
     exp = parse_dt(expires_at)
