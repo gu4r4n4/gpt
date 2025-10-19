@@ -30,6 +30,8 @@ from app.routes.ingest import router as ingest_router
 from backend.api.routes.offers_upload import router as offers_upload_router
 from backend.api.routes.batches import router as batches_router
 from backend.api.routes.qa import router as qa_router
+from app.routes.admin_insurers import router as admin_insurers_router
+from app.routes.admin_tc import router as admin_tc_router
 
 APP_NAME = "GPT Offer Extractor"
 APP_VERSION = "1.0.0"
@@ -48,6 +50,8 @@ app.include_router(ingest_router)
 app.include_router(offers_upload_router)  # File upload with vector store integration
 app.include_router(batches_router)  # Batch management endpoints
 app.include_router(qa_router)  # Q&A endpoints
+app.include_router(admin_insurers_router)  # Admin insurers management
+app.include_router(admin_tc_router)  # Admin terms & conditions management
 
 # -------------------------------
 # CORS (adjust for production)
