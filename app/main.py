@@ -37,6 +37,31 @@ from app.services.vector_batches import ensure_batch_vector_store, add_file_to_b
 APP_NAME = "GPT Offer Extractor"
 APP_VERSION = "1.0.0"
 
+# Request context resolver
+def _coalesce_int(*vals) -> Optional[int]:
+    for v in vals:
+        if v is None: continue
+        try:
+            iv = int(v)
+            if iv > 0: return iv
+        except: pass
+    return None
+
+async def resolve_request_context(
+    request: Request,
+    x_org_id: Optional[int] = Header(None, convert_underscores=False),
+    x_user_id: Optional[int] = Header(None, convert_underscores=False),
+    org_id_form: Optional[int] = None,
+    created_by_user_id_form: Optional[int] = None,
+) -> Tuple[int, int]:
+    st_org_id = getattr(request.state, "org_id", None)
+    st_user_id = getattr(request.state, "user_id", None)
+    org_id = _coalesce_int(st_org_id, x_org_id, org_id_form)
+    user_id = _coalesce_int(st_user_id, x_user_id, created_by_user_id_form)
+    if org_id is None or user_id is None:
+        raise HTTPException(status_code=400, detail="Missing org_id or user_id (X-Org-Id/X-User-Id headers or form fields).")
+    return org_id, user_id
+
 # Database helpers for batch integration
 def get_db_connection():
     import psycopg2
@@ -622,22 +647,25 @@ async def extract_multiple(request: Request):
 
 
 @app.post("/extract/multiple-async", status_code=202)
-async def extract_multiple_async(request: Request):
-    org_id, user_id = _ctx_ids(request)
-
-    parsed = await _parse_upload_form(request)
-    files: List[UploadFile] = parsed["files"]
-    insurers: List[str] = parsed["insurers"]
-    company: str = parsed["company"]
-    insured_count: int = parsed["insured_count"]
-    inquiry_id: str = parsed["inquiry_id"]
+async def extract_multiple_async(
+    request: Request,
+    files: List[UploadFile] = File(...),
+    insurers: List[str] = Form(...),
+    company: Optional[str] = Form(None),
+    insured_count: Optional[int] = Form(None),
+    inquiry_id: Optional[int] = Form(None),
+    # swagger/dev fallbacks
+    org_id_form: Optional[int] = Form(None),
+    created_by_user_id_form: Optional[int] = Form(None),
+):
+    org_id, user_id = await resolve_request_context(request, org_id_form=org_id_form, created_by_user_id_form=created_by_user_id_form)
 
     # Create batch for this extraction job
     batch_token, batch_id = create_offer_batch(org_id, user_id, title=f"PAS Upload - {company or 'Unknown'}")
     
     # Ensure vector store exists for this batch
     vector_store_id = ensure_batch_vector_store(org_id, batch_token)
-    
+
     job_id = str(uuid.uuid4())
     with _JOBS_LOCK:
         _jobs[job_id] = {"total": len(files), "done": 0, "errors": [], "docs": [], "timings": {}, "batch_token": batch_token, "vector_store_id": vector_store_id}
@@ -908,6 +936,71 @@ def job_status(job_id: str):
         if not job:
             raise HTTPException(status_code=404, detail="job not found")
         return job
+
+@app.get("/offers/by-job/{job_id}")
+def offers_by_job(job_id: str):
+    """Get grouped offers for a job by looking up the batch and associated files."""
+    with _JOBS_LOCK:
+        job = _jobs.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        
+        batch_token = job.get("batch_token")
+        if not batch_token:
+            raise HTTPException(status_code=404, detail="Job not found")
+    
+    # Get batch info and associated files
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            # Get batch info
+            cur.execute("""
+                SELECT id, org_id, created_by_user_id, title, status, created_at, expires_at
+                FROM public.offer_batches 
+                WHERE token = %s
+            """, (batch_token,))
+            batch_row = cur.fetchone()
+            if not batch_row:
+                raise HTTPException(status_code=404, detail="Batch not found")
+            
+            batch_id = batch_row[0]
+            
+            # Get files in this batch
+            cur.execute("""
+                SELECT id, filename, insurer_code, size_bytes, embeddings_ready, created_at
+                FROM public.offer_files 
+                WHERE batch_id = %s
+                ORDER BY created_at DESC
+            """, (batch_id,))
+            files = cur.fetchall()
+    
+    # Return grouped offers data (matching FE expectations)
+    grouped_offers = []
+    for file_row in files:
+        file_id, filename, insurer_code, size_bytes, embeddings_ready, created_at = file_row
+        
+        # Create a grouped offer entry
+        grouped_offer = {
+            "id": f"batch_{batch_id}_file_{file_id}",
+            "filename": filename,
+            "insurer": insurer_code or "Unknown",
+            "company_hint": insurer_code or "Unknown",
+            "program_code": "BATCH_UPLOAD",
+            "source": "batch_upload",
+            "status": "completed" if embeddings_ready else "processing",
+            "created_at": created_at.isoformat() if created_at else None,
+            "size_bytes": size_bytes,
+            "embeddings_ready": embeddings_ready,
+            "programs": []  # Could be populated from extraction results if needed
+        }
+        grouped_offers.append(grouped_offer)
+    
+    return {
+        "batch_token": batch_token,
+        "batch_id": batch_id,
+        "total_files": len(files),
+        "files_ready": sum(1 for f in files if f[4]),  # embeddings_ready count
+        "offers": grouped_offers
+    }
 
 # -------------------------------
 # Templates API (create/list/instantiate)
