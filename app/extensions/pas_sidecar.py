@@ -123,11 +123,11 @@ def run_batch_ingest_sidecar(org_id: int, batch_id: int) -> None:
         # Never throw - sidecar errors should not affect client
 
 
-def infer_batch_token_for_docs(document_ids: list[str]) -> str | None:
+def infer_batch_token_for_docs(document_ids: list[str], org_id: int | None = None) -> str | None:
     """
-    Infer batch token from document IDs.
-    This is a best-effort attempt to link shares to vector stores.
-    Returns None if not inferable.
+    Infer batch token from document IDs using robust filename matching.
+    For each doc_id, extracts filename and matches against offer_files.
+    Returns the most recent batch token or None if not found.
     """
     if not document_ids:
         return None
@@ -135,16 +135,53 @@ def infer_batch_token_for_docs(document_ids: list[str]) -> str | None:
     try:
         with get_db_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                # Try to find batch through offer_files -> offer_batches
-                # This assumes document_ids correspond to offer_files entries
+                # Build candidate filenames from document IDs
+                candidate_names = []
+                for doc_id in document_ids:
+                    # Extract filename from doc_id format: "prefix::idx::filename"
+                    parts = doc_id.split('::')
+                    if len(parts) >= 3:
+                        candidate_names.append(parts[2])
+                
+                # Also collect original_filename from offers table
+                if candidate_names:
+                    placeholders = ','.join(['%s'] * len(candidate_names))
+                    cur.execute(f"""
+                        SELECT DISTINCT raw_json->>'original_filename' as original_filename
+                        FROM public.offers
+                        WHERE filename IN ({placeholders}) 
+                        AND raw_json->>'original_filename' IS NOT NULL
+                    """, candidate_names)
+                    
+                    for row in cur.fetchall():
+                        if row['original_filename']:
+                            candidate_names.append(row['original_filename'])
+                
+                # Remove duplicates and nulls
+                candidate_names = list(set([name for name in candidate_names if name]))
+                
+                if not candidate_names:
+                    print(f"[sidecar] No candidate names found for document_ids={document_ids}")
+                    return None
+                
+                # Find batch by matching filenames
                 cur.execute("""
-                    SELECT DISTINCT ob.token
-                    FROM public.offer_files of
-                    JOIN public.offer_batches ob ON of.batch_id = ob.id
-                    WHERE of.filename = ANY(%s) OR of.id::text = ANY(%s)
-                    ORDER BY ob.created_at DESC
-                    LIMIT 1
-                """, (document_ids, document_ids))
+                    WITH names AS (
+                        SELECT unnest(%s::text[]) AS name
+                    ),
+                    ofs AS (
+                        SELECT of.batch_id
+                        FROM public.offer_files of
+                        JOIN names n ON n.name = of.filename
+                        WHERE (%s IS NULL OR of.org_id = %s)
+                        GROUP BY of.batch_id
+                        ORDER BY MAX(of.created_at) DESC
+                        LIMIT 1
+                    )
+                    SELECT ob.token
+                    FROM public.offer_batches ob
+                    JOIN ofs ON ofs.batch_id = ob.id
+                """, (candidate_names, org_id, org_id))
                 
                 row = cur.fetchone()
                 if row:

@@ -1142,11 +1142,15 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
         # never block share creation on derivation issues
         pass
 
+    # Get org_id for inference
+    org_id, user_id = _ctx_ids(request)
+    org_id, user_id = _ctx_or_defaults(org_id, user_id)
+    
     # Try to infer batch_token if not provided
     inferred_batch_token = body.batch_token
     if not inferred_batch_token and body.document_ids:
         try:
-            inferred_batch_token = infer_batch_token_for_docs(body.document_ids)
+            inferred_batch_token = infer_batch_token_for_docs(body.document_ids, org_id)
         except Exception as e:
             print(f"[shares] Failed to infer batch_token: {e}")
     
@@ -1175,6 +1179,7 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
         "payload": payload,
         "expires_at": expires_at,
         "view_prefs": body.view_prefs or {},  # stored in dedicated column too
+        "org_id": org_id,  # Set org_id for proper isolation
     }
 
     if _supabase:

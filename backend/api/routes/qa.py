@@ -212,14 +212,6 @@ def ask_share_qa(req: QAAskRequest, conn = Depends(get_db)):
         payload = share_record.get("payload", {})
         batch_token = payload.get("batch_token")
         
-        # Best-effort inference if batch_token missing
-        if not batch_token:
-            document_ids = payload.get("document_ids", [])
-            if document_ids:
-                batch_token = infer_batch_token_for_docs(document_ids)
-            if not batch_token:
-                raise HTTPException(status_code=404, detail="Batch token not found in share")
-        
         # Get org_id from share or use default
         org_id = share_record.get("org_id")
         if not org_id:
@@ -233,23 +225,33 @@ def ask_share_qa(req: QAAskRequest, conn = Depends(get_db)):
         if not org_id:
             raise HTTPException(status_code=404, detail="Organization not found")
         
+        # Try batch_token from share → if missing, run inference
+        if not batch_token:
+            document_ids = payload.get("document_ids", [])
+            if document_ids:
+                batch_token = infer_batch_token_for_docs(document_ids, org_id)
+        
         print(f"[qa] start share={req.share_token} org={org_id} batch={batch_token}")
         
-        # Get vector stores
-        batch_vs_id = get_offer_vs(conn, org_id, batch_token)
-        tc_vs_id = get_tc_vs(conn, org_id, "insurer_tc")
-        
-        if not batch_vs_id and not tc_vs_id:
-            raise HTTPException(status_code=404, detail="No vector stores available")
-        
-        print(f"[qa] stores batch={batch_vs_id or '-'} tnc={tc_vs_id or '-'}")
-        
-        # Prepare retrieval
+        # Build vector_store_ids list
         vector_store_ids = []
-        if batch_vs_id:
-            vector_store_ids.append(batch_vs_id)
+        
+        # Include batch store if found
+        if batch_token:
+            batch_vs_id = get_offer_vs(conn, org_id, batch_token)
+            if batch_vs_id:
+                vector_store_ids.append(batch_vs_id)
+        
+        # Include T&C store if exists
+        tc_vs_id = get_tc_vs(conn, org_id, "insurer_tc")
         if tc_vs_id:
             vector_store_ids.append(tc_vs_id)
+        
+        print(f"[qa] stores batch={batch_vs_id if batch_token else '-'} tnc={tc_vs_id or '-'}")
+        
+        # Check if any vector stores available
+        if not vector_store_ids:
+            raise HTTPException(status_code=404, detail="No vector stores available (no batch for this share and insurer T&C store not seeded)")
         
         # Create thread and run
         thread = client.beta.threads.create(messages=[{
@@ -316,3 +318,25 @@ def ask_share_qa(req: QAAskRequest, conn = Depends(get_db)):
     except Exception as e:
         print(f"[qa] error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.post("/seed-tc")
+def seed_tc(org_id: int = Query(...)):
+    """Admin endpoint to seed T&C vector store with canonical PDFs."""
+    try:
+        # Import the function
+        from app.services.vectorstores import ensure_tc_vector_store
+        
+        # Call the function
+        vector_store_id = ensure_tc_vector_store(org_id)
+        
+        return {
+            "ok": True,
+            "org_id": org_id,
+            "vector_store_id": vector_store_id,
+            "message": "T&C vector store seeded successfully"
+        }
+        
+    except Exception as e:
+        print(f"[qa] seed-tc error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to seed T&C vector store: {e}")
