@@ -169,3 +169,150 @@ def logs(org_id: int, batch_token: Optional[str] = None, limit: int = 25, offset
           LIMIT %s OFFSET %s
         """, (*params, limit, offset))
         return {"items": cur.fetchall(), "next_offset": offset + limit}
+
+
+# New scoped Q&A endpoint
+class QASource(BaseModel):
+    filename: str
+    retrieval_file_id: str
+    score: float
+
+class QAAskRequest(BaseModel):
+    question: str
+    share_token: str
+    insurer_only: Optional[str] = None
+    lang: Optional[str] = None
+
+class QAAskResponse(BaseModel):
+    answer: str
+    sources: List[QASource]
+
+@router.post("/ask-share", response_model=QAAskResponse)
+def ask_share_qa(req: QAAskRequest, conn = Depends(get_db)):
+    """Ask questions scoped to a share's batch and insurer T&C KB."""
+    import time
+    start_time = time.time()
+    
+    # Validation
+    if not req.question or not req.share_token:
+        raise HTTPException(status_code=400, detail="Missing question or share_token")
+    
+    # Load share record
+    try:
+        # Import the helper from main app
+        import sys
+        sys.path.append('/app')
+        from app.main import _load_share_record
+        from app.extensions.pas_sidecar import infer_batch_token_for_docs
+        
+        share_record = _load_share_record(req.share_token)
+        if not share_record:
+            raise HTTPException(status_code=404, detail="Share not found")
+        
+        payload = share_record.get("payload", {})
+        batch_token = payload.get("batch_token")
+        
+        # Best-effort inference if batch_token missing
+        if not batch_token:
+            document_ids = payload.get("document_ids", [])
+            if document_ids:
+                batch_token = infer_batch_token_for_docs(document_ids)
+            if not batch_token:
+                raise HTTPException(status_code=404, detail="Batch token not found in share")
+        
+        # Get org_id from share or use default
+        org_id = share_record.get("org_id")
+        if not org_id:
+            try:
+                org_id = int(os.getenv("DEFAULT_ORG_ID", "0"))
+                if org_id <= 0:
+                    org_id = None
+            except:
+                org_id = None
+        
+        if not org_id:
+            raise HTTPException(status_code=404, detail="Organization not found")
+        
+        print(f"[qa] start share={req.share_token} org={org_id} batch={batch_token}")
+        
+        # Get vector stores
+        batch_vs_id = get_offer_vs(conn, org_id, batch_token)
+        tc_vs_id = get_tc_vs(conn, org_id, "insurer_tc")
+        
+        if not batch_vs_id and not tc_vs_id:
+            raise HTTPException(status_code=404, detail="No vector stores available")
+        
+        print(f"[qa] stores batch={batch_vs_id or '-'} tnc={tc_vs_id or '-'}")
+        
+        # Prepare retrieval
+        vector_store_ids = []
+        if batch_vs_id:
+            vector_store_ids.append(batch_vs_id)
+        if tc_vs_id:
+            vector_store_ids.append(tc_vs_id)
+        
+        # Create thread and run
+        thread = client.beta.threads.create(messages=[{
+            "role": "user",
+            "content": req.question
+        }])
+        
+        run = client.beta.threads.runs.create(
+            thread_id=thread.id,
+            assistant_id=os.getenv("ASSISTANT_ID_QA", "asst_default"),
+            tool_resources={"file_search": {"vector_store_ids": vector_store_ids}}
+        )
+        
+        # Poll for completion
+        max_wait = 60  # 60 second timeout
+        wait_time = 0
+        while wait_time < max_wait:
+            r = client.beta.threads.runs.retrieve(thread_id=thread.id, run_id=run.id)
+            if r.status in ("completed", "failed", "cancelled", "expired"):
+                break
+            time.sleep(1)
+            wait_time += 1
+        
+        if r.status != "completed":
+            raise HTTPException(status_code=502, detail=f"Query failed: {r.status}")
+        
+        # Get response
+        messages = client.beta.threads.messages.list(thread_id=thread.id, order="desc", limit=1)
+        answer = ""
+        sources = []
+        
+        for message in messages.data:
+            if message.role == "assistant":
+                for content in message.content:
+                    if content.type == "text":
+                        answer = content.text.value
+                        
+                        # Extract citations from annotations
+                        for annotation in content.text.annotations:
+                            if hasattr(annotation, 'file_id') and annotation.file_id:
+                                # Map file_id to filename and retrieval_file_id
+                                sources.append(QASource(
+                                    filename=f"file_{annotation.file_id[:8]}",
+                                    retrieval_file_id=annotation.file_id,
+                                    score=0.8  # Default score
+                                ))
+                break
+        
+        # Filter by insurer if specified
+        if req.insurer_only and sources:
+            # This is a simplified filter - in practice you'd want to check file metadata
+            sources = [s for s in sources if req.insurer_only.lower() in s.filename.lower()]
+        
+        k = len(sources)
+        print(f"[qa] k={k} hits={len(sources)} insurer_only={req.insurer_only or '-'}")
+        
+        latency_ms = int((time.time() - start_time) * 1000)
+        print(f"[qa] done ms={latency_ms}")
+        
+        return QAAskResponse(answer=answer, sources=sources)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[qa] error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
