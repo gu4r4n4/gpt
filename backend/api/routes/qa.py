@@ -269,11 +269,47 @@ def ask_share_qa(req: QAAskRequest, conn = Depends(get_db)):
                 "content": req.question
             }])
             
-            run = client.beta.threads.runs.create(
-                thread_id=thread.id,
-                assistant_id=assistant_id,
-                tool_resources={"file_search": {"vector_store_ids": vector_store_ids}}
-            )
+            # --- begin compatibility wrapper ---
+            use_tool_resources = True
+            try:
+                # Newer SDK path (Assistants v2): pass tool_resources at run-time
+                run = client.beta.threads.runs.create(
+                    thread_id=thread.id,
+                    assistant_id=assistant_id,
+                    tool_resources={"file_search": {"vector_store_ids": vector_store_ids}},
+                )
+                print(f"[qa] run-create using tool_resources ok")
+            except TypeError as e:
+                # Older SDK fallback: bind vector stores on an assistant and run without tool_resources
+                print(f"[qa] run-create TypeError; falling back to assistant-level tool_resources: {e}")
+                use_tool_resources = False
+
+            if not use_tool_resources:
+                # Create a short-lived, per-request assistant so we don't mutate the global one
+                tmp_asst = client.beta.assistants.create(
+                    name="Offer QA (tmp)",
+                    model=os.getenv("ASSISTANT_MODEL", "gpt-4.1-mini"),
+                    tools=[{"type": "file_search"}],
+                    tool_resources={"file_search": {"vector_store_ids": vector_store_ids}},
+                    instructions=os.getenv(
+                        "ASSISTANT_QA_INSTRUCTIONS",
+                        "You are a broker assistant. Answer only from the provided files (uploaded offers for the share and the organization T&C store). When unsure, say so. Be concise."
+                    ),
+                )
+                try:
+                    run = client.beta.threads.runs.create(
+                        thread_id=thread.id,
+                        assistant_id=tmp_asst.id,
+                    )
+                    print(f"[qa] run-create with tmp assistant ok id={tmp_asst.id}")
+                finally:
+                    try:
+                        # best-effort cleanup; if it fails, it's still harmless
+                        client.beta.assistants.delete(tmp_asst.id)
+                        print(f"[qa] tmp assistant deleted id={tmp_asst.id}")
+                    except Exception as del_err:
+                        print(f"[qa] tmp assistant delete failed: {del_err}")
+            # --- end compatibility wrapper ---
             
             # Poll for completion
             max_wait = 60  # 60 second timeout
