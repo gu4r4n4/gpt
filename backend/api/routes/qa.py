@@ -231,12 +231,13 @@ def ask_share_qa(req: QAAskRequest, conn = Depends(get_db)):
             if document_ids:
                 batch_token = infer_batch_token_for_docs(document_ids, org_id)
         
-        print(f"[qa] start share={req.share_token} org={org_id} batch={batch_token}")
+        print(f"[qa] start share={req.share_token} org={org_id} batch={batch_token or '-'}")
         
         # Build vector_store_ids list
         vector_store_ids = []
         
         # Include batch store if found
+        batch_vs_id = None
         if batch_token:
             batch_vs_id = get_offer_vs(conn, org_id, batch_token)
             if batch_vs_id:
@@ -247,71 +248,81 @@ def ask_share_qa(req: QAAskRequest, conn = Depends(get_db)):
         if tc_vs_id:
             vector_store_ids.append(tc_vs_id)
         
-        print(f"[qa] stores batch={batch_vs_id if batch_token else '-'} tnc={tc_vs_id or '-'}")
+        print(f"[qa] stores batch={batch_vs_id or '-'} tnc={tc_vs_id or '-'}")
         
-        # Check if any vector stores available
+        # Assert preconditions
         if not vector_store_ids:
             raise HTTPException(status_code=404, detail="No vector stores available (no batch for this share and insurer T&C store not seeded)")
         
-        # Create thread and run
-        thread = client.beta.threads.create(messages=[{
-            "role": "user",
-            "content": req.question
-        }])
+        if not os.getenv("OPENAI_API_KEY"):
+            raise HTTPException(status_code=500, detail="OPENAI_API_KEY not configured")
         
-        run = client.beta.threads.runs.create(
-            thread_id=thread.id,
-            assistant_id=os.getenv("ASSISTANT_ID_QA", "asst_default"),
-            tool_resources={"file_search": {"vector_store_ids": vector_store_ids}}
-        )
+        assistant_id = os.getenv("ASSISTANT_ID_QA")
+        if not assistant_id:
+            raise HTTPException(status_code=500, detail="ASSISTANT_ID_QA not configured")
         
-        # Poll for completion
-        max_wait = 60  # 60 second timeout
-        wait_time = 0
-        while wait_time < max_wait:
-            r = client.beta.threads.runs.retrieve(thread_id=thread.id, run_id=run.id)
-            if r.status in ("completed", "failed", "cancelled", "expired"):
-                break
-            time.sleep(1)
-            wait_time += 1
-        
-        if r.status != "completed":
-            raise HTTPException(status_code=502, detail=f"Query failed: {r.status}")
-        
-        # Get response
-        messages = client.beta.threads.messages.list(thread_id=thread.id, order="desc", limit=1)
-        answer = ""
-        sources = []
-        
-        for message in messages.data:
-            if message.role == "assistant":
-                for content in message.content:
-                    if content.type == "text":
-                        answer = content.text.value
-                        
-                        # Extract citations from annotations
-                        for annotation in content.text.annotations:
-                            if hasattr(annotation, 'file_id') and annotation.file_id:
-                                # Map file_id to filename and retrieval_file_id
-                                sources.append(QASource(
-                                    filename=f"file_{annotation.file_id[:8]}",
-                                    retrieval_file_id=annotation.file_id,
-                                    score=0.8  # Default score
-                                ))
-                break
-        
-        # Filter by insurer if specified
-        if req.insurer_only and sources:
-            # This is a simplified filter - in practice you'd want to check file metadata
-            sources = [s for s in sources if req.insurer_only.lower() in s.filename.lower()]
-        
-        k = len(sources)
-        print(f"[qa] k={k} hits={len(sources)} insurer_only={req.insurer_only or '-'}")
-        
-        latency_ms = int((time.time() - start_time) * 1000)
-        print(f"[qa] done ms={latency_ms}")
-        
-        return QAAskResponse(answer=answer, sources=sources)
+        # Wrap OpenAI calls in try/except
+        try:
+            # Create thread and run
+            thread = client.beta.threads.create(messages=[{
+                "role": "user",
+                "content": req.question
+            }])
+            
+            run = client.beta.threads.runs.create(
+                thread_id=thread.id,
+                assistant_id=assistant_id,
+                tool_resources={"file_search": {"vector_store_ids": vector_store_ids}}
+            )
+            
+            # Poll for completion
+            max_wait = 60  # 60 second timeout
+            wait_time = 0
+            while wait_time < max_wait:
+                r = client.beta.threads.runs.retrieve(thread_id=thread.id, run_id=run.id)
+                if r.status in ("completed", "failed", "cancelled", "expired"):
+                    break
+                time.sleep(1)
+                wait_time += 1
+            
+            if r.status != "completed":
+                raise HTTPException(status_code=502, detail=f"Query failed: {r.status}")
+            
+            # Get response
+            messages = client.beta.threads.messages.list(thread_id=thread.id, order="desc", limit=1)
+            answer = ""
+            sources = []
+            
+            for message in messages.data:
+                if message.role == "assistant":
+                    for content in message.content:
+                        if content.type == "text":
+                            answer = content.text.value
+                            
+                            # Extract citations from annotations
+                            for annotation in content.text.annotations:
+                                if hasattr(annotation, 'file_id') and annotation.file_id:
+                                    # Map file_id to filename and retrieval_file_id
+                                    sources.append(QASource(
+                                        filename=f"file_{annotation.file_id[:8]}",
+                                        retrieval_file_id=annotation.file_id,
+                                        score=0.8  # Default score
+                                    ))
+                    break
+            
+            # Filter by insurer if specified
+            if req.insurer_only and sources:
+                # This is a simplified filter - in practice you'd want to check file metadata
+                sources = [s for s in sources if req.insurer_only.lower() in s.filename.lower()]
+            
+            latency_ms = int((time.time() - start_time) * 1000)
+            print(f"[qa] done ms={latency_ms}")
+            
+            return QAAskResponse(answer=answer, sources=sources)
+            
+        except Exception as e:
+            print(f"[qa] oai-error type={type(e).__name__} msg={e}")
+            raise HTTPException(status_code=502, detail=f"OpenAI error: {e}")
         
     except HTTPException:
         raise
