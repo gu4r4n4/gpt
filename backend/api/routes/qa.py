@@ -6,6 +6,7 @@ from psycopg2.extras import RealDictCursor
 from openai import OpenAI
 from datetime import datetime
 from app.services.vectorstores import get_tc_vs, get_offer_vs
+from pypdf import PdfReader
 
 # Compat: pydantic v1 uses @validator, v2 uses @field_validator
 try:
@@ -604,3 +605,241 @@ def get_chunks_report(
             status_code=500, 
             detail=f"Failed to retrieve chunks report: {str(e)}"
         )
+
+
+# ============================================================================
+# Re-embedding functionality
+# ============================================================================
+
+def _extract_text_from_pdf(pdf_path: str) -> str:
+    """Extract text from PDF file."""
+    try:
+        reader = PdfReader(pdf_path)
+        pages = []
+        for page in reader.pages:
+            text = page.extract_text()
+            if text:
+                pages.append(text)
+        return "\n\n".join(pages)
+    except Exception as e:
+        raise Exception(f"Failed to extract text from PDF: {e}")
+
+
+def _chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> List[dict]:
+    """
+    Split text into overlapping chunks.
+    
+    Args:
+        text: Text to chunk
+        chunk_size: Target size of each chunk in characters
+        overlap: Number of characters to overlap between chunks
+    
+    Returns:
+        List of dicts with 'text' and 'metadata' keys
+    """
+    if not text or not text.strip():
+        return []
+    
+    chunks = []
+    start = 0
+    chunk_index = 0
+    
+    while start < len(text):
+        # Calculate end position
+        end = start + chunk_size
+        
+        # If this is not the last chunk, try to break at a sentence or paragraph
+        if end < len(text):
+            # Look for paragraph break first
+            paragraph_break = text.rfind("\n\n", start, end)
+            if paragraph_break > start + chunk_size // 2:
+                end = paragraph_break + 2
+            else:
+                # Look for sentence break
+                sentence_break = max(
+                    text.rfind(". ", start, end),
+                    text.rfind("! ", start, end),
+                    text.rfind("? ", start, end)
+                )
+                if sentence_break > start + chunk_size // 2:
+                    end = sentence_break + 2
+        
+        chunk_text = text[start:end].strip()
+        
+        if chunk_text:
+            chunks.append({
+                "text": chunk_text,
+                "metadata": {
+                    "chunk_index": chunk_index,
+                    "start_pos": start,
+                    "end_pos": end,
+                    "length": len(chunk_text)
+                }
+            })
+            chunk_index += 1
+        
+        # Move start position (with overlap)
+        start = end - overlap if end < len(text) else len(text)
+    
+    return chunks
+
+
+def _reembed_file(file_id: int, conn) -> dict:
+    """
+    Re-embed a file by extracting text, chunking, and storing in offer_chunks.
+    
+    Args:
+        file_id: ID of the file in offer_files table
+        conn: Database connection
+    
+    Returns:
+        Dict with status and details
+    """
+    print(f"[embedding] start file_id={file_id}")
+    
+    try:
+        # Step 1: Load file record
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, filename, storage_path, mime_type, org_id, batch_id
+                FROM public.offer_files
+                WHERE id = %s
+            """, (file_id,))
+            file_record = cur.fetchone()
+        
+        if not file_record:
+            raise HTTPException(status_code=404, detail=f"File ID {file_id} not found")
+        
+        storage_path = file_record.get("storage_path")
+        filename = file_record.get("filename", "unknown.pdf")
+        
+        print(f"[embedding] file={filename} path={storage_path}")
+        
+        if not storage_path:
+            raise Exception("storage_path is blank")
+        
+        if not os.path.exists(storage_path):
+            raise Exception(f"File not found at path: {storage_path}")
+        
+        # Step 2: Extract text from PDF
+        print(f"[embedding] extracting text from {storage_path}")
+        text = _extract_text_from_pdf(storage_path)
+        
+        if not text or len(text.strip()) < 10:
+            raise Exception("Extracted text is empty or too short")
+        
+        print(f"[embedding] extracted {len(text)} characters")
+        
+        # Step 3: Split into chunks
+        print(f"[embedding] chunking text")
+        chunks = _chunk_text(text, chunk_size=1000, overlap=200)
+        
+        if not chunks:
+            raise Exception("No chunks created from text")
+        
+        print(f"[embedding] created {len(chunks)} chunks")
+        
+        # Step 4: Delete existing chunks for this file
+        with conn.cursor() as cur:
+            cur.execute("""
+                DELETE FROM public.offer_chunks
+                WHERE file_id = %s
+            """, (file_id,))
+            deleted_count = cur.rowcount
+            print(f"[embedding] deleted {deleted_count} existing chunks")
+        
+        # Step 5: Insert new chunks
+        inserted_count = 0
+        with conn.cursor() as cur:
+            for idx, chunk in enumerate(chunks):
+                cur.execute("""
+                    INSERT INTO public.offer_chunks
+                    (file_id, chunk_index, text, metadata)
+                    VALUES (%s, %s, %s, %s)
+                """, (
+                    file_id,
+                    idx,
+                    chunk["text"],
+                    json.dumps(chunk["metadata"])
+                ))
+                inserted_count += 1
+        
+        conn.commit()
+        print(f"[embedding] inserted {inserted_count} chunks")
+        
+        # Step 6: Set embeddings_ready = true only if chunks were stored
+        embeddings_ready = inserted_count > 0
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE public.offer_files
+                SET embeddings_ready = %s
+                WHERE id = %s
+            """, (embeddings_ready, file_id))
+            conn.commit()
+        
+        print(f"[embedding] done file_id={file_id} chunks={inserted_count} ready={embeddings_ready}")
+        
+        return {
+            "ok": True,
+            "file_id": file_id,
+            "filename": filename,
+            "text_length": len(text),
+            "chunks_created": inserted_count,
+            "chunks_deleted": deleted_count,
+            "embeddings_ready": embeddings_ready
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[embedding] error file_id={file_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        # Set embeddings_ready = false on error
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE public.offer_files
+                    SET embeddings_ready = false
+                    WHERE id = %s
+                """, (file_id,))
+                conn.commit()
+        except:
+            pass
+        
+        raise HTTPException(
+            status_code=500,
+            detail=f"Re-embedding failed: {str(e)}"
+        )
+
+
+@router.post("/reembed-file")
+def reembed_file(
+    file_id: int = Query(..., description="ID of the file to re-embed"),
+    x_user_role: Optional[str] = Header(None, alias="X-User-Role"),
+    conn = Depends(get_db)
+):
+    """
+    Admin endpoint to manually re-embed a file.
+    
+    This endpoint:
+    1. Loads the file record from offer_files
+    2. Extracts text from the PDF at storage_path
+    3. Splits text into chunks (~1000 chars with 200 char overlap)
+    4. Deletes existing chunks for this file
+    5. Inserts new chunks into offer_chunks
+    6. Sets embeddings_ready = true if at least 1 chunk stored
+    
+    Protected: Only accessible to admin users.
+    """
+    print(f"[embedding] reembed-file request file_id={file_id}")
+    
+    # Check authorization - only admins
+    if not x_user_role or x_user_role.lower() != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail="Unauthorized: only admin users can re-embed files"
+        )
+    
+    return _reembed_file(file_id, conn)
