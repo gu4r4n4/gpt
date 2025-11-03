@@ -457,3 +457,5 @@ export DATABASE_URL="postgresql://..."
 - `backend/scripts/create_offer_chunks_table.sql` - Database schema
 - `/api/qa/chunks-report` - View created chunks
 
+
+

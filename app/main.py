@@ -1367,6 +1367,36 @@ def update_share_token_only(token: str, body: ShareUpdateBody, request: Request)
 def post_update_share_token_only(token: str, body: ShareUpdateBody, request: Request):
     return update_share_token_only(token, body, request)
 
+@app.get("/shares/{token}/qa")
+async def list_share_qa_public(token: str, limit: int = 200, offset: int = 0):
+    """List Q&A logs for a share token (public endpoint)."""
+    if not _supabase:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    q = (
+        _supabase.table("offer_qa_logs")
+        .select("created_at,question,answer,asked_by_user_id,meta")
+        .eq("share_token", token)
+        .order("created_at", desc=False)
+        .range(offset, offset + max(limit, 1) - 1)
+        .execute()
+    )
+    if getattr(q, "error", None):
+        raise HTTPException(status_code=400, detail=str(q.error))
+
+    items = []
+    for r in q.data or []:
+        actor = "broker" if r.get("asked_by_user_id") else "client"
+        m = r.get("meta") or {}
+        m["actor"] = m.get("actor", actor)
+        items.append({
+            "created_at": r["created_at"],
+            "question": r["question"],
+            "answer": r["answer"],
+            "meta": m,
+        })
+    return {"items": items}
+
 # -------------------------------
 # Debug helpers
 # -------------------------------

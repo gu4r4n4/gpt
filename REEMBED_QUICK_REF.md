@@ -120,3 +120,5 @@ python backend/scripts/reembed_file.py --file-id 46
 psql $DATABASE_URL -c "SELECT COUNT(*) FROM offer_chunks WHERE file_id=46"
 ```
 
+
+
