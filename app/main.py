@@ -1004,6 +1004,31 @@ def _ensure_share_editable(share_token: Optional[str]) -> None:
     if not bool(payload.get("editable")):
         raise HTTPException(status_code=403, detail="Share is read-only")
 
+
+def _bump_share_edit(token: Optional[str]) -> None:
+    """Increment edit_count and update last_edited_at for a share token (best-effort).
+
+    This is a small helper intended to be called after edits/deletes that originate
+    from a share link so the share's edit statistics stay in sync.
+    """
+    if not token:
+        return
+    try:
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE share_links
+                    SET edit_count = COALESCE(edit_count, 0) + 1,
+                        last_edited_at = now()
+                    WHERE token = %s
+                """, (token,))
+                conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[warn] bump share edit failed for token {token}: {e}")
+
 @app.delete("/offers/{offer_id}")
 def delete_offer(offer_id: int, x_share_token: Optional[str] = Header(default=None, alias="X-Share-Token")):
     _ensure_share_editable(x_share_token)
@@ -1012,6 +1037,10 @@ def delete_offer(offer_id: int, x_share_token: Optional[str] = Header(default=No
         raise HTTPException(status_code=503, detail="DB not configured")
     try:
         _supabase.table(_OFFERS_TABLE).delete().eq("id", offer_id).execute()
+
+        # 👇 NEW: bump share edit stats for deletions initiated from share page
+        _bump_share_edit(x_share_token)
+
         for doc_id, ids in list(_INSERTED_IDS.items()):
             _INSERTED_IDS[doc_id] = [i for i in ids if i != offer_id]
         return {"ok": True, "deleted": offer_id}
@@ -1067,6 +1096,9 @@ def update_offer(
         rows = sel.data or []
         if not rows:
             raise HTTPException(status_code=404, detail="offer not found")
+        # 👇 NEW: bump share edit stats if this edit came from a share page
+        _bump_share_edit(x_share_token)
+
         return {"ok": True, "offer": rows[0]}
     except HTTPException:
         raise
