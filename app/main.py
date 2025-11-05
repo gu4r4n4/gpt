@@ -1319,7 +1319,8 @@ class ShareUpdateBody(BaseModel):
     company_name: Optional[str] = None
     employees_count: Optional[int] = Field(None, ge=0)
     view_prefs: Optional[Dict[str, Any]] = None
-    title: Optional[str] = None  # optional
+    title: Optional[str] = None
+    broker_profile: Optional[Dict[str, Any]] = None
 
 def _share_is_editable(rec: Dict[str, Any], *, field: Optional[str] = None) -> None:
     payload = (rec or {}).get("payload") or {}
@@ -1342,6 +1343,7 @@ def update_share_token_only(token: str, body: ShareUpdateBody, request: Request)
     payload = rec.get("payload") or {}
     changed = False
 
+    # Apply known edits into payload/view_prefs
     if body.company_name is not None:
         _share_is_editable(rec, field="company_name")
         payload["company_name"] = body.company_name
@@ -1363,16 +1365,19 @@ def update_share_token_only(token: str, body: ShareUpdateBody, request: Request)
         payload["title"] = body.title
         changed = True
 
-    if not changed:
-        raise HTTPException(status_code=400, detail="no changes provided")
+    # NEW: allow broker_profile to be stored inside payload
+    if body.broker_profile is not None:
+        # (optionally gate with _share_is_editable if you want)
+        payload["broker_profile"] = body.broker_profile
+        changed = True
 
-    # 🔢 increment edit_count and update last_edited_at atomically
+    # 🔢 Always increment edit_count and set last_edited_at — even if no fields changed.
     updated_stats = None
     try:
         conn = get_db_connection()
         try:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                # Update payload/view_prefs AND increment edit_count atomically
+                # 1) Always upsert payload + increment edits
                 cur.execute("""
                     UPDATE share_links
                     SET payload = %s,
@@ -1385,8 +1390,8 @@ def update_share_token_only(token: str, body: ShareUpdateBody, request: Request)
                 row = cur.fetchone()
                 if row:
                     updated_stats = dict(row)
-                
-                # Also update view_prefs column if provided
+
+                # 2) Keep dedicated view_prefs column in sync if provided
                 if body.view_prefs is not None:
                     cur.execute("""
                         UPDATE share_links
@@ -1399,7 +1404,7 @@ def update_share_token_only(token: str, body: ShareUpdateBody, request: Request)
             conn.close()
     except Exception as e:
         print(f"[warn] Failed to update share and increment edit_count for token {token}: {e}")
-        # Fall back to Supabase client if direct DB fails
+        # Fallback: write via Supabase client (will NOT increment edit_count here)
         if _supabase:
             try:
                 upd_fields: Dict[str, Any] = {"payload": payload}
@@ -1411,23 +1416,13 @@ def update_share_token_only(token: str, body: ShareUpdateBody, request: Request)
         else:
             raise HTTPException(status_code=500, detail=f"Share update failed: {e}")
 
-    # persist to DB if available (fallback if atomic update didn't work)
-    if _supabase and updated_stats is None:
-        try:
-            upd_fields: Dict[str, Any] = {"payload": payload}
-            if body.view_prefs is not None:
-                upd_fields["view_prefs"] = body.view_prefs
-            _supabase.table(_SHARE_TABLE).update(upd_fields).eq("token", token).execute()
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Share update failed: {e}")
-
     # hot cache update
     rec["payload"] = payload
     if body.view_prefs is not None:
         rec["view_prefs"] = body.view_prefs
     _SHARES_FALLBACK[token] = rec
 
-    # optional propagation to offers rows
+    # optional propagation to offers rows (unchanged)
     if (request.query_params.get("propagate_offers") or "").lower() in {"1", "true", "yes"}:
         try:
             doc_ids = (payload.get("document_ids") or [])
@@ -1439,7 +1434,6 @@ def update_share_token_only(token: str, body: ShareUpdateBody, request: Request)
                     upd["employee_count"] = int(body.employees_count)
                 if upd:
                     _supabase.table(_OFFERS_TABLE).update(upd).in_("filename", doc_ids).execute()
-            # keep in-memory fallback consistent
             for d in payload.get("document_ids") or []:
                 p = _LAST_RESULTS.get(d)
                 if p:
@@ -1450,7 +1444,7 @@ def update_share_token_only(token: str, body: ShareUpdateBody, request: Request)
         except Exception as e:
             print(f"[warn] offers propagation failed: {e}")
 
-    # return same shape FE already expects, with stats
+    # Response shape (with fresh stats)
     response_payload = {
         "company_name": payload.get("company_name"),
         "employees_count": payload.get("employees_count"),
@@ -1459,12 +1453,11 @@ def update_share_token_only(token: str, body: ShareUpdateBody, request: Request)
         "allow_edit_fields": payload.get("allow_edit_fields") or [],
         "view_prefs": rec.get("view_prefs") or payload.get("view_prefs") or {},
     }
-    
-    # Include stats in response
-    views_count = updated_stats.get("views_count", 0) if updated_stats else (rec.get("views_count") or 0)
-    edit_count = updated_stats.get("edit_count", 0) if updated_stats else (rec.get("edit_count") or 0)
-    last_viewed_at = updated_stats.get("last_viewed_at") if updated_stats else rec.get("last_viewed_at")
-    last_edited_at = updated_stats.get("last_edited_at") if updated_stats else rec.get("last_edited_at")
+
+    views_count = (updated_stats or rec).get("views_count", 0) or 0
+    edit_count = (updated_stats or rec).get("edit_count", 0) or 0
+    last_viewed_at = (updated_stats or rec).get("last_viewed_at")
+    last_edited_at = (updated_stats or rec).get("last_edited_at")
     
     return {
         "ok": True,
