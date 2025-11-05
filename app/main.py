@@ -1006,16 +1006,18 @@ def _ensure_share_editable(share_token: Optional[str]) -> None:
 
 
 def _bump_share_edit(token: Optional[str]) -> None:
-    """Increment edit_count and update last_edited_at for a share token (best-effort).
-
-    This is a small helper intended to be called after edits/deletes that originate
-    from a share link so the share's edit statistics stay in sync.
-    """
+    """Increment edit_count and update last_edited_at for a share token (Supabase-safe)."""
     if not token:
         return
     try:
-        conn = get_db_connection()
+        if _supabase:
+            _supabase.table(_SHARE_TABLE).update({
+                "last_edited_at": datetime.utcnow().isoformat() + "Z"
+            }).eq("token", token).execute()
+
+        # Manual SQL fallback (in case supabase-py doesn't support arithmetic updates)
         try:
+            conn = get_db_connection()
             with conn.cursor() as cur:
                 cur.execute("""
                     UPDATE share_links
@@ -1024,10 +1026,11 @@ def _bump_share_edit(token: Optional[str]) -> None:
                     WHERE token = %s
                 """, (token,))
                 conn.commit()
-        finally:
             conn.close()
+        except Exception as e:
+            print(f"[warn] local bump share edit failed (fallback) for token {token}: {e}")
     except Exception as e:
-        print(f"[warn] bump share edit failed for token {token}: {e}")
+        print(f"[warn] Supabase bump share edit failed for token {token}: {e}")
 
 @app.delete("/offers/{offer_id}")
 def delete_offer(offer_id: int, x_share_token: Optional[str] = Header(default=None, alias="X-Share-Token")):
