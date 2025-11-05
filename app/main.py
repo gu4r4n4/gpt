@@ -8,6 +8,7 @@ import uuid
 import secrets
 import threading
 import unicodedata
+import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Dict, Any, Tuple
@@ -22,6 +23,8 @@ try:
 except Exception:  # pragma: no cover
     create_client = None  # type: ignore
     Client = None  # type: ignore
+
+import psycopg2.extras
 
 from app.gpt_extractor import extract_offer_from_pdf_bytes, ExtractionError
 from app.routes.offers_by_documents import router as offers_by_documents_router
@@ -1216,6 +1219,36 @@ def get_share_token_only(token: str):
     if exp is not None and datetime.utcnow() > exp:
         raise HTTPException(status_code=404, detail="Share token expired")
 
+    # 🔢 increment total views (non-unique) atomically
+    updated_stats = None
+    try:
+        conn = get_db_connection()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("""
+                    UPDATE share_links
+                    SET views_count = COALESCE(views_count, 0) + 1,
+                        last_viewed_at = now()
+                    WHERE token = %s
+                    RETURNING views_count, edit_count, last_viewed_at, last_edited_at
+                """, (token,))
+                row = cur.fetchone()
+                if row:
+                    updated_stats = dict(row)
+                conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        # If DB update fails, continue with existing values (graceful degradation)
+        print(f"[warn] Failed to increment views_count for token {token}: {e}")
+        # Fall back to values from share record if available
+        updated_stats = {
+            "views_count": share.get("views_count", 0),
+            "edit_count": share.get("edit_count", 0),
+            "last_viewed_at": share.get("last_viewed_at"),
+            "last_edited_at": share.get("last_edited_at"),
+        }
+
     payload = share.get("payload") or {}
     mode = payload.get("mode") or "snapshot"
 
@@ -1253,11 +1286,28 @@ def get_share_token_only(token: str):
         "view_prefs": share.get("view_prefs") or payload.get("view_prefs") or {},
     }
 
+    # Include stats in multiple places for FE compatibility
+    views_count = updated_stats.get("views_count", 0) if updated_stats else 0
+    edit_count = updated_stats.get("edit_count", 0) if updated_stats else 0
+    last_viewed_at = updated_stats.get("last_viewed_at") if updated_stats else None
+    last_edited_at = updated_stats.get("last_edited_at") if updated_stats else None
+
     return {
         "ok": True,
         "token": token,
         "payload": response_payload,   # FE reads editable & view_prefs from here
         "offers": offers,
+        # 👇 include stats in multiple obvious places so FE can pick any
+        "views": views_count,
+        "edits": edit_count,
+        "stats": {
+            "views": views_count,
+            "edits": edit_count,
+            "last_viewed_at": last_viewed_at,
+            "last_edited_at": last_edited_at,
+        },
+        "last_viewed_at": last_viewed_at,
+        "last_edited_at": last_edited_at,
     }
 
 # ---------- update share header/meta (company/employees/view_prefs) ----------
@@ -1312,8 +1362,53 @@ def update_share_token_only(token: str, body: ShareUpdateBody, request: Request)
     if not changed:
         raise HTTPException(status_code=400, detail="no changes provided")
 
-    # persist to DB if available
-    if _supabase:
+    # 🔢 increment edit_count and update last_edited_at atomically
+    updated_stats = None
+    try:
+        conn = get_db_connection()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                # Update payload/view_prefs AND increment edit_count atomically
+                cur.execute("""
+                    UPDATE share_links
+                    SET payload = %s,
+                        payload_updated_at = now(),
+                        edit_count = COALESCE(edit_count, 0) + 1,
+                        last_edited_at = now()
+                    WHERE token = %s
+                    RETURNING views_count, edit_count, last_viewed_at, last_edited_at
+                """, (json.dumps(payload), token))
+                row = cur.fetchone()
+                if row:
+                    updated_stats = dict(row)
+                
+                # Also update view_prefs column if provided
+                if body.view_prefs is not None:
+                    cur.execute("""
+                        UPDATE share_links
+                        SET view_prefs = %s
+                        WHERE token = %s
+                    """, (json.dumps(body.view_prefs), token))
+                
+                conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[warn] Failed to update share and increment edit_count for token {token}: {e}")
+        # Fall back to Supabase client if direct DB fails
+        if _supabase:
+            try:
+                upd_fields: Dict[str, Any] = {"payload": payload}
+                if body.view_prefs is not None:
+                    upd_fields["view_prefs"] = body.view_prefs
+                _supabase.table(_SHARE_TABLE).update(upd_fields).eq("token", token).execute()
+            except Exception as e2:
+                raise HTTPException(status_code=500, detail=f"Share update failed: {e2}")
+        else:
+            raise HTTPException(status_code=500, detail=f"Share update failed: {e}")
+
+    # persist to DB if available (fallback if atomic update didn't work)
+    if _supabase and updated_stats is None:
         try:
             upd_fields: Dict[str, Any] = {"payload": payload}
             if body.view_prefs is not None:
@@ -1351,7 +1446,7 @@ def update_share_token_only(token: str, body: ShareUpdateBody, request: Request)
         except Exception as e:
             print(f"[warn] offers propagation failed: {e}")
 
-    # return same shape FE already expects
+    # return same shape FE already expects, with stats
     response_payload = {
         "company_name": payload.get("company_name"),
         "employees_count": payload.get("employees_count"),
@@ -1360,7 +1455,24 @@ def update_share_token_only(token: str, body: ShareUpdateBody, request: Request)
         "allow_edit_fields": payload.get("allow_edit_fields") or [],
         "view_prefs": rec.get("view_prefs") or payload.get("view_prefs") or {},
     }
-    return {"ok": True, "token": token, "payload": response_payload}
+    
+    # Include stats in response
+    views_count = updated_stats.get("views_count", 0) if updated_stats else (rec.get("views_count") or 0)
+    edit_count = updated_stats.get("edit_count", 0) if updated_stats else (rec.get("edit_count") or 0)
+    last_viewed_at = updated_stats.get("last_viewed_at") if updated_stats else rec.get("last_viewed_at")
+    last_edited_at = updated_stats.get("last_edited_at") if updated_stats else rec.get("last_edited_at")
+    
+    return {
+        "ok": True,
+        "token": token,
+        "payload": response_payload,
+        "stats": {
+            "views": views_count,
+            "edits": edit_count,
+            "last_viewed_at": last_viewed_at,
+            "last_edited_at": last_edited_at,
+        },
+    }
 
 # POST alias so FE fallback works
 @app.post("/shares/{token}")
