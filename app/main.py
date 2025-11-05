@@ -1208,8 +1208,10 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
 
 
 @app.get("/shares/{token}", name="get_share_token_only")
-def get_share_token_only(token: str):
-    """Return snapshot results or dynamic offers for a token (with optional insurer-only filtering)."""
+def get_share_token_only(token: str, request: Request):
+    """Return snapshot results or dynamic offers for a token.
+       View counting is **opt-in** via ?count=1 or header X-Count-View: 1.
+    """
     share = _load_share_record(token)
     if not share:
         raise HTTPException(status_code=404, detail="Share token not found")
@@ -1219,35 +1221,38 @@ def get_share_token_only(token: str):
     if exp is not None and datetime.utcnow() > exp:
         raise HTTPException(status_code=404, detail="Share token expired")
 
-    # 🔢 increment total views (non-unique) atomically
+    # ---- NEW: opt-in counting ----
+    qp_count = (request.query_params.get("count") or "").strip()
+    hdr_count = (request.headers.get("X-Count-View") or "").strip()
+    should_count_view = qp_count == "1" or hdr_count == "1"
+
     updated_stats = None
-    try:
-        conn = get_db_connection()
+    if should_count_view:
         try:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute("""
-                    UPDATE share_links
-                    SET views_count = COALESCE(views_count, 0) + 1,
-                        last_viewed_at = now()
-                    WHERE token = %s
-                    RETURNING views_count, edit_count, last_viewed_at, last_edited_at
-                """, (token,))
-                row = cur.fetchone()
-                if row:
-                    updated_stats = dict(row)
-                conn.commit()
-        finally:
-            conn.close()
-    except Exception as e:
-        # If DB update fails, continue with existing values (graceful degradation)
-        print(f"[warn] Failed to increment views_count for token {token}: {e}")
-        # Fall back to values from share record if available
-        updated_stats = {
-            "views_count": share.get("views_count", 0),
-            "edit_count": share.get("edit_count", 0),
-            "last_viewed_at": share.get("last_viewed_at"),
-            "last_edited_at": share.get("last_edited_at"),
-        }
+            conn = get_db_connection()
+            try:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute("""
+                        UPDATE share_links
+                        SET views_count = COALESCE(views_count, 0) + 1,
+                            last_viewed_at = now()
+                        WHERE token = %s
+                        RETURNING views_count, edit_count, last_viewed_at, last_edited_at
+                    """, (token,))
+                    row = cur.fetchone()
+                    if row:
+                        updated_stats = dict(row)
+                    conn.commit()
+            finally:
+                conn.close()
+        except Exception as e:
+            print(f"[warn] Failed to increment views_count for token {token}: {e}")
+            updated_stats = {
+                "views_count": share.get("views_count", 0),
+                "edit_count": share.get("edit_count", 0),
+                "last_viewed_at": share.get("last_viewed_at"),
+                "last_edited_at": share.get("last_edited_at"),
+            }
 
     payload = share.get("payload") or {}
     mode = payload.get("mode") or "snapshot"
@@ -1286,18 +1291,17 @@ def get_share_token_only(token: str):
         "view_prefs": share.get("view_prefs") or payload.get("view_prefs") or {},
     }
 
-    # Include stats in multiple places for FE compatibility
-    views_count = updated_stats.get("views_count", 0) if updated_stats else 0
-    edit_count = updated_stats.get("edit_count", 0) if updated_stats else 0
-    last_viewed_at = updated_stats.get("last_viewed_at") if updated_stats else None
-    last_edited_at = updated_stats.get("last_edited_at") if updated_stats else None
+    # stats for response (if we didn't count this time, fall back to stored values)
+    views_count = (updated_stats or share).get("views_count", 0)
+    edit_count = (updated_stats or share).get("edit_count", 0)
+    last_viewed_at = (updated_stats or share).get("last_viewed_at")
+    last_edited_at = (updated_stats or share).get("last_edited_at")
 
     return {
         "ok": True,
         "token": token,
         "payload": response_payload,   # FE reads editable & view_prefs from here
         "offers": offers,
-        # 👇 include stats in multiple obvious places so FE can pick any
         "views": views_count,
         "edits": edit_count,
         "stats": {

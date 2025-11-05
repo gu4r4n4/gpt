@@ -3,11 +3,14 @@
 ## ✅ What Was Implemented
 
 ### 1. View Counting (GET `/shares/{token}`)
-- ✅ Increments `views_count` atomically on each GET request
-- ✅ Updates `last_viewed_at` timestamp
+- ✅ **Opt-in counting**: Only increments `views_count` when explicitly requested via:
+  - Query parameter: `?count=1` OR
+  - Header: `X-Count-View: 1`
+- ✅ Updates `last_viewed_at` timestamp when counting is enabled
 - ✅ Returns stats in multiple formats for FE compatibility:
   - Top-level: `views`, `edits`, `last_viewed_at`, `last_edited_at`
   - Nested: `stats` object with all statistics
+- ✅ PAS tab enrichment, bots, and crawlers don't increment views (unless they opt-in)
 
 ### 2. Edit Counting (PATCH `/shares/{token}`)
 - ✅ Increments `edit_count` atomically when updating a share
@@ -58,14 +61,21 @@ ALTER TABLE public.share_links
 
 ### 2. Test the Implementation
 
-#### Test View Counting
+#### Test View Counting (Opt-in)
 ```bash
 # Get a share token first (or use an existing one)
 TOKEN="your_share_token_here"
 
-# Call GET endpoint twice - views should increment
+# Without opt-in - views should NOT increment
 curl -s http://localhost:8000/shares/$TOKEN | jq '{views:.views, stats:.stats}'
 curl -s http://localhost:8000/shares/$TOKEN | jq '{views:.views, stats:.stats}'
+
+# With query parameter - views SHOULD increment
+curl -s "http://localhost:8000/shares/$TOKEN?count=1" | jq '{views:.views, stats:.stats}'
+curl -s "http://localhost:8000/shares/$TOKEN?count=1" | jq '{views:.views, stats:.stats}'
+
+# With header - views SHOULD increment
+curl -s -H "X-Count-View: 1" http://localhost:8000/shares/$TOKEN | jq '{views:.views, stats:.stats}'
 ```
 
 #### Test Edit Counting
@@ -157,9 +167,12 @@ The implementation includes graceful degradation:
 ## 📝 Notes
 
 1. **Atomic Updates**: All increments use PostgreSQL's atomic `UPDATE ... RETURNING` to prevent race conditions
-2. **Total Views (Non-Unique)**: Every GET request increments the counter (as requested - not unique viewers)
-3. **Backward Compatible**: Existing API responses are unchanged, stats are additive
-4. **Migration File**: `backend/scripts/add_share_links_stats_columns.sql` contains the complete migration
+2. **Opt-in View Counting**: Views only increment when explicitly requested via `?count=1` or `X-Count-View: 1` header
+   - Prevents bots, crawlers, and PAS tab enrichment from inflating view counts
+   - Only intentional user views are counted
+3. **Automatic Edit Counting**: Edit counts increment automatically on every PATCH/POST to `/shares/{token}`
+4. **Backward Compatible**: Existing API responses are unchanged, stats are additive
+5. **Migration File**: `backend/scripts/add_share_links_stats_columns.sql` contains the complete migration
 
 ## 🐛 Troubleshooting
 
