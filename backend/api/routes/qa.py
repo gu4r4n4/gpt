@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, Header
 from pydantic import BaseModel, Field
-from typing import List, Optional
-import os, json, psycopg2
+from typing import List, Optional, Dict, Any
+import os, json, psycopg2, time
 from psycopg2.extras import RealDictCursor
 from openai import OpenAI
 from datetime import datetime
@@ -19,8 +19,10 @@ client = OpenAI()
 
 def get_db():
     conn = psycopg2.connect(os.getenv("DATABASE_URL"), cursor_factory=RealDictCursor)
-    try: yield conn
-    finally: conn.close()
+    try: 
+        yield conn
+    finally: 
+        conn.close()
 
 class RankedInsurer(BaseModel):
     insurer_code: str = Field(..., description="e.g. BALTA, BTA")
@@ -33,7 +35,6 @@ class RankedInsurer(BaseModel):
         if not v or len(v) < 1:
             raise ValueError("at least one source is required")
         return v
-
 
 class Top3Response(BaseModel):
     product_line: str
@@ -171,7 +172,6 @@ def logs(org_id: int, batch_token: Optional[str] = None, limit: int = 25, offset
         """, (*params, limit, offset))
         return {"items": cur.fetchall(), "next_offset": offset + limit}
 
-
 # New scoped Q&A endpoint
 class QASource(BaseModel):
     filename: str
@@ -188,10 +188,23 @@ class QAAskResponse(BaseModel):
     answer: str
     sources: List[QASource]
 
+def _count_vs_files(vector_store_id: str) -> int:
+    try:
+        page = client.beta.vector_stores.files.list(vector_store_id=vector_store_id, limit=100)
+        total = 0
+        while True:
+            total += len(page.data or [])
+            if not getattr(page, "has_more", False):
+                break
+            page = client.beta.vector_stores.files.list(vector_store_id=vector_store_id, limit=100, after=page.last_id)
+        return total
+    except Exception as e:
+        print(f"[qa] vs-count warn for {vector_store_id}: {e}")
+        return -1
+
 @router.post("/ask-share", response_model=QAAskResponse)
 def ask_share_qa(req: QAAskRequest, conn = Depends(get_db)):
     """Ask questions scoped to a share's batch and insurer T&C KB."""
-    import time
     start_time = time.time()
     
     # Validation
@@ -250,6 +263,18 @@ def ask_share_qa(req: QAAskRequest, conn = Depends(get_db)):
             vector_store_ids.append(tc_vs_id)
         
         print(f"[qa] stores batch={batch_vs_id or '-'} tnc={tc_vs_id or '-'}")
+        # Light audit: count files in each VS (helps confirm scanning vs. visibility)
+        try:
+            if batch_vs_id:
+                cnt = _count_vs_files(batch_vs_id)
+                if cnt >= 0:
+                    print(f"[qa] vs batch files={cnt}")
+            if tc_vs_id:
+                cnt = _count_vs_files(tc_vs_id)
+                if cnt >= 0:
+                    print(f"[qa] vs tnc files={cnt}")
+        except Exception as e:
+            print(f"[qa] vs-count warn: {e}")
         
         # Assert preconditions
         if not vector_store_ids:
@@ -367,7 +392,6 @@ def ask_share_qa(req: QAAskRequest, conn = Depends(get_db)):
         print(f"[qa] error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-
 @router.post("/seed-tc")
 def seed_tc(org_id: int = Query(...)):
     """Admin endpoint to seed T&C vector store with canonical PDFs."""
@@ -389,7 +413,6 @@ def seed_tc(org_id: int = Query(...)):
         print(f"[qa] seed-tc error: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to seed T&C vector store: {e}")
 
-
 # Models for chunks-report endpoint
 class ChunkData(BaseModel):
     chunk_index: int
@@ -399,7 +422,6 @@ class ChunkData(BaseModel):
     file_id: Optional[int] = None
     filename: Optional[str] = None
 
-
 class ChunksReportResponse(BaseModel):
     ok: bool = True
     share_token: str
@@ -407,7 +429,6 @@ class ChunksReportResponse(BaseModel):
     org_id: int
     total_chunks: int
     chunks: List[ChunkData]
-
 
 def _validate_share_token(share_token: str, conn) -> dict:
     """
@@ -450,7 +471,6 @@ def _validate_share_token(share_token: str, conn) -> dict:
         "payload": payload
     }
 
-
 def _check_authorization(share_record: dict, user_org_id: Optional[int], user_role: Optional[str]) -> None:
     """
     Check if user is authorized to access this share's chunks.
@@ -468,7 +488,6 @@ def _check_authorization(share_record: dict, user_org_id: Optional[int], user_ro
         status_code=403, 
         detail="Unauthorized: only admin or same organization can access chunks report"
     )
-
 
 @router.get("/chunks-report", response_model=ChunksReportResponse)
 def get_chunks_report(
@@ -514,6 +533,7 @@ def get_chunks_report(
         # Step 3: Query chunks from database
         # First, try to get file_ids from offer_files table based on batch
         file_ids = []
+        file_records: List[Dict[str, Any]] = []
         if batch_token:
             with conn.cursor() as cur:
                 cur.execute("""
@@ -606,6 +626,116 @@ def get_chunks_report(
             detail=f"Failed to retrieve chunks report: {str(e)}"
         )
 
+# ============================================================================
+# VISIBILITY AUDIT FOR SHARE (NEW ENDPOINT)
+# ============================================================================
+
+class AuditFile(BaseModel):
+    file_id: int
+    filename: str
+    storage_path: Optional[str]
+    embeddings_ready: Optional[bool] = None
+    retrieval_file_id: Optional[str] = None
+    chunk_count: int = 0
+    in_vector_stores: List[str] = []
+
+class AuditShareResponse(BaseModel):
+    ok: bool = True
+    org_id: int
+    share_token: str
+    batch_token: Optional[str] = None
+    vector_store_ids: List[str]
+    files: List[AuditFile]
+
+def _list_vs_file_ids(vs_id: str) -> set:
+    ids = set()
+    try:
+        page = client.beta.vector_stores.files.list(vector_store_id=vs_id, limit=100)
+        while True:
+            for f in page.data:
+                ids.add(f.id)
+            if not getattr(page, "has_more", False):
+                break
+            page = client.beta.vector_stores.files.list(vector_store_id=vs_id, limit=100, after=page.last_id)
+    except Exception as e:
+        print(f"[audit] list vs={vs_id} failed: {e}")
+    return ids
+
+@router.get("/audit-share", response_model=AuditShareResponse)
+def audit_share(share_token: str = Query(...), conn = Depends(get_db)):
+    """
+    Audit what the QA can see for a share:
+    - Files in DB (offer_files) tied to the share's batch/org
+    - Chunk counts in offer_chunks
+    - retrieval_file_id presence
+    - Actual attachment of those file IDs to the Vector Store(s) used by /ask-share
+    """
+    share = _validate_share_token(share_token, conn)
+    org_id = share["org_id"]
+    batch_token = share["batch_token"]
+
+    # Recreate the vector store set as used by /ask-share
+    vector_store_ids: List[str] = []
+    if batch_token:
+        b_vs = get_offer_vs(conn, org_id, batch_token)
+        if b_vs:
+            vector_store_ids.append(b_vs)
+    t_vs = get_tc_vs(conn, org_id, "insurer_tc")
+    if t_vs:
+        vector_store_ids.append(t_vs)
+    if not vector_store_ids:
+        raise HTTPException(status_code=404, detail="No vector stores available for this share")
+
+    # Build cache of vector store file ids
+    vs_file_sets = {vs_id: _list_vs_file_ids(vs_id) for vs_id in vector_store_ids}
+
+    # Collect files for this batch/org
+    files = []
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT of.id, of.filename, of.storage_path, of.embeddings_ready, of.retrieval_file_id
+            FROM public.offer_files of
+            JOIN public.offer_batches ob ON of.batch_id = ob.id
+            WHERE ob.token=%s AND ob.org_id=%s
+            ORDER BY of.id
+        """, (batch_token, org_id))
+        frows = cur.fetchall()
+
+    # Chunk counts
+    id_list = [r["id"] for r in frows] or [-1]
+    chunk_counts = {}
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT file_id, COUNT(*) AS cnt
+            FROM public.offer_chunks
+            WHERE file_id = ANY(%s)
+            GROUP BY file_id
+        """, (id_list,))
+        for r in cur.fetchall():
+            chunk_counts[r["file_id"]] = r["cnt"]
+
+    # Assemble audit rows
+    for r in frows:
+        rfid = r.get("retrieval_file_id")
+        attached_to = [vs for vs, s in vs_file_sets.items() if (rfid and rfid in s)]
+        files.append(AuditFile(
+            file_id=r["id"],
+            filename=r["filename"],
+            storage_path=r.get("storage_path"),
+            embeddings_ready=r.get("embeddings_ready"),
+            retrieval_file_id=rfid,
+            chunk_count=chunk_counts.get(r["id"], 0),
+            in_vector_stores=attached_to
+        ))
+
+    return AuditShareResponse(
+        ok=True,
+        org_id=org_id,
+        share_token=share_token,
+        batch_token=batch_token,
+        vector_store_ids=vector_store_ids,
+        files=files
+    )
 
 # ============================================================================
 # Re-embedding functionality
@@ -624,18 +754,9 @@ def _extract_text_from_pdf(pdf_path: str) -> str:
     except Exception as e:
         raise Exception(f"Failed to extract text from PDF: {e}")
 
-
 def _chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> List[dict]:
     """
     Split text into overlapping chunks.
-    
-    Args:
-        text: Text to chunk
-        chunk_size: Target size of each chunk in characters
-        overlap: Number of characters to overlap between chunks
-    
-    Returns:
-        List of dicts with 'text' and 'metadata' keys
     """
     if not text or not text.strip():
         return []
@@ -645,17 +766,13 @@ def _chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> List[d
     chunk_index = 0
     
     while start < len(text):
-        # Calculate end position
         end = start + chunk_size
         
-        # If this is not the last chunk, try to break at a sentence or paragraph
         if end < len(text):
-            # Look for paragraph break first
             paragraph_break = text.rfind("\n\n", start, end)
             if paragraph_break > start + chunk_size // 2:
                 end = paragraph_break + 2
             else:
-                # Look for sentence break
                 sentence_break = max(
                     text.rfind(". ", start, end),
                     text.rfind("! ", start, end),
@@ -678,22 +795,14 @@ def _chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> List[d
             })
             chunk_index += 1
         
-        # Move start position (with overlap)
         start = end - overlap if end < len(text) else len(text)
     
     return chunks
 
-
 def _reembed_file(file_id: int, conn) -> dict:
     """
     Re-embed a file by extracting text, chunking, and storing in offer_chunks.
-    
-    Args:
-        file_id: ID of the file in offer_files table
-        conn: Database connection
-    
-    Returns:
-        Dict with status and details
+    Also ensures the file is uploaded to OpenAI Files and attached to the batch Vector Store.
     """
     print(f"[embedding] start file_id={file_id}")
     
@@ -777,7 +886,47 @@ def _reembed_file(file_id: int, conn) -> dict:
             """, (embeddings_ready, file_id))
             conn.commit()
         
-        print(f"[embedding] done file_id={file_id} chunks={inserted_count} ready={embeddings_ready}")
+        # Step 7 (NEW): ensure the source PDF is uploaded & attached to the vector store used by /ask-share
+        retrieval_file_id = None
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT of.retrieval_file_id, ob.token AS batch_token, of.org_id
+                FROM public.offer_files of
+                JOIN public.offer_batches ob ON of.batch_id = ob.id
+                WHERE of.id = %s
+            """, (file_id,))
+            meta = cur.fetchone() or {}
+            retrieval_file_id = meta.get("retrieval_file_id")
+            org_id = meta.get("org_id")
+            batch_token = meta.get("batch_token")
+        
+        vs_id = None
+        if org_id and batch_token:
+            vs_id = get_offer_vs(conn, org_id, batch_token)
+        
+        # Upload original PDF if missing retrieval_file_id
+        if not retrieval_file_id:
+            try:
+                up = client.files.create(file=open(storage_path, "rb"), purpose="assistants")
+                retrieval_file_id = up.id
+                with conn.cursor() as cur:
+                    cur.execute("UPDATE public.offer_files SET retrieval_file_id=%s WHERE id=%s",
+                                (retrieval_file_id, file_id))
+                    conn.commit()
+                print(f"[embedding] uploaded to OpenAI files id={retrieval_file_id}")
+            except Exception as e:
+                print(f"[embedding] upload skipped/failed: {e}")
+        
+        # Attach to vector store if not already present
+        if retrieval_file_id and vs_id:
+            try:
+                client.beta.vector_stores.files.create(vector_store_id=vs_id, file_id=retrieval_file_id)
+                print(f"[embedding] attached file to vector_store={vs_id}")
+            except Exception as e:
+                # If already attached, OpenAI may signal conflict — safe to log and continue
+                print(f"[embedding] attach warn vs={vs_id}: {e}")
+        
+        print(f"[embedding] done file_id={file_id} chunks={inserted_count} ready={embeddings_ready} vs={vs_id or '-'}")
         
         return {
             "ok": True,
@@ -813,7 +962,6 @@ def _reembed_file(file_id: int, conn) -> dict:
             detail=f"Re-embedding failed: {str(e)}"
         )
 
-
 @router.post("/reembed-file")
 def reembed_file(
     file_id: int = Query(..., description="ID of the file to re-embed"),
@@ -822,15 +970,9 @@ def reembed_file(
 ):
     """
     Admin endpoint to manually re-embed a file.
-    
-    This endpoint:
-    1. Loads the file record from offer_files
-    2. Extracts text from the PDF at storage_path
-    3. Splits text into chunks (~1000 chars with 200 char overlap)
-    4. Deletes existing chunks for this file
-    5. Inserts new chunks into offer_chunks
-    6. Sets embeddings_ready = true if at least 1 chunk stored
-    
+    - Stores fresh chunks in DB
+    - Ensures PDF is uploaded to OpenAI Files (retrieval_file_id)
+    - Ensures it's attached to the correct batch Vector Store
     Protected: Only accessible to admin users.
     """
     print(f"[embedding] reembed-file request file_id={file_id}")

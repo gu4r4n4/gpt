@@ -1,3 +1,9 @@
+
+
+project.md
++75
+-1630
+
 # Backend Codebase Analysis Report: GPT Offer Extractor
 
 **Project**: Insurance Offer PDF Extraction & Analysis System  
@@ -8,6 +14,12 @@
 ---
 
 ## 📁 Project Structure
+- `backend/` – FastAPI backend focused on offer ingestion, Q&A, and maintenance scripts. Organized by concern (API routes, scripts, tests).【F:backend/api/routes/offers_upload.py†L1-L592】【F:backend/scripts/expire_and_cleanup_batches.py†L1-L200】
+  - `backend/api/routes/` – HTTP endpoints for batch management, uploads, and question answering, each encapsulated in its own module and FastAPI router.【F:backend/api/routes/batches.py†L1-L82】【F:backend/api/routes/qa.py†L1-L608】
+  - `backend/scripts/` – Operational scripts for vector store management and cleanup across Python and TypeScript tooling.【F:backend/scripts/expire_and_cleanup_batches.py†L1-L200】【F:backend/scripts/create-vector-stores.ts†L1-L91】
+  - `backend/tests/` – Pytest suites covering upload flows, re-embedding logic, and share chunk reporting helpers.【F:backend/tests/test_upload_smoke.py†L1-L109】【F:backend/tests/test_reembed.py†L1-L177】
+- `app/services/` – Shared service layer for OpenAI/vector store orchestration used by API routes.【F:app/services/vectorstores.py†L1-L169】【F:app/services/openai_compat.py†L1-L40】
+- Root config – Makefile, `requirements.txt`, and `package.json` provide hybrid Python/TypeScript tooling and scripts for local ops and deployment.【F:Makefile†L1-L9】【F:requirements.txt†L1-L10】【F:package.json†L1-L21】
 
 ```
 e:\FAILI\1.OnGo\1.AGENT\v2\be\gpt\
@@ -86,6 +98,7 @@ e:\FAILI\1.OnGo\1.AGENT\v2\be\gpt\
 **Current State**: Dual-track development with legacy compatibility
 
 ---
+The codebase is primarily concern-oriented: API routes by feature, service modules for shared infrastructure, and standalone operational scripts, with supporting tests colocated by domain.
 
 ## 🛠 Technology Stack
 
@@ -116,6 +129,16 @@ e:\FAILI\1.OnGo\1.AGENT\v2\be\gpt\
 **Minimal Dependencies**: Only 10 Python packages - lean and focused.
 
 ---
+| Layer | Technology & Version | Purpose |
+| --- | --- | --- |
+| Web framework | FastAPI 0.111 | Defines REST endpoints and dependency injection for backend services.【F:requirements.txt†L1-L2】【F:backend/api/routes/batches.py†L1-L47】|
+| ASGI server | Uvicorn 0.30 | Development and production serving entrypoint (`package.json` scripts).【F:requirements.txt†L2-L2】【F:package.json†L6-L13】|
+| Database client | psycopg2 / psycopg3 | PostgreSQL connectivity for transactional queries in routes and scripts.【F:requirements.txt†L7-L10】【F:backend/api/routes/offers_upload.py†L24-L183】|
+| Vector search | OpenAI Assistants / Vector Stores (openai 2.2) | File upload, retrieval, and embeddings management.【F:requirements.txt†L4-L4】【F:backend/api/routes/qa.py†L81-L148】|
+| PDF parsing | pypdf 4.2 | Text extraction for re-embedding flows.【F:requirements.txt†L5-L5】【F:backend/api/routes/qa.py†L1-L200】|
+| Cloud storage (optional) | boto3 (implicit) | Used when `S3_BUCKET` is configured for uploads/cleanup (not listed in requirements).【F:backend/api/routes/offers_upload.py†L211-L225】【F:backend/scripts/expire_and_cleanup_batches.py†L55-L82】|
+| Task scripts | tsx, TypeScript, pg | Vector store provisioning via Node tooling.【F:package.json†L6-L20】【F:backend/scripts/create-vector-stores.ts†L1-L91】|
+| Testing | pytest | Functional and unit coverage for API helpers.【F:requirements.txt†L1-L10】【F:backend/tests/test_reembed.py†L1-L177】|
 
 ## 🏗 Architecture
 
@@ -206,6 +229,7 @@ def call_gpt_extractor(document_id: str, pdf_bytes: bytes, cfg: Optional[GPTConf
 **Retry Logic**: Each strategy includes exponential backoff (0.7s × attempt).
 
 #### 2. **Concurrent Processing Architecture** (app/main.py)
+The backend is a modular FastAPI application. Each router module declares its own `APIRouter` with cohesive responsibilities and shared helpers. For example, the offers upload flow centralizes validation, duplicate detection, persistence, and OpenAI interaction in a single async handler, delegating vector store provisioning to the shared service layer:
 
 ```python
 # Thread pool for parallel PDF processing
@@ -221,7 +245,21 @@ def _process_pdf_bytes(data, doc_id, insurer, company, ...):
     with _JOBS_LOCK:
         rec = _jobs.get(job_id)
         rec["done"] += 1
+@router.post("/upload")
+async def upload_offer_file(...):
+    validate_environment()
+    content = await file.read()
+    validate_size(len(content))
+    existing = check_duplicate(org_id, sha256)
+    if existing:
+        ...  # reattach to vector store
+    batch_id = resolve_batch_id_by_token(batch_token, org_id)
+    storage_path = save_to_storage(content, org_id, file.filename)
+    retrieval_file_id = upload_to_openai(content, file.filename)
+    attach_to_vector_store(vector_store_id, retrieval_file_id)
+    return JSONResponse(payload)
 ```
+【F:backend/api/routes/offers_upload.py†L287-L592】
 
 **Pattern**: Submit jobs to executor, track progress in thread-safe dict, poll for completion.
 
@@ -306,6 +344,7 @@ def run_batch_ingest_sidecar(org_id: int, batch_id: int):
 **Risk**: User sees success before vector processing completes
 
 ---
+Routing favors explicit dependency injection (e.g., `Depends(get_db)`), ensuring transactional control and input validation through Pydantic models for Q&A payloads.【F:backend/api/routes/qa.py†L20-L148】 Asynchronous workflows rely on OpenAI Assistants for retrieval augmented generation, with dual vector-store resolution (T&C + batch data) to compose responses.【F:backend/api/routes/qa.py†L81-L148】 Maintenance tasks (batch cleanup, vector store seeding) reuse the same service abstractions, highlighting a layered architecture where scripts act as clients to the service layer.【F:backend/scripts/expire_and_cleanup_batches.py†L85-L200】【F:app/services/vectorstores.py†L10-L166】
 
 ## 🎨 Styling and UI
 
@@ -352,6 +391,7 @@ print(f"[sidecar] vs-ready {vector_store_id}")
 **Tags**: `[qa]`, `[embedding]`, `[sidecar]`, `[tc]`, `[upload]`
 
 ---
+This backend-focused repository does not implement a visual UI. Styling concerns are limited to response payload structures and JSON formatting enforced via Pydantic validators and explicit serialization. Accessibility and theming are delegated to downstream clients consuming the API.【F:backend/api/routes/qa.py†L25-L148】【F:backend/api/routes/batches.py†L21-L76】
 
 ## ✅ Code Quality and Testing
 
@@ -472,6 +512,10 @@ backend/tests/
 - ❌ No troubleshooting FAQ
 
 ---
+- **Linting/Formatting**: No dedicated configuration files (e.g., `pyproject.toml`, `.flake8`) are present; style consistency relies on developer discipline. Some modules contain unused imports (`urllib.parse.quote`), indicating linting gaps.【F:backend/api/routes/offers_upload.py†L1-L75】
+- **Type Annotations**: Python modules leverage typing hints selectively (e.g., helper signatures) but do not enforce mypy or runtime type checking.【F:backend/api/routes/offers_upload.py†L29-L204】
+- **Testing**: Pytest suites cover upload validation, re-embedding pipelines, and share chunk reporting helpers, using mocks for filesystem, OpenAI, and database dependencies.【F:backend/tests/test_upload_smoke.py†L17-L106】【F:backend/tests/test_reembed.py†L1-L177】【F:backend/tests/test_chunks_report.py†L1-L138】 Coverage is partial: end-to-end scenarios depend on external services and environment variables, leading to conditional skips (e.g., missing `OPENAI_API_KEY`).
+- **Documentation**: Inline docstrings and comments describe operational scripts and helper functions, but there is no centralized API reference or README for backend deployment beyond root quick-start files.【F:backend/scripts/expire_and_cleanup_batches.py†L1-L200】【F:backend/tests/test_reembed.py†L143-L176】
 
 ## 🔧 Key Components
 
@@ -737,6 +781,11 @@ normalized = normalize_offer_json(raw_extraction, document_id="offer_123.pdf")
 - "Zobārstniecība ar 50% atlaidi, apdrošinājuma summa (pp)"
 
 ---
+1. **Offers Upload Router (`backend/api/routes/offers_upload.py`)** – Handles ingestion, deduplication, storage, and vector store attachment for uploaded documents. Depends on OpenAI, PostgreSQL, and optional S3; enforces MIME/size validation and batch scoping.【F:backend/api/routes/offers_upload.py†L287-L592】
+2. **QA Router (`backend/api/routes/qa.py`)** – Provides multiple Q&A endpoints (Top-3 insurer ranking, share-scoped answers, chunk reporting, re-embedding). Integrates OpenAI Assistants with dynamic vector store selection and rigorous Pydantic validation.【F:backend/api/routes/qa.py†L81-L608】
+3. **Batch Router (`backend/api/routes/batches.py`)** – Creates and retrieves offer batches, assigning tokens and maintaining file associations for upload flows.【F:backend/api/routes/batches.py†L21-L82】
+4. **Vector Store Service (`app/services/vectorstores.py`)** – Shared layer encapsulating vector store creation, lookup, and seeding, supporting both batch and permanent T&C knowledge bases.【F:app/services/vectorstores.py†L10-L166】
+5. **Cleanup Script (`backend/scripts/expire_and_cleanup_batches.py`)** – Operational tool that decommissions expired batches, deleting OpenAI assets, local/S3 artifacts, and database records to prevent storage drift.【F:backend/scripts/expire_and_cleanup_batches.py†L30-L200】
 
 ## 🧩 Patterns and Best Practices
 
@@ -960,6 +1009,10 @@ from app.services.openai_compat import create_vector_store
 ```
 
 ---
+- **Transactional Context Managers**: Database operations consistently use context managers to ensure cursors close and transactions commit/rollback deterministically.【F:backend/api/routes/offers_upload.py†L171-L592】【F:backend/scripts/expire_and_cleanup_batches.py†L95-L200】
+- **Compatibility Guards**: OpenAI integration layers include fallbacks between stable and beta SDK namespaces, future-proofing against API changes.【F:backend/api/routes/offers_upload.py†L258-L284】【F:app/services/openai_compat.py†L5-L34】
+- **Idempotent Operations**: Duplicate upload handling reattaches existing files and self-heals missing storage paths, preventing redundant OpenAI uploads.【F:backend/api/routes/offers_upload.py†L314-L474】
+- **Validation & Logging**: Pydantic validators enforce strict payloads, while extensive logging aids observability across upload, QA, and script workflows.【F:backend/api/routes/qa.py†L25-L608】【F:backend/api/routes/offers_upload.py†L297-L592】
 
 ## ⚙️ Development Infrastructure
 
@@ -1091,6 +1144,11 @@ repos:
 ```
 
 ---
+- **Python dependencies** pinned via `requirements.txt`, emphasizing reproducible OpenAI and database clients.【F:requirements.txt†L1-L10】
+- **Node/TypeScript tooling** defined in `package.json` for vector store provisioning and ASGI server startup, mixing ecosystems for operational flexibility.【F:package.json†L6-L21】
+- **Makefile** shortcuts orchestrate cleanup and vector store creation scripts, requiring environment variables for org scoping.【F:Makefile†L1-L9】
+- **Environment Configuration**: Runtime expectations rely on environment variables (`DATABASE_URL`, `OPENAI_API_KEY`, `S3_BUCKET`, assistant IDs) checked at runtime rather than through `.env` scaffolding. Validation helpers exist for critical paths but not uniformly across modules.【F:backend/api/routes/offers_upload.py†L82-L89】【F:backend/api/routes/qa.py†L191-L284】
+- **Dockerfile/CI**: No CI configuration or Dockerfile dedicated to the backend is present in this tree, suggesting deployment responsibilities lie elsewhere or remain manual.
 
 ## ⚠️ Bug & Issue Report
 
@@ -1433,6 +1491,12 @@ repos:
   ```
 
 ---
+- **File**: `backend/api/routes/batches.py` – Returning raw `datetime` objects inside a `JSONResponse` causes serialization failures (`TypeError: Object of type datetime is not JSON serializable`). Convert timestamps to ISO strings before returning.【F:backend/api/routes/batches.py†L47-L76】
+  - **Suggested Fix**: Pass data through FastAPI's `jsonable_encoder` or manually call `.isoformat()` on datetime fields prior to constructing the response.
+- **File**: `backend/api/routes/offers_upload.py` & `requirements.txt` – S3 upload paths import `boto3`, but the dependency is not declared; deployments enabling `S3_BUCKET` will crash at import time.【F:backend/api/routes/offers_upload.py†L211-L224】【F:requirements.txt†L1-L10】
+  - **Suggested Fix**: Add `boto3` to Python dependencies or guard the import with an informative runtime error.
+- **File**: `backend/tests/test_upload_smoke.py` – Test posts to `/api/offers/upload` without the now-required `batch_token`, so it receives HTTP 422 instead of 200, causing false failures.【F:backend/tests/test_upload_smoke.py†L38-L47】【F:backend/api/routes/offers_upload.py†L482-L493】
+  - **Suggested Fix**: Include a valid `batch_token` (mocked or fixture-provided) in the test payload or adjust expectations for 422 responses.
 
 ## 📋 Summary & Recommendations
 
@@ -1654,3 +1718,20 @@ The codebase demonstrates strong engineering fundamentals with sophisticated AI 
 *Report Generated: October 26, 2025*  
 *Codebase Version: 1.0.0*  
 *Analysis Scope: Complete backend codebase (7,500+ lines)*
+**Strengths**
+- Well-structured FastAPI routers with rich validation, logging, and error handling around critical flows (uploads, QA, maintenance).【F:backend/api/routes/offers_upload.py†L287-L592】【F:backend/api/routes/qa.py†L81-L608】
+- Robust service abstractions for vector store lifecycle management, including compatibility helpers and bulk seeding scripts.【F:app/services/vectorstores.py†L10-L166】【F:backend/scripts/create-vector-stores.ts†L1-L91】
+- Comprehensive operational tooling (cleanup, re-embed) and targeted unit tests for complex routines (chunking, PDF extraction).【F:backend/scripts/expire_and_cleanup_batches.py†L30-L200】【F:backend/tests/test_reembed.py†L1-L177】
+
+**Weaknesses**
+- Missing dependency declarations (e.g., `boto3`) and serialization oversights introduce runtime instability under common configurations.【F:backend/api/routes/offers_upload.py†L211-L224】【F:backend/api/routes/batches.py†L47-L76】
+- Lack of automated linting/typing pipelines allows unused imports and inconsistent typing patterns to linger.【F:backend/api/routes/offers_upload.py†L1-L75】
+- Test coverage depends on real OpenAI credentials and outdated payloads, limiting reliability of automated suites.【F:backend/tests/test_upload_smoke.py†L12-L87】
+
+**Recommendations**
+1. Address identified bugs (datetime serialization, dependency declarations, test payloads) to stabilize critical endpoints and CI.
+2. Introduce tooling (e.g., Ruff/Black, mypy) and CI workflows to enforce style and catch regressions earlier.
+3. Expand test fixtures/mocks to decouple from external APIs, enabling deterministic CI without secret configuration.
+4. Document expected environment variables and deployment steps (Docker/compose) to streamline onboarding.
+
+Overall complexity leans **mid-to-senior friendly**: domain logic and integrations are sophisticated (OpenAI Assistants, vector stores, batch lifecycle), but modules are well-organized with clear contracts. A mid-level engineer experienced with FastAPI and external APIs should navigate and extend the system effectively once environment prerequisites are clarified.
