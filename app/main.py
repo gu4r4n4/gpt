@@ -984,7 +984,7 @@ def _load_share_record(token: str, attempts: int = 25, delay_s: float = 0.2) -> 
     # Same-dyno hot cache (works when GET hits the same process as POST)
     return _SHARES_FALLBACK.get(token)
 
-def _parse_to_utc_naive(s: Optional[str]) -> Optional[datetime]]:
+def _parse_to_utc_naive(s: Optional[str]) -> Optional[datetime])
     """
     Parse ISO string with 'Z', '+00:00', or no tz, return UTC-naive datetime.
     """
