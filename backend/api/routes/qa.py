@@ -722,7 +722,7 @@ def audit_share(share_token: str = Query(...), conn = Depends(get_db)):
             file_id=r["id"],
             filename=r["filename"],
             storage_path=r.get("storage_path"),
-            embeddings_ready=r.get("embeddings_ready"],
+            embeddings_ready=r.get("embeddings_ready"),
             retrieval_file_id=rfid,
             chunk_count=chunk_counts.get(r["id"], 0),
             in_vector_stores=attached_to
