@@ -38,6 +38,10 @@ from app.routes.admin_tc import router as admin_tc_router
 from app.services.vector_batches import ensure_batch_vector_store, add_file_to_batch_vs, compute_sha256
 from app.extensions.pas_sidecar import run_batch_ingest_sidecar, infer_batch_token_for_docs
 
+# >>> NEW: mount translation endpoints
+from app.translate import register_translate_routes
+# <<< NEW
+
 APP_NAME = "GPT Offer Extractor"
 APP_VERSION = "1.0.0"
 
@@ -123,6 +127,10 @@ app.include_router(batches_router)  # Batch management endpoints
 app.include_router(qa_router)  # Q&A endpoints
 app.include_router(admin_insurers_router)  # Admin insurers management
 app.include_router(admin_tc_router)  # Admin terms & conditions management
+
+# >>> NEW: actually register /api/translate routes
+register_translate_routes(app)
+# <<< NEW
 
 # -------------------------------
 # CORS (adjust for production)
@@ -976,7 +984,7 @@ def _load_share_record(token: str, attempts: int = 25, delay_s: float = 0.2) -> 
     # Same-dyno hot cache (works when GET hits the same process as POST)
     return _SHARES_FALLBACK.get(token)
 
-def _parse_to_utc_naive(s: Optional[str]) -> Optional[datetime]:
+def _parse_to_utc_naive(s: Optional[str]) -> Optional[datetime]]:
     """
     Parse ISO string with 'Z', '+00:00', or no tz, return UTC-naive datetime.
     """
