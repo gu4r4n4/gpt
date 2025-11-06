@@ -722,7 +722,7 @@ def audit_share(share_token: str = Query(...), conn = Depends(get_db)):
             file_id=r["id"],
             filename=r["filename"],
             storage_path=r.get("storage_path"),
-            embeddings_ready=r.get("embeddings_ready"),
+            embeddings_ready=r.get("embeddings_ready"],
             retrieval_file_id=rfid,
             chunk_count=chunk_counts.get(r["id"], 0),
             in_vector_stores=attached_to
@@ -736,6 +736,99 @@ def audit_share(share_token: str = Query(...), conn = Depends(get_db)):
         vector_store_ids=vector_store_ids,
         files=files
     )
+
+# ============================================================================
+# ATTACH-ONLY ENDPOINT (NEW) — No text extraction, just upload (if needed) and attach
+# ============================================================================
+
+class AttachResult(BaseModel):
+    ok: bool = True
+    file_id: int
+    filename: Optional[str] = None
+    retrieval_file_id: str
+    vector_store_id: Optional[str] = None
+    action: str  # "attached", "already_present", "uploaded_and_attached"
+
+@router.post("/attach-file-to-vs", response_model=AttachResult)
+def attach_file_to_vs(
+    file_id: int = Query(..., description="ID of the file to attach"),
+    x_user_role: Optional[str] = Header(None, alias="X-User-Role"),
+    conn = Depends(get_db)
+):
+    """
+    Admin endpoint to ensure a file is attached to the correct Vector Store (no re-embedding).
+    - If retrieval_file_id is missing, uploads original PDF to OpenAI Files.
+    - Then attaches the file to the batch vector store used in /ask-share.
+    This is safe for scanned PDFs (no text extraction required).
+    """
+    if not x_user_role or x_user_role.lower() != "admin":
+        raise HTTPException(status_code=403, detail="Unauthorized: only admin users")
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT of.id, of.filename, of.storage_path, of.retrieval_file_id, of.org_id, ob.token AS batch_token
+            FROM public.offer_files of
+            JOIN public.offer_batches ob ON of.batch_id = ob.id
+            WHERE of.id = %s
+        """, (file_id,))
+        row = cur.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail=f"File ID {file_id} not found")
+
+    filename = row.get("filename")
+    storage_path = row.get("storage_path")
+    retrieval_file_id = row.get("retrieval_file_id")
+    org_id = row.get("org_id")
+    batch_token = row.get("batch_token")
+
+    if not org_id or not batch_token:
+        raise HTTPException(status_code=400, detail="Missing org_id or batch_token for file")
+
+    vs_id = get_offer_vs(conn, org_id, batch_token)
+    if not vs_id:
+        raise HTTPException(status_code=404, detail="Offer vector store not found for this batch")
+
+    action = "attached"
+
+    # Upload if needed (no text extraction)
+    if not retrieval_file_id:
+        if not storage_path or not os.path.exists(storage_path):
+            raise HTTPException(status_code=400, detail="Original PDF is missing on disk and cannot be uploaded")
+        try:
+            up = client.files.create(file=open(storage_path, "rb"), purpose="assistants")
+            retrieval_file_id = up.id
+            with conn.cursor() as cur:
+                cur.execute("UPDATE public.offer_files SET retrieval_file_id=%s WHERE id=%s",
+                            (retrieval_file_id, file_id))
+                conn.commit()
+            action = "uploaded_and_attached"
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Upload failed: {e}")
+
+    # Attach to VS (idempotent)
+    try:
+        # Quick check to avoid noisy errors
+        listing = client.beta.vector_stores.files.list(vector_store_id=vs_id, limit=100)
+        present = any(f.id == retrieval_file_id for f in listing.data or [])
+        if present:
+            return AttachResult(ok=True, file_id=file_id, filename=filename,
+                                retrieval_file_id=retrieval_file_id, vector_store_id=vs_id,
+                                action="already_present")
+
+        client.beta.vector_stores.files.create(vector_store_id=vs_id, file_id=retrieval_file_id)
+    except Exception as e:
+        # If it's "already exists" type error, treat as success
+        msg = str(e).lower()
+        if "already" in msg or "exists" in msg or "conflict" in msg:
+            return AttachResult(ok=True, file_id=file_id, filename=filename,
+                                retrieval_file_id=retrieval_file_id, vector_store_id=vs_id,
+                                action="already_present")
+        raise HTTPException(status_code=500, detail=f"Attach failed: {e}")
+
+    return AttachResult(ok=True, file_id=file_id, filename=filename,
+                        retrieval_file_id=retrieval_file_id, vector_store_id=vs_id,
+                        action=action)
 
 # ============================================================================
 # Re-embedding functionality
