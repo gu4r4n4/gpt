@@ -24,6 +24,10 @@ def get_db():
     finally:
         conn.close()
 
+# --------------------------------------------------------------------
+# Top-3 model (unchanged behavior)
+# --------------------------------------------------------------------
+
 class RankedInsurer(BaseModel):
     insurer_code: str = Field(..., description="e.g. BALTA, BTA")
     score: float = Field(..., ge=0, le=1)
@@ -97,9 +101,11 @@ def ask(req: AskRequest, conn = Depends(get_db)):
         tool_resources={"file_search": {"vector_store_ids": [tc_vs, offer_vs]}}
     )
 
+    # poll
     while True:
         r = client.beta.threads.runs.retrieve(thread_id=thread.id, run_id=run.id)
-        if r.status in ("completed","failed","cancelled","expired","requires_action"): break
+        if r.status in ("completed","failed","cancelled","expired","requires_action"):
+            break
 
     if r.status != "completed":
         raise HTTPException(status_code=502, detail=f"Run failed: {r.status}")
@@ -107,7 +113,8 @@ def ask(req: AskRequest, conn = Depends(get_db)):
     msgs = client.beta.threads.messages.list(thread_id=thread.id, order="desc", limit=1)
     content = ""
     for part in msgs.data[0].content:
-        if part.type == "text": content += part.text.value
+        if part.type == "text":
+            content += part.text.value
     content = content.strip()
 
     try:
@@ -142,6 +149,10 @@ def ask(req: AskRequest, conn = Depends(get_db)):
         resp["_log_id"] = log_id
     return resp
 
+# --------------------------------------------------------------------
+# Logs (unchanged)
+# --------------------------------------------------------------------
+
 class LogsQuery(BaseModel):
     org_id: int
     batch_token: Optional[str] = None
@@ -166,7 +177,10 @@ def logs(org_id: int, batch_token: Optional[str] = None, limit: int = 25, offset
         """, (*params, limit, offset))
         return {"items": cur.fetchall(), "next_offset": offset + limit}
 
-# New scoped Q&A endpoint
+# --------------------------------------------------------------------
+# Scoped Q&A (/ask-share) with fixed citations + strict instructions
+# --------------------------------------------------------------------
+
 class QASource(BaseModel):
     filename: str
     retrieval_file_id: str
@@ -272,17 +286,31 @@ def ask_share_qa(req: QAAskRequest, conn = Depends(get_db)):
             raise HTTPException(status_code=500, detail="ASSISTANT_ID_QA not configured")
 
         try:
+            # Create thread with the user's message
             thread = client.beta.threads.create(messages=[{
                 "role": "user",
                 "content": req.question
             }])
 
+            # Enforce behavior at run-time (no uploads ask; always cite; LV/EN output)
+            out_lang = "lv" if (req.lang or "").lower().startswith("lv") else "en"
+            run_instructions = (
+                "You are a broker assistant.\n"
+                "Answer ONLY from the provided files (the share’s uploaded offers and the organization T&C store).\n"
+                "NEVER ask the user to upload files. If some information is missing, state briefly that some data is unavailable "
+                "and still provide the best possible answer. If a table is requested, output the table and use '—' for missing cells.\n"
+                "Always include citations to the supporting files using the file search tool so annotations are present.\n"
+                f"Write the answer in {'Latvian' if out_lang=='lv' else 'English'}."
+            )
+
+            # Try run with tool_resources on run (Assistants v2)
             use_tool_resources = True
             try:
                 run = client.beta.threads.runs.create(
                     thread_id=thread.id,
                     assistant_id=assistant_id,
                     tool_resources={"file_search": {"vector_store_ids": vector_store_ids}},
+                    instructions=run_instructions,
                 )
                 print(f"[qa] run-create using tool_resources ok")
             except TypeError as e:
@@ -290,15 +318,13 @@ def ask_share_qa(req: QAAskRequest, conn = Depends(get_db)):
                 use_tool_resources = False
 
             if not use_tool_resources:
+                # Short-lived assistant with the same instructions
                 tmp_asst = client.beta.assistants.create(
                     name="Offer QA (tmp)",
                     model=os.getenv("ASSISTANT_MODEL", "gpt-4.1-mini"),
                     tools=[{"type": "file_search"}],
                     tool_resources={"file_search": {"vector_store_ids": vector_store_ids}},
-                    instructions=os.getenv(
-                        "ASSISTANT_QA_INSTRUCTIONS",
-                        "You are a broker assistant. Answer only from the provided files (uploaded offers for the share and the organization T&C store). When unsure, say so. Be concise."
-                    ),
+                    instructions=run_instructions,
                 )
                 try:
                     run = client.beta.threads.runs.create(
@@ -313,6 +339,7 @@ def ask_share_qa(req: QAAskRequest, conn = Depends(get_db)):
                     except Exception as del_err:
                         print(f"[qa] tmp assistant delete failed: {del_err}")
 
+            # Poll for completion
             max_wait = 60
             wait_time = 0
             while wait_time < max_wait:
@@ -325,24 +352,62 @@ def ask_share_qa(req: QAAskRequest, conn = Depends(get_db)):
             if r.status != "completed":
                 raise HTTPException(status_code=502, detail=f"Query failed: {r.status}")
 
+            # Read the last assistant message
             messages = client.beta.threads.messages.list(thread_id=thread.id, order="desc", limit=1)
             answer = ""
-            sources = []
+            sources: List[QASource] = []
 
             for message in messages.data:
                 if message.role == "assistant":
                     for content in message.content:
                         if content.type == "text":
-                            answer = content.text.value
-                            for annotation in content.text.annotations:
-                                if hasattr(annotation, 'file_id') and annotation.file_id:
+                            answer = content.text.value or ""
+
+                            # Extract citations from annotations (SDK 2.x nesting)
+                            for annotation in (content.text.annotations or []):
+                                fid = None
+                                atype = getattr(annotation, "type", "")
+                                if atype == "file_citation" and getattr(annotation, "file_citation", None):
+                                    fid = getattr(annotation.file_citation, "file_id", None)
+                                elif atype == "file_path" and getattr(annotation, "file_path", None):
+                                    fid = getattr(annotation.file_path, "file_id", None)
+                                # legacy flat attribute (defensive)
+                                elif getattr(annotation, "file_id", None):
+                                    fid = getattr(annotation, "file_id")
+
+                                if fid:
                                     sources.append(QASource(
-                                        filename=f"file_{annotation.file_id[:8]}",
-                                        retrieval_file_id=annotation.file_id,
+                                        filename=f"file_{fid[:8]}",
+                                        retrieval_file_id=fid,
                                         score=0.8
                                     ))
                     break
 
+            # If model forgot to cite, backfill from VS (best-effort, up to 4)
+            if not sources:
+                try:
+                    backfill_ids = []
+                    for vsid in vector_store_ids:
+                        page = client.vector_stores.files.list(vector_store_id=vsid, limit=10)
+                        backfill_ids.extend([f.id for f in (page.data or [])])
+                    seen = set()
+                    for fid in backfill_ids:
+                        if fid in seen:
+                            continue
+                        seen.add(fid)
+                        sources.append(QASource(
+                            filename=f"file_{fid[:8]}",
+                            retrieval_file_id=fid,
+                            score=0.5
+                        ))
+                        if len(sources) >= 4:
+                            break
+                    if sources:
+                        print(f"[qa] sources backfilled with {len(sources)} vector store files")
+                except Exception as e:
+                    print(f"[qa] backfill warn: {e}")
+
+            # Optional filter
             if req.insurer_only and sources:
                 sources = [s for s in sources if req.insurer_only.lower() in s.filename.lower()]
 
@@ -361,6 +426,10 @@ def ask_share_qa(req: QAAskRequest, conn = Depends(get_db)):
         print(f"[qa] error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
+# --------------------------------------------------------------------
+# Seed T&C (unchanged)
+# --------------------------------------------------------------------
+
 @router.post("/seed-tc")
 def seed_tc(org_id: int = Query(...)):
     """Admin endpoint to seed T&C vector store with canonical PDFs."""
@@ -376,6 +445,10 @@ def seed_tc(org_id: int = Query(...)):
     except Exception as e:
         print(f"[qa] seed-tc error: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to seed T&C vector store: {e}")
+
+# --------------------------------------------------------------------
+# Chunks report (unchanged behavior)
+# --------------------------------------------------------------------
 
 class ChunkData(BaseModel):
     chunk_index: int
@@ -543,9 +616,9 @@ def get_chunks_report(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to retrieve chunks report: {str(e)}")
 
-# ============================================================================
-# VISIBILITY AUDIT FOR SHARE (NEW ENDPOINT)
-# ============================================================================
+# --------------------------------------------------------------------
+# Visibility audit for a share (unchanged behavior, uses client.vector_stores)
+# --------------------------------------------------------------------
 
 class AuditFile(BaseModel):
     file_id: int
@@ -591,6 +664,7 @@ def audit_share(share_token: str = Query(...), conn = Depends(get_db)):
     org_id = share["org_id"]
     batch_token = share["batch_token"]
 
+    # Recreate the vector store set as used by /ask-share
     vector_store_ids: List[str] = []
     if batch_token:
         b_vs = get_offer_vs(conn, org_id, batch_token)
@@ -602,8 +676,10 @@ def audit_share(share_token: str = Query(...), conn = Depends(get_db)):
     if not vector_store_ids:
         raise HTTPException(status_code=404, detail="No vector stores available for this share")
 
+    # Build cache of vector store file ids
     vs_file_sets = {vs_id: _list_vs_file_ids(vs_id) for vs_id in vector_store_ids}
 
+    # Collect files for this batch/org
     files = []
     with conn.cursor() as cur:
         cur.execute("""
@@ -615,6 +691,7 @@ def audit_share(share_token: str = Query(...), conn = Depends(get_db)):
         """, (batch_token, org_id))
         frows = cur.fetchall()
 
+    # Chunk counts
     id_list = [r["id"] for r in frows] or [-1]
     chunk_counts = {}
     with conn.cursor() as cur:
@@ -627,6 +704,7 @@ def audit_share(share_token: str = Query(...), conn = Depends(get_db)):
         for r in cur.fetchall():
             chunk_counts[r["file_id"]] = r["cnt"]
 
+    # Assemble audit rows
     for r in frows:
         rfid = r.get("retrieval_file_id")
         attached_to = [vs for vs, s in vs_file_sets.items() if (rfid and rfid in s)]
@@ -649,9 +727,9 @@ def audit_share(share_token: str = Query(...), conn = Depends(get_db)):
         files=files
     )
 
-# ============================================================================
-# ATTACH-ONLY ENDPOINT — upload if needed, then attach (no text extraction)
-# ============================================================================
+# --------------------------------------------------------------------
+# Attach-only (no text extraction)
+# --------------------------------------------------------------------
 
 class AttachResult(BaseModel):
     ok: bool = True
@@ -732,9 +810,9 @@ def attach_file_to_vs(
                         retrieval_file_id=retrieval_file_id, vector_store_id=vs_id,
                         action=action)
 
-# ============================================================================
-# Re-embedding functionality
-# ============================================================================
+# --------------------------------------------------------------------
+# Re-embedding (unchanged, plus attach to VS)
+# --------------------------------------------------------------------
 
 def _extract_text_from_pdf(pdf_path: str) -> str:
     try:
