@@ -1,101 +1,98 @@
 # app/routes/translate.py
 from __future__ import annotations
 import os
-from typing import Optional, Literal, Dict, Any
+from typing import Optional, Dict, Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Query
 from pydantic import BaseModel
 from openai import OpenAI
 
 router = APIRouter(prefix="/api/translate", tags=["translate"])
 
-# Client is created lazily so container boots even if key is missing
+# Lazily create client so boot works even without a key
 _client: Optional[OpenAI] = None
 DEFAULT_MODEL = os.getenv("TRANSLATE_MODEL", "gpt-4o-mini")
 
 class TranslateBody(BaseModel):
     text: str
-    targetLang: Optional[str] = None  # required only when direction=out
+    targetLang: Optional[str] = None  # only used when direction=out
 
-def _ensure_client() -> OpenAI:
+def _ensure_client() -> Optional[OpenAI]:
+    """Return OpenAI client if key exists; else None (we fail-open)."""
     global _client
+    if not os.getenv("OPENAI_API_KEY"):
+        return None
     if _client is None:
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            # We don't raise here—caller handles "no key" by echoing text back
-            raise RuntimeError("OPENAI_API_KEY missing")
         _client = OpenAI()
     return _client
 
-def _safe_ok(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Ensure a very stable response shape so the FE never crashes.
-    """
-    base = {
-        "ok": True,
-        "text": payload.get("text") or "",
-        # Both keys below so either FE path can consume it
-        "translatedInput": payload.get("translatedInput"),
-        "translatedOutput": payload.get("translatedOutput"),
+def _mk_response(*, text: str, translated_in: Optional[str]=None,
+                 translated_out: Optional[str]=None, error: Optional[str]=None) -> Dict[str, Any]:
+    """Stable, FE-friendly shape. Always 200 from the route."""
+    payload: Dict[str, Any] = {
+        "ok": error is None,
+        "text": text or "",
+        "translatedInput": translated_in,
+        "translatedOutput": translated_out,
     }
-    if "error" in payload and payload["error"]:
-        base["ok"] = False
-        base["error"] = str(payload["error"])
-    return base
+    if error:
+        payload["error"] = error
+    return payload
 
 @router.post("")
 async def translate(
     body: TranslateBody,
-    direction: Literal["in","out"] = Query(..., pattern="^(in|out)$"),
-    preserveMarkdown: bool = Query(False),
+    # DO NOT validate here; we accept anything and handle inside to avoid 422s.
+    direction: str = Query(...),
+    preserveMarkdown: Optional[bool] = Query(False),
 ):
     """
     POST /api/translate?direction=in|out[&preserveMarkdown=true]
-    - direction=in  : user language -> English
-    - direction=out : English -> targetLang (body.targetLang required)
-
-    Always returns 200 with shape:
-      {
-        ok: boolean,
-        text: string,                 # final translated text (or original on fail-open)
-        translatedInput?: string,     # set for direction=in
-        translatedOutput?: string,    # set for direction=out
-        error?: string
-      }
+    Body: { "text": "...", "targetLang": "latvian" }
+    Always returns 200 with:
+      { ok, text, translatedInput?, translatedOutput?, error? }
     """
     raw = (body.text or "").strip()
     if not raw:
-        return _safe_ok({"text": ""})
+        return _mk_response(text="")
 
-    # No key? Fail-open: echo original so UI never blanks.
-    api_key_present = bool(os.getenv("OPENAI_API_KEY"))
-    if not api_key_present:
-        if direction == "in":
-            return _safe_ok({"text": raw, "translatedInput": raw})
+    # normalize inputs (be generous)
+    d = (direction or "").strip().lower()
+    if d not in {"in", "out"}:
+        # Don’t throw; return safe payload so FE never blanks
+        return _mk_response(text=raw, translated_out=raw, error="invalid direction (expected 'in' or 'out')")
+
+    # handle preserveMarkdown that might come as "true"/"1"/true
+    pm = bool(str(preserveMarkdown).lower() in {"1", "true", "yes"})
+
+    client = _ensure_client()
+    if client is None:
+        # No key configured: fail-open (echo)
+        if d == "in":
+            return _mk_response(text=raw, translated_in=raw)
         else:
-            return _safe_ok({"text": raw, "translatedOutput": raw})
+            return _mk_response(text=raw, translated_out=raw)
 
-    # Build system prompt
-    if direction == "in":
+    # Build a conservative system prompt
+    if d == "in":
         sys = (
             "Translate the user's message into English. "
-            + ("Preserve original Markdown formatting, tables and code blocks. " if preserveMarkdown else "")
+            + ("Preserve original Markdown formatting, tables and code blocks. " if pm else "")
             + "Do not add explanations—return only the translated text."
         )
     else:
         tl = (body.targetLang or "").strip()
         if not tl:
-            # Still return 200 with ok:false so FE keeps going
-            return _safe_ok({"text": raw, "translatedOutput": raw, "error": "targetLang is required for direction=out"})
+            # Keep 200; FE-safe
+            return _mk_response(text=raw, translated_out=raw, error="targetLang is required for direction=out")
         sys = (
             f"Translate the user's message from English into {tl}. "
-            + ("Preserve Markdown tables, headings and code fences. " if preserveMarkdown else "")
+            + ("Preserve Markdown tables, headings and code fences. " if pm else "")
             + "Do not add explanations—return only the translated text."
         )
 
-    # Call OpenAI – wrapped so *any* exception still returns 200 with fallback text
+    # OpenAI call – any failure falls back to echo with an error string
     try:
-        client = _ensure_client()
         rsp = client.chat.completions.create(
             model=DEFAULT_MODEL,
             messages=[
@@ -103,20 +100,18 @@ async def translate(
                 {"role": "user", "content": raw},
             ],
             temperature=0,
-            # max_tokens left unset so model can return full text (Markdown tables etc.)
         )
         out = (rsp.choices[0].message.content or "").strip()
         if not out:
-            out = raw  # fail-open if model returns empty
+            out = raw  # fail-open if empty
 
-        if direction == "in":
-            return _safe_ok({"text": out, "translatedInput": out})
+        if d == "in":
+            return _mk_response(text=out, translated_in=out)
         else:
-            return _safe_ok({"text": out, "translatedOutput": out})
+            return _mk_response(text=out, translated_out=out)
 
     except Exception as e:
-        # Fail-open on any OpenAI/network error
-        if direction == "in":
-            return _safe_ok({"text": raw, "translatedInput": raw, "error": f"{type(e).__name__}: {e}"})
+        if d == "in":
+            return _mk_response(text=raw, translated_in=raw, error=f"{type(e).__name__}: {e}")
         else:
-            return _safe_ok({"text": raw, "translatedOutput": raw, "error": f"{type(e).__name__}: {e}"})
+            return _mk_response(text=raw, translated_out=raw, error=f"{type(e).__name__}: {e}")
