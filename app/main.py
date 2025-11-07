@@ -35,7 +35,7 @@ from backend.api.routes.batches import router as batches_router
 from backend.api.routes.qa import router as qa_router
 from app.routes.admin_insurers import router as admin_insurers_router
 from app.routes.admin_tc import router as admin_tc_router
-from app.translate import router as translate_router  # <-- FIXED import
+from app.routes.translate import router as translate_router  # <-- FIXED import
 from app.extensions.pas_sidecar import run_batch_ingest_sidecar, infer_batch_token_for_docs
 
 APP_NAME = "GPT Offer Extractor"
