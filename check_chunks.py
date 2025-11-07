@@ -1,57 +1,77 @@
 # check_chunks.py
 import os
 from openai import OpenAI
+from datetime import datetime
 
-VECTOR_STORE_ID = "vs_690d83e728488191aa76c75d2a483041"
+VS_ID = os.getenv("VECTOR_STORE_ID", "vs_690d83e728488191aa76c75d2a483041")
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+def ts(sec):
+    try:
+        return datetime.utcfromtimestamp(int(sec)).isoformat() + "Z"
+    except Exception:
+        return str(sec)
 
-print(f"📦 Checking files in vector store: {VECTOR_STORE_ID}\n")
+def main():
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        print("❌ OPENAI_API_KEY is not set")
+        return
 
-# 1) List vector-store file relations (gives you file IDs + status)
-rel_list = client.vector_stores.files.list(vector_store_id=VECTOR_STORE_ID)
+    client = OpenAI()
 
-if not rel_list.data:
-    print("⚠️ No files found in the vector store!")
-else:
-    for rel in rel_list.data:
-        file_id = rel.id
+    print(f"📦 Checking files in vector store: {VS_ID}\n")
 
-        # 2) Get filename from the Files API
+    # 1) List files attached to the vector store
+    vs_files = client.vector_stores.files.list(vector_store_id=VS_ID)
+
+    # Older SDKs return .data, newer can be iterable; handle both
+    items = getattr(vs_files, "data", vs_files) or []
+
+    if not items:
+        print("⚠️ No files listed by vector store. Are files attached?")
+        return
+
+    for vsf in items:
+        file_id = getattr(vsf, "id", None)
+        status = getattr(vsf, "status", "unknown")
+        created_at = getattr(vsf, "created_at", None)
+
+        # 2) Retrieve filename via Files API
+        filename = "(unknown)"
         try:
-            fmeta = client.files.retrieve(file_id)
-            filename = getattr(fmeta, "filename", fmeta.get("filename", "(unknown)")) if hasattr(fmeta, "__dict__") else "(unknown)"
+            fobj = client.files.retrieve(file_id)
+            # FileObject has attributes (not dict)
+            filename = getattr(fobj, "filename", "(unknown)")
         except Exception as e:
-            filename = "(unknown)"
             print(f"   ⚠️ Could not retrieve filename for {file_id}: {e}")
 
-        # 3) Count chunks via the chunks list endpoint
-        chunk_count = 0
+        # 3) Try to list chunks (SDK 2.x: vector_stores.files.list_chunks)
+        chunk_count = None
+        chunk_err = None
         try:
-            chunks_page = client.vector_stores.files.chunks.list(
-                vector_store_id=VECTOR_STORE_ID,
+            # Newer method name:
+            chunks = client.vector_stores.files.list_chunks(
+                vector_store_id=VS_ID,
                 file_id=file_id,
-                limit=100  # paginate if needed
             )
-            chunk_count += len(chunks_page.data)
-            # paginate if there are more
-            while getattr(chunks_page, "has_more", False):
-                chunks_page = client.vector_stores.files.chunks.list(
-                    vector_store_id=VECTOR_STORE_ID,
-                    file_id=file_id,
-                    limit=100,
-                    after=chunks_page.last_id
-                )
-                chunk_count += len(chunks_page.data)
+            chunk_list = getattr(chunks, "data", chunks) or []
+            chunk_count = len(chunk_list)
         except Exception as e:
-            print(f"   ⚠️ Could not list chunks for {file_id}: {e}")
-            chunk_count = -1  # indicates unknown
+            chunk_err = e
 
         print(f"🗂️ File ID: {file_id}")
         print(f"   Filename: {filename}")
-        print(f"   Status: {getattr(rel, 'status', '(unknown)')}")
-        print(f"   Chunk count: {chunk_count if chunk_count >= 0 else '(not available)'}")
-        print(f"   Created at: {getattr(rel, 'created_at', '(n/a)')}")
+        print(f"   Status: {status}")
+        if chunk_count is not None:
+            print(f"   Chunk count: {chunk_count}")
+        else:
+            print(f"   Chunk count: (not available)")
+            if chunk_err:
+                print(f"   ⚠️ list_chunks not available in this SDK/env: {chunk_err}")
+        print(f"   Created at: {ts(created_at)}")
         print("-" * 60)
 
-print("\n✅ Done.")
+    print("\n✅ Done.")
+
+if __name__ == "__main__":
+    main()
