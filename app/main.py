@@ -25,6 +25,7 @@ except Exception:  # pragma: no cover
     Client = None  # type: ignore
 
 import psycopg2.extras
+from psycopg2.extras import RealDictCursor
 
 from app.gpt_extractor import extract_offer_from_pdf_bytes, ExtractionError
 from app.routes.offers_by_documents import router as offers_by_documents_router
@@ -35,7 +36,7 @@ from backend.api.routes.batches import router as batches_router
 from backend.api.routes.qa import router as qa_router
 from app.routes.admin_insurers import router as admin_insurers_router
 from app.routes.admin_tc import router as admin_tc_router
-from app.routes.translate import router as translate_router  # <-- FIXED import
+from app.routes.translate import router as translate_router  # translation endpoints
 from app.extensions.pas_sidecar import run_batch_ingest_sidecar, infer_batch_token_for_docs
 
 APP_NAME = "GPT Offer Extractor"
@@ -1074,6 +1075,46 @@ class ShareCreateBody(BaseModel):
 def _gen_token() -> str:
     return secrets.token_urlsafe(16)
 
+def _infer_batch_token_via_doc_ids(doc_ids: list[str]) -> Optional[str]:
+    """
+    Infer batch_token ONLY from document_ids by matching filenames in offer_files/offer_batches.
+    No org/user assumptions.
+    """
+    if not doc_ids:
+        return None
+    # extract sanitized filenames from the last "::" part
+    fnames: list[str] = []
+    for d in doc_ids:
+        try:
+            fn = d.split("::", 2)[-1]
+        except Exception:
+            continue
+        if fn:
+            fnames.append(_safe_filename(fn))
+    if not fnames:
+        return None
+    try:
+        conn = get_db_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT ob.token AS batch_token
+                    FROM offer_files of
+                    JOIN offer_batches ob ON ob.id = of.batch_id
+                    WHERE of.filename = ANY(%s)
+                    ORDER BY of.id DESC
+                    LIMIT 1
+                    """,
+                    (fnames,),
+                )
+                row = cur.fetchone()
+                return row["batch_token"] if row and row.get("batch_token") else None
+        finally:
+            conn.close()
+    except Exception:
+        return None
+
 @app.post("/shares")
 def create_share_token_only(body: ShareCreateBody, request: Request):
     token = _gen_token()
@@ -1101,10 +1142,8 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
 
     inferred_batch_token = body.batch_token
     if not inferred_batch_token and body.document_ids:
-        try:
-            inferred_batch_token = infer_batch_token_for_docs(body.document_ids, org_id)
-        except Exception as e:
-            print(f"[shares] Failed to infer batch_token: {e}")
+        # org-less inference to avoid crossing into foreign batches
+        inferred_batch_token = _infer_batch_token_via_doc_ids(body.document_ids)
 
     payload = {
         "mode": mode,

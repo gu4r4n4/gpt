@@ -5,10 +5,10 @@ from typing import Optional, Dict, Any
 from fastapi import APIRouter, Query
 from pydantic import BaseModel
 
-# OpenAI import is optional; if it fails we still "fail-open"
+# Optional import; route must work even if the SDK/key are missing
 try:
     from openai import OpenAI  # SDK v1+
-except Exception:  # pragma: no cover
+except Exception:
     OpenAI = None  # type: ignore
 
 router = APIRouter(prefix="/api/translate", tags=["translate"])
@@ -18,69 +18,57 @@ DEFAULT_MODEL = os.getenv("TRANSLATE_MODEL", "gpt-4o-mini")
 
 class TranslateBody(BaseModel):
     text: str
-    targetLang: Optional[str] = None  # required only for direction=out
+    targetLang: Optional[str] = None  # required when direction=out
 
 def _ensure_client() -> Optional["OpenAI"]:
-    """
-    Return OpenAI client if a key + import exist; else None (we fail-open).
-    """
-    global _client
     if not os.getenv("OPENAI_API_KEY"):
         return None
-    if OpenAI is None:  # old SDK not installed / import error
+    if OpenAI is None:
         return None
+    global _client
     if _client is None:
         _client = OpenAI()
     return _client
 
 def _ok_payload(*, original: str, translated_in: Optional[str]=None,
                 translated_out: Optional[str]=None, error: Optional[str]=None) -> Dict[str, Any]:
-    """
-    FE-friendly + stable shape. Always HTTP 200; `ok` remains True even on echo fallback.
-    """
-    payload: Dict[str, Any] = {
-        "ok": True,  # keep UI happy even if we had to echo
-        "text": original or "",            # ALWAYS echo original input here
-        "translatedInput": translated_in,  # set only for direction=in
-        "translatedOutput": translated_out # set only for direction=out
+    # Always HTTP 200; FE-safe shape
+    out: Dict[str, Any] = {
+        "ok": True,
+        "text": original or "",
+        "translatedInput": translated_in,
+        "translatedOutput": translated_out,
     }
     if error:
-        payload["error"] = error  # diagnostic only; UI may ignore
-    return payload
+        out["error"] = error
+    return out
 
-@router.post("")      # /api/translate
-@router.post("/")     # /api/translate/ (avoid proxy 307 weirdness)
+@router.post("")   # /api/translate
+@router.post("/")  # /api/translate/ (avoid proxy/redirect quirks)
 async def translate(
     body: TranslateBody,
     direction: str = Query(..., description="in|out"),
     preserveMarkdown: Optional[bool] = Query(False),
 ):
-    """
-    POST /api/translate?direction=in|out[&preserveMarkdown=true]
-    Body: { "text": "...", "targetLang": "latvian" }
-    Always returns 200 with: { ok, text, translatedInput?, translatedOutput?, error? }
-    """
     raw = (body.text or "").strip()
     if not raw:
         return _ok_payload(original="")
 
     d = (direction or "").strip().lower()
     if d not in {"in", "out"}:
-        # Do not 4xx; echo so FE never blanks
+        # No 4xx; fail-open echo
         return _ok_payload(original=raw, translated_out=raw, error="invalid direction (expected 'in' or 'out')")
 
-    # boolean query can arrive as True/False or "true"/"1"
     pm = str(preserveMarkdown).lower() in {"1", "true", "yes"}
 
     client = _ensure_client()
     if client is None:
-        # No key or SDK import: fail-open (echo)
+        # Echo on missing client/key/import; keep ok=True
         if d == "in":
             return _ok_payload(original=raw, translated_in=raw, error="no OpenAI client (echo)")
         else:
             return _ok_payload(original=raw, translated_out=raw, error="no OpenAI client (echo)")
 
-    # Build system prompt
     if d == "in":
         sys = (
             "Translate the user's message into English. "
@@ -90,7 +78,6 @@ async def translate(
     else:
         tl = (body.targetLang or "").strip()
         if not tl:
-            # Keep FE working; echo + note
             return _ok_payload(original=raw, translated_out=raw, error="targetLang is required for direction=out")
         sys = (
             f"Translate the user's message from English into {tl}. "
@@ -98,27 +85,18 @@ async def translate(
             + "Do not add explanations—return only the translated text."
         )
 
-    # Call OpenAI, but never break the contract
     try:
         rsp = client.chat.completions.create(
             model=DEFAULT_MODEL,
-            messages=[
-                {"role": "system", "content": sys},
-                {"role": "user", "content": raw},
-            ],
+            messages=[{"role": "system", "content": sys}, {"role": "user", "content": raw}],
             temperature=0,
         )
-        out = (rsp.choices[0].message.content or "").strip()
-        if not out:
-            out = raw  # fail-open to echo
-
+        out = (rsp.choices[0].message.content or "").strip() or raw
         if d == "in":
             return _ok_payload(original=raw, translated_in=out)
         else:
             return _ok_payload(original=raw, translated_out=out)
-
     except Exception as e:
-        # Network/401/model errors → echo, but keep ok=True so FE UX doesn’t regress
         if d == "in":
             return _ok_payload(original=raw, translated_in=raw, error=f"{type(e).__name__}: {e}")
         else:
