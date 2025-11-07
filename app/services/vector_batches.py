@@ -3,10 +3,8 @@ import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from hashlib import sha256 as _sha256
-from openai import OpenAI
+from app.services.openai_client import client
 from app.services.openai_compat import ensure_vector_store, add_file_to_store
-
-client = OpenAI()
 
 def get_db_connection():
     db_url = os.getenv("DATABASE_URL")

@@ -1,9 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, Header
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Set
 import os, json, psycopg2, time
 from psycopg2.extras import RealDictCursor
-from openai import OpenAI
+from app.services.openai_client import client
 from datetime import datetime
 from app.services.vectorstores import get_tc_vs, get_offer_vs
 from pypdf import PdfReader
@@ -15,7 +15,6 @@ except ImportError:  # pydantic v1
     from pydantic import validator as _validator  # type: ignore
 
 router = APIRouter(prefix="/api/qa", tags=["qa"])
-client = OpenAI()
 
 def get_db():
     conn = psycopg2.connect(os.getenv("DATABASE_URL"), cursor_factory=RealDictCursor)
@@ -181,11 +180,6 @@ def logs(org_id: int, batch_token: Optional[str] = None, limit: int = 25, offset
 # Scoped Q&A (/ask-share) with fixed citations + strict instructions
 # --------------------------------------------------------------------
 
-class QASource(BaseModel):
-    filename: str
-    retrieval_file_id: str
-    score: float
-
 class QAAskRequest(BaseModel):
     question: str
     share_token: str
@@ -194,7 +188,30 @@ class QAAskRequest(BaseModel):
 
 class QAAskResponse(BaseModel):
     answer: str
-    sources: List[QASource]
+    sources: List[str]
+
+
+def _format_source_label(filename: Optional[str], retrieval_file_id: Optional[str]) -> str:
+    parts = [p.strip() for p in (filename, retrieval_file_id) if p and p.strip()]
+    return " · ".join(parts) if parts else "source"
+
+
+def _normalize_source_strings(raw_sources: List[Any]) -> List[str]:
+    labels: List[str] = []
+    seen: Set[str] = set()
+    for item in raw_sources:
+        if isinstance(item, str):
+            label = item.strip() or "source"
+        elif isinstance(item, dict):
+            filename = item.get("filename")
+            retrieval_file_id = item.get("retrieval_file_id")
+            label = _format_source_label(filename, retrieval_file_id)
+        else:
+            label = "source"
+        if label not in seen:
+            seen.add(label)
+            labels.append(label)
+    return labels
 
 def _count_vs_files(vector_store_id: str) -> int:
     try:
@@ -355,7 +372,37 @@ def ask_share_qa(req: QAAskRequest, conn = Depends(get_db)):
             # Read the last assistant message
             messages = client.beta.threads.messages.list(thread_id=thread.id, order="desc", limit=1)
             answer = ""
-            sources: List[QASource] = []
+            source_labels: List[str] = []
+            seen_labels: Set[str] = set()
+            file_label_cache: Dict[str, str] = {}
+
+            def _label_for_file(file_id: Optional[str], filename_hint: Optional[str] = None) -> str:
+                if not file_id:
+                    return _format_source_label(filename_hint, None)
+                if file_id in file_label_cache:
+                    cached = file_label_cache[file_id]
+                    if filename_hint and " · " not in cached:
+                        # Upgrade cached label with filename hint if we did not include it earlier
+                        updated = _format_source_label(filename_hint, file_id)
+                        file_label_cache[file_id] = updated
+                        return updated
+                    return cached
+                resolved_name = filename_hint
+                if resolved_name is None:
+                    try:
+                        retrieved = client.files.retrieve(file_id)
+                        resolved_name = getattr(retrieved, "filename", None)
+                    except Exception as fetch_err:
+                        print(f"[qa] file-name lookup warn id={file_id}: {fetch_err}")
+                label = _format_source_label(resolved_name, file_id)
+                file_label_cache[file_id] = label
+                return label
+
+            def _append_label(file_id: Optional[str], filename_hint: Optional[str] = None) -> None:
+                label = _label_for_file(file_id, filename_hint)
+                if label not in seen_labels:
+                    seen_labels.add(label)
+                    source_labels.append(label)
 
             for message in messages.data:
                 if message.role == "assistant":
@@ -365,56 +412,55 @@ def ask_share_qa(req: QAAskRequest, conn = Depends(get_db)):
 
                             # Extract citations from annotations (SDK 2.x nesting)
                             for annotation in (content.text.annotations or []):
-                                fid = None
-                                atype = getattr(annotation, "type", "")
-                                if atype == "file_citation" and getattr(annotation, "file_citation", None):
-                                    fid = getattr(annotation.file_citation, "file_id", None)
-                                elif atype == "file_path" and getattr(annotation, "file_path", None):
-                                    fid = getattr(annotation.file_path, "file_id", None)
-                                # legacy flat attribute (defensive)
+                                fid: Optional[str] = None
+                                filename_hint: Optional[str] = None
+                                annotation_type = getattr(annotation, "type", "")
+                                if annotation_type == "file_citation" and getattr(annotation, "file_citation", None):
+                                    file_citation = annotation.file_citation
+                                    fid = getattr(file_citation, "file_id", None)
+                                    filename_hint = getattr(file_citation, "filename", None) or getattr(file_citation, "file_name", None)
+                                elif annotation_type == "file_path" and getattr(annotation, "file_path", None):
+                                    file_path = annotation.file_path
+                                    fid = getattr(file_path, "file_id", None)
+                                    filename_hint = (
+                                        getattr(file_path, "display_name", None)
+                                        or getattr(file_path, "filename", None)
+                                        or getattr(file_path, "title", None)
+                                    )
                                 elif getattr(annotation, "file_id", None):
                                     fid = getattr(annotation, "file_id")
 
-                                if fid:
-                                    sources.append(QASource(
-                                        filename=f"file_{fid[:8]}",
-                                        retrieval_file_id=fid,
-                                        score=0.8
-                                    ))
+                                if fid or filename_hint:
+                                    _append_label(fid, filename_hint)
                     break
 
             # If model forgot to cite, backfill from VS (best-effort, up to 4)
-            if not sources:
+            if not source_labels:
                 try:
-                    backfill_ids = []
+                    backfill_files: List[Any] = []
                     for vsid in vector_store_ids:
                         page = client.vector_stores.files.list(vector_store_id=vsid, limit=10)
-                        backfill_ids.extend([f.id for f in (page.data or [])])
-                    seen = set()
-                    for fid in backfill_ids:
-                        if fid in seen:
-                            continue
-                        seen.add(fid)
-                        sources.append(QASource(
-                            filename=f"file_{fid[:8]}",
-                            retrieval_file_id=fid,
-                            score=0.5
-                        ))
-                        if len(sources) >= 4:
+                        backfill_files.extend(page.data or [])
+                    for vs_file in backfill_files:
+                        fid = getattr(vs_file, "id", None)
+                        filename_hint = getattr(vs_file, "filename", None)
+                        _append_label(fid, filename_hint)
+                        if len(source_labels) >= 4:
                             break
-                    if sources:
-                        print(f"[qa] sources backfilled with {len(sources)} vector store files")
+                    if source_labels:
+                        print(f"[qa] sources backfilled with {len(source_labels)} vector store files")
                 except Exception as e:
                     print(f"[qa] backfill warn: {e}")
 
             # Optional filter
-            if req.insurer_only and sources:
-                sources = [s for s in sources if req.insurer_only.lower() in s.filename.lower()]
+            if req.insurer_only and source_labels:
+                needle = req.insurer_only.lower()
+                source_labels = [label for label in source_labels if needle in label.lower()]
 
             latency_ms = int((time.time() - start_time) * 1000)
             print(f"[qa] done ms={latency_ms}")
 
-            return QAAskResponse(answer=answer, sources=sources)
+            return QAAskResponse(answer=answer, sources=_normalize_source_strings(source_labels))
 
         except Exception as e:
             print(f"[qa] oai-error type={type(e).__name__} msg={e}")

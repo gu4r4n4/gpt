@@ -10,7 +10,9 @@ from pathlib import Path
 
 import psycopg2
 import psycopg2.extras
-from openai import OpenAI
+from psycopg.rows import dict_row
+from app.services.openai_client import client
+from app.services.vectorstores import ensure_offer_vs
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -18,8 +20,6 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not DATABASE_URL or not OPENAI_API_KEY:
     print("Error: DATABASE_URL and OPENAI_API_KEY are required", file=sys.stderr)
     sys.exit(1)
-
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 
 def get_db_connection():
@@ -32,7 +32,7 @@ def delete_openai_file(vector_store_id: str, file_id: str) -> bool:
     try:
         # Try to remove from vector store first
         try:
-            openai_client.vector_stores.files.delete(vector_store_id, file_id)
+            client.vector_stores.files.delete(vector_store_id, file_id)
             print(f"  Removed from vector store: {file_id}")
         except Exception as e:
             if "not_found" not in str(e).lower():
@@ -40,7 +40,7 @@ def delete_openai_file(vector_store_id: str, file_id: str) -> bool:
         
         # Then delete the file itself
         try:
-            openai_client.files.delete(file_id)
+            client.files.delete(file_id)
             print(f"  Deleted OpenAI file: {file_id}")
             return True
         except Exception as e:

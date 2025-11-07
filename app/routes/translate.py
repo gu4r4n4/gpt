@@ -4,7 +4,8 @@ import os
 from typing import Optional, Dict, Any
 from fastapi import APIRouter, Query, HTTPException
 from pydantic import BaseModel
-from openai import OpenAI, APIStatusError, APIConnectionError, RateLimitError
+from openai import APIStatusError, APIConnectionError, RateLimitError
+from app.services.openai_client import client
 
 router = APIRouter(prefix="/api/translate", tags=["translate"])
 
@@ -13,12 +14,6 @@ DEFAULT_MODEL = os.getenv("TRANSLATE_MODEL", "gpt-4o-mini")
 class TranslateBody(BaseModel):
     text: str
     targetLang: Optional[str] = None  # required for direction=out
-
-def _client() -> OpenAI:
-    key = os.getenv("OPENAI_API_KEY")
-    if not key:
-        raise HTTPException(status_code=503, detail="OPENAI_API_KEY not set")
-    return OpenAI(api_key=key)
 
 @router.post("")
 async def translate(
@@ -50,13 +45,22 @@ async def translate(
             + "Return only the translated text."
         )
 
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        # Fail-open by returning original content unchanged
+        if direction == "in":
+            return {"ok": True, "text": raw, "translatedInput": raw, "translatedOutput": None}
+        return {"ok": True, "text": raw, "translatedInput": None, "translatedOutput": raw}
+
     try:
-        rsp = _client().chat.completions.create(
+        rsp = client.chat.completions.create(
             model=DEFAULT_MODEL,
             messages=[{"role":"system","content":sys},{"role":"user","content":raw}],
             temperature=0,
         )
-        out = (rsp.choices[0].message.content or "").strip()
+        first_choice = rsp.choices[0]
+        message_content = first_choice.message.content if first_choice.message else ""
+        out = (message_content or "").strip()
         if not out:
             raise HTTPException(status_code=502, detail="Empty translation from model")
         if direction == "in":

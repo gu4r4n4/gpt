@@ -14,8 +14,9 @@ import psycopg2
 import psycopg2.extras
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, Request
 from fastapi.responses import JSONResponse
-from openai import OpenAI
+from app.services.openai_client import client
 from app.services.vectorstores import ensure_offer_vs
+from app.services.openai_compat import attach_file_to_vector_store
 
 # ---- BATCH SUPPORT (add near other imports/constants) ----
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -74,7 +75,7 @@ STORAGE_ROOT = os.getenv("STORAGE_ROOT", "/tmp")
 S3_BUCKET = os.getenv("S3_BUCKET")
 
 # Initialize OpenAI client
-openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+# openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 router = APIRouter(prefix="/api/offers", tags=["offers"])
 
@@ -246,42 +247,13 @@ def upload_to_openai(content: bytes, filename: str) -> str:
         
         try:
             with open(tmp_file.name, 'rb') as f:
-                file_obj = openai_client.files.create(
+                file_obj = client.files.create(
                     file=f,
                     purpose="assistants"
                 )
             return file_obj.id
         finally:
             os.unlink(tmp_file.name)
-
-
-def attach_to_vector_store(vector_store_id: str, file_id: str) -> None:
-    """
-    Attach file to vector store.
-    Tries stable path first, then beta path for older/newer SDKs.
-    """
-    try:
-        # Try stable (no .beta)
-        if hasattr(openai_client, "vector_stores"):
-            openai_client.vector_stores.files.create(
-                vector_store_id=vector_store_id,
-                file_id=file_id,
-            )
-            return
-        # Fallback: beta namespace
-        if hasattr(openai_client, "beta") and hasattr(openai_client.beta, "vector_stores"):
-            openai_client.beta.vector_stores.files.create(
-                vector_store_id=vector_store_id,
-                file_id=file_id,
-            )
-            return
-        raise RuntimeError("OpenAI client has no vector_stores API (stable or beta)")
-    except Exception as e:
-        # Log full traceback for diagnostics
-        print("[attach_to_vector_store] error:", repr(e))
-        traceback.print_exc()
-        # Re-raise to caller; caller will convert to HTTP 502
-        raise
 
 
 @router.post("/upload")
@@ -397,14 +369,14 @@ async def upload_offer_file(
                 try:
                     # Create file in OpenAI
                     mime = existing.get("mime_type") or (file.content_type if 'file' in locals() else "application/octet-stream")
-                    created_file = openai_client.files.create(
+                    created_file = client.files.create(
                         file=(existing["filename"], fbytes, mime),
                         purpose="assistants",
                     )
                     retrieval_file_id = created_file.id if hasattr(created_file, "id") else created_file["id"]
 
                     # Attach to vector store (stable first, then fallback)
-                    attach_to_vector_store(vector_store_id=vector_store_id, file_id=retrieval_file_id)
+                    attach_file_to_vector_store(client, vector_store_id, retrieval_file_id)
 
                     # Update DB with retrieval_file_id + vector_store_id + embeddings_ready
                     with get_db_connection() as conn, conn.cursor() as cur:
@@ -544,7 +516,7 @@ async def upload_offer_file(
         print(f"Uploaded to OpenAI: {retrieval_file_id}")
         
         # Attach to vector store
-        attach_to_vector_store(vector_store_id, retrieval_file_id)
+        attach_file_to_vector_store(client, vector_store_id, retrieval_file_id)
         print(f"[upload] attached file {retrieval_file_id} to vector store {vector_store_id}")
         print(f"Attached to vector store: {vector_store_id}")
         

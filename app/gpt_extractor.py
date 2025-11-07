@@ -27,11 +27,13 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from jsonschema import Draft202012Validator
-from openai import OpenAI
 from pypdf import PdfReader
+from app.services.openai_client import client as openai_client
+if TYPE_CHECKING:  # pragma: no cover
+    from openai import OpenAI
 
 from app.normalizer import normalize_offer_json
 
@@ -732,18 +734,10 @@ class GPTConfig:
     log_prompts: bool = os.getenv("LOG_PROMPTS", "false").lower() == "true"
     fallback_chat_model: str = os.getenv("FALLBACK_CHAT_MODEL", "gpt-4o-mini")
 
-_client: Optional[OpenAI] = None
-def _client_singleton() -> OpenAI:
-    global _client
-    if _client is None:
-        _client = OpenAI()
-    return _client
-
 # =========================
 # Core: Responses API path
 # =========================
 def _responses_with_pdf(model: str, document_id: str, pdf_bytes: bytes, allow_schema: bool) -> Dict[str, Any]:
-    client = _client_singleton()
     content = [
         {"type": "input_text", "text": _build_user_instructions(document_id)},
         {
@@ -760,7 +754,7 @@ def _responses_with_pdf(model: str, document_id: str, pdf_bytes: bytes, allow_sc
             "json_schema": {"name": "InsurerOfferExtraction_v1", "schema": INSURER_OFFER_SCHEMA, "strict": True},
         }
 
-    resp = client.responses.create(**kwargs)
+    resp = openai_client.responses.create(**kwargs)
 
     payload = getattr(resp, "output_parsed", None)
     if payload is not None:
@@ -778,7 +772,6 @@ def _responses_with_pdf(model: str, document_id: str, pdf_bytes: bytes, allow_sc
 # Fallback: Chat Completions with extracted text
 # =========================
 def _chat_with_text(model: str, document_id: str, pdf_bytes: bytes) -> Dict[str, Any]:
-    client = _client_singleton()
     pages = _pdf_to_text_pages(pdf_bytes)
     user = (
         _build_user_instructions(document_id)
@@ -787,7 +780,7 @@ def _chat_with_text(model: str, document_id: str, pdf_bytes: bytes) -> Dict[str,
     )
 
     try:
-        resp = client.chat.completions.create(
+        resp = openai_client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": "Return STRICT JSON only. No markdown, no prose."},
@@ -798,7 +791,7 @@ def _chat_with_text(model: str, document_id: str, pdf_bytes: bytes) -> Dict[str,
         txt = resp.choices[0].message.content or "{}"
         return json.loads(txt)
     except TypeError:
-        resp = client.chat.completions.create(
+        resp = openai_client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": "Return ONLY raw JSON that matches the required schema. No extra keys."},

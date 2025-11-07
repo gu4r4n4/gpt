@@ -6,11 +6,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 import os, json, psycopg2, traceback
 from psycopg2.extras import RealDictCursor
-from openai import OpenAI
+from app.services.openai_client import client
 from app.services.openai_compat import attach_file_to_vector_store, create_vector_store, delete_file_from_vector_store
 
 router = APIRouter(prefix="/api/admin/tc", tags=["admin-tc"])
-client = OpenAI()
 
 # ✅ use a writable default on Render
 UPLOAD_ROOT = os.getenv("UPLOAD_ROOT", "/tmp/uploads")

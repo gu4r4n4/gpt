@@ -1,11 +1,9 @@
 import os
 import psycopg2
 from pathlib import Path
-from openai import OpenAI
 from psycopg2.extensions import connection as _Conn
+from app.services.openai_client import client
 from app.services.openai_compat import create_vector_store, attach_file_to_vector_store
-
-client = OpenAI()
 
 def ensure_tc_vs(conn: _Conn, org_id: int, product_line: str) -> str:
     """org × product_line vector store (permanent T&C)."""

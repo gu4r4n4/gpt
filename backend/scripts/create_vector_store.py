@@ -1,6 +1,6 @@
 import os, sys
 import psycopg2
-from openai import OpenAI
+from app.services.openai_client import client
 
 ORG_ID = int(os.getenv("ORG_ID", "1"))
 
@@ -9,8 +9,6 @@ api_key = os.getenv("OPENAI_API_KEY")
 if not db_url or not api_key:
     print("Missing env: DATABASE_URL and OPENAI_API_KEY are required", file=sys.stderr)
     sys.exit(1)
-
-client = OpenAI(api_key=api_key)
 
 # 1) Create vector store
 vs = client.vector_stores.create(name=f"org-{ORG_ID}-offers")
@@ -26,3 +24,6 @@ with conn, conn.cursor() as cur:
         ON CONFLICT (org_id) DO UPDATE SET vector_store_id = EXCLUDED.vector_store_id
     """, (ORG_ID, vs.id))
 print("Saved to org_vector_stores for org_id", ORG_ID)
+
+if __name__ == "__main__":
+    main()
