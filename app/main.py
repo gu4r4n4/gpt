@@ -35,7 +35,7 @@ from backend.api.routes.batches import router as batches_router
 from backend.api.routes.qa import router as qa_router
 from app.routes.admin_insurers import router as admin_insurers_router
 from app.routes.admin_tc import router as admin_tc_router
-from app.routes.translate import router as translate_router
+from app.translate import router as translate_router  # <-- FIXED import
 from app.extensions.pas_sidecar import run_batch_ingest_sidecar, infer_batch_token_for_docs
 
 APP_NAME = "GPT Offer Extractor"
@@ -57,7 +57,6 @@ def _coalesce_int(*vals) -> Optional[int]:
     return None
 
 def _ctx_or_defaults(org_id: Optional[int], user_id: Optional[int]) -> tuple[Optional[int], Optional[int]]:
-    """Apply environment defaults if org_id/user_id are None."""
     try_env_org = int(os.getenv("DEFAULT_ORG_ID", "0") or 0)
     try_env_user = int(os.getenv("DEFAULT_USER_ID", "0") or 0)
     if org_id is None and try_env_org > 0:
@@ -94,7 +93,6 @@ def get_db_connection():
     return psycopg2.connect(db_url)
 
 def create_offer_batch(org_id: int, user_id: int, title: str = None) -> tuple[str, int]:
-    """Create a new offer batch and return (batch_token, batch_id)."""
     token = f"bt_{uuid.uuid4().hex[:24]}"
     expires_at = datetime.now(timezone.utc) + timedelta(days=30)
 
@@ -126,7 +124,7 @@ app.include_router(ingest_router)
 app.include_router(offers_upload_router)
 app.include_router(batches_router)
 app.include_router(qa_router)
-app.include_router(translate_router)  # /api/translate endpoints
+app.include_router(translate_router)  # translation endpoints
 app.include_router(admin_insurers_router)
 app.include_router(admin_tc_router)
 
@@ -901,6 +899,9 @@ class OfferUpdateBody(BaseModel):
     insurer: Optional[str] = None
     program_code: Optional[str] = None
 
+# -------------------------------
+# Share links
+# -------------------------------
 def _load_share_record(token: str, attempts: int = 25, delay_s: float = 0.2) -> Optional[Dict[str, Any]]:
     if not token:
         return None
@@ -1054,7 +1055,7 @@ def offers_by_inquiry(inquiry_id: int):
     return _aggregate_offers_rows(rows)
 
 # -------------------------------
-# Share links
+# Share APIs
 # -------------------------------
 class ShareCreateBody(BaseModel):
     title: Optional[str] = None
