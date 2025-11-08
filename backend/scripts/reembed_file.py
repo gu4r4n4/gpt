@@ -16,10 +16,12 @@ import os
 import sys
 import json
 import re
+import tempfile
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from pypdf import PdfReader
 from typing import List
+from openai import OpenAI
 
 # Add parent directory to path to import from backend
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
@@ -43,8 +45,8 @@ def preprocess_pdf_text(t: str) -> str:
     if not t: return t
     # Remove soft hyphens and weird unicode spaces
     t = t.replace("\u00ad", "").replace("\u200B", "")
-    # Merge hyphenation at line breaks: "pro-\ncedūra" -> "procedūra"
-    t = re.sub(r'(\w)[\--]\n(\w)', r'\1\2', t)
+    # Merge hyphenation at line breaks: "pro-\ncedūra" -> "procedūra" (handle both - and – en-dash)
+    t = re.sub(r'(\w)[\-–]\n(\w)', r'\1\2', t)
     # Join lines that break mid-word without hyphen: "operācij\nām" -> "operācijām"
     t = re.sub(r'(\w)\n(\w)', r'\1\2', t)
     # Normalize leftover linebreaks -> paragraphs
@@ -54,6 +56,33 @@ def preprocess_pdf_text(t: str) -> str:
     t = re.sub(r'[ \t]{2,}', ' ', t)
     return t
 
+
+def _download_from_openai_file(retrieval_file_id: str) -> str:
+    """Restore a missing local PDF from OpenAI Files to a temp path."""
+    if not retrieval_file_id:
+        raise Exception("No retrieval_file_id to restore from")
+    client = OpenAI()
+    content = client.files.content(retrieval_file_id)
+    data = content.read() if hasattr(content, "read") else bytes(content)
+    fd, tmp_path = tempfile.mkstemp(suffix=".pdf")
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    return tmp_path
+
+def embed_texts(texts: List[str]) -> List[List[float]]:
+    """Batch-embed chunk texts with text-embedding-3-large (3072 dims)."""
+    client = OpenAI()
+    # You can do true batching with the Responses API as well; keeping it simple/robust here.
+    out = []
+    for tx in texts:
+        tx = tx or ""
+        e = client.embeddings.create(model="text-embedding-3-large", input=tx)
+        out.append(e.data[0].embedding)
+    return out
+
+def _vector_literal(vec: List[float]) -> str:
+    """pgvector text literal for psycopg2 (%s::vector)."""
+    return "[" + ",".join(f"{x:.8f}" for x in vec) + "]"
 
 def chunk_text(text: str, chunk_size: int = 1500, overlap: int = 300) -> List[dict]:
     """
@@ -134,7 +163,8 @@ def reembed_file(file_id: int, conn, chunk_size: int = 1000, overlap: int = 200,
         # Step 1: Load file record
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT id, filename, storage_path, mime_type, org_id, batch_id
+                SELECT id, filename, storage_path, mime_type, org_id, batch_id,
+                       retrieval_file_id, metadata
                 FROM public.offer_files
                 WHERE id = %s
             """, (file_id,))
@@ -145,37 +175,38 @@ def reembed_file(file_id: int, conn, chunk_size: int = 1000, overlap: int = 200,
         
         storage_path = file_record.get("storage_path")
         filename = file_record.get("filename", "unknown.pdf")
-        
+        retrieval_file_id = file_record.get("retrieval_file_id") or (
+            file_record.get("metadata") and file_record["metadata"].get("retrieval_file_id")
+        )
+
         print(f"[embedding] file={filename} path={storage_path}")
-        
-        if not storage_path:
-            raise Exception("storage_path is blank in database")
-        
-        if not os.path.exists(storage_path):
-            raise Exception(f"File not found at path: {storage_path}")
-        
-        # Step 2: Extract text from PDF
+
+        if not storage_path or not os.path.exists(storage_path):
+            if retrieval_file_id:
+                print(f"[embedding] local file missing — restoring from OpenAI file {retrieval_file_id}")
+                storage_path = _download_from_openai_file(retrieval_file_id)
+            else:
+                raise Exception(f"File not found and no retrieval_file_id: {storage_path}")
+
+        # Step 2: Extract & clean
         print(f"[embedding] extracting text from {storage_path}")
         text = extract_text_from_pdf(storage_path)
-        
+        text = preprocess_pdf_text(text)
+
         if not text or len(text.strip()) < 10:
             raise Exception("Extracted text is empty or too short")
-        
-        print(f"[embedding] extracted {len(text)} characters")
-        
-        # Step 3: Clean up PDF artifacts and normalize text
-        text = preprocess_pdf_text(text)
-        print(f"[embedding] preprocessed text to {len(text)} characters")
-        
-        # Step 4: Split into chunks 
+
+        print(f"[embedding] extracted {len(text)} characters (after cleanup)")
+
+        # Step 3: Chunk (slightly larger + bigger overlap for robustness)
+        chunk_size = chunk_size  # keep CLI value
+        overlap = overlap
         print(f"[embedding] chunking text (size={chunk_size}, overlap={overlap})")
         chunks = chunk_text(text, chunk_size=chunk_size, overlap=overlap)
-        
         if not chunks:
             raise Exception("No chunks created from text")
-        
         print(f"[embedding] created {len(chunks)} chunks")
-        
+
         if dry_run:
             print(f"[embedding] DRY RUN - not modifying database")
             print(f"[embedding] Would delete existing chunks and insert {len(chunks)} new chunks")
@@ -187,45 +218,32 @@ def reembed_file(file_id: int, conn, chunk_size: int = 1000, overlap: int = 200,
                 "text_length": len(text),
                 "chunks_would_create": len(chunks)
             }
-        
-        # Step 4: Delete existing chunks for this file
+
+        # Step 4: Compute embeddings for all chunks
+        print(f"[embedding] embedding {len(chunks)} chunks...")
+        embs = embed_texts([c["text"] for c in chunks])
+
+        # Step 5: Replace existing chunks and insert new ones with embeddings
         with conn.cursor() as cur:
-            cur.execute("""
-                DELETE FROM public.offer_chunks
-                WHERE file_id = %s
-            """, (file_id,))
-            deleted_count = cur.rowcount
-            print(f"[embedding] deleted {deleted_count} existing chunks")
-        
-        # Step 5: Insert new chunks
-        inserted_count = 0
-        with conn.cursor() as cur:
-            for idx, chunk in enumerate(chunks):
+            cur.execute("DELETE FROM public.offer_chunks WHERE file_id = %s", (file_id,))
+            deleted_count = cur.rowcount or 0
+            inserted_count = 0
+            for idx, (chunk, emb) in enumerate(zip(chunks, embs)):
+                vec_lit = _vector_literal(emb)  # '[0.1,0.2,...]'
                 cur.execute("""
-                    INSERT INTO public.offer_chunks
-                    (file_id, chunk_index, text, metadata)
-                    VALUES (%s, %s, %s, %s)
-                """, (
-                    file_id,
-                    idx,
-                    chunk["text"],
-                    json.dumps(chunk["metadata"])
-                ))
+                    INSERT INTO public.offer_chunks (file_id, chunk_index, text, metadata, embedding)
+                    VALUES (%s, %s, %s, %s, %s::vector)
+                """, (file_id, idx, chunk["text"], json.dumps(chunk["metadata"]), vec_lit))
                 inserted_count += 1
-        
         conn.commit()
-        print(f"[embedding] inserted {inserted_count} chunks")
-        
-        # Step 6: Set embeddings_ready = true only if chunks were stored
+        print(f"[embedding] deleted {deleted_count} old chunks, inserted {inserted_count} new chunks")
+
+        # Step 6: Mark file as ready
         embeddings_ready = inserted_count > 0
         with conn.cursor() as cur:
-            cur.execute("""
-                UPDATE public.offer_files
-                SET embeddings_ready = %s
-                WHERE id = %s
-            """, (embeddings_ready, file_id))
-            conn.commit()
-        
+            cur.execute("UPDATE public.offer_files SET embeddings_ready = %s WHERE id = %s",
+                      (embeddings_ready, file_id))
+        conn.commit()
         print(f"[embedding] done file_id={file_id} chunks={inserted_count} ready={embeddings_ready}")
         
         return {
