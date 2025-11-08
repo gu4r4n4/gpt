@@ -48,6 +48,15 @@ async def _safe_translate(system: str, text: str, *, timeout_s: float = 20.0) ->
             return text
     return text
 
+def _detect_lang(text: str) -> str:
+    """Use a simple heuristic for Latvian detection - presence of diacritics."""
+    latvian_chars = set('āčēģīķļņōŗšūžĀČĒĢĪĶĻŅŌŖŠŪŽ')
+    text_chars = set(text)
+    # If text contains Latvian diacritics, consider it Latvian
+    if any(c in latvian_chars for c in text_chars):
+        return "lv"
+    return "unknown"
+
 @router.post("")
 async def translate(
     payload: TranslateBody,
@@ -55,6 +64,15 @@ async def translate(
     preserveMarkdown: bool = Query(False),
 ):
     text = (payload.text or "").strip()
+
+    # Auto-detect Latvian and bypass translation
+    detected_lang = _detect_lang(text)
+    if detected_lang == "lv":
+        if direction == "in":
+            return {"translatedInput": text, "detected_lang": "lv", "translated": False}
+        # For outbound, if target is also Latvian, bypass
+        if (payload.targetLang or "").lower() in ("lv", "lav", "latvian"):
+            return {"translatedOutput": text, "detected_lang": "lv", "translated": False}
 
     # No key? Fail-open echo (keeps your FE logic working)
     if not _client_ok():

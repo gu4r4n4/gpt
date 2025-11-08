@@ -4,8 +4,8 @@ CLI script to manually re-embed a file by extracting text, chunking, and storing
 
 Usage:
     python backend/scripts/reembed_file.py --file-id 46
-    python backend/scripts/reembed_file.py --file-id 46 --chunk-size 1500 --overlap 300
-    python backend/scripts/reembed_file.py --batch-id 5  # Re-embed all files in a batch
+    python backend/scripts/reembed_file.py --file-id 46 --chunk-size 2000 --overlap 400  # larger chunks if needed
+    python backend/scripts/reembed_file.py --batch-id 5  # Re-embed all files in batch
 
 Environment variables required:
     DATABASE_URL - PostgreSQL connection string
@@ -15,6 +15,7 @@ import argparse
 import os
 import sys
 import json
+import re
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from pypdf import PdfReader
@@ -38,14 +39,30 @@ def extract_text_from_pdf(pdf_path: str) -> str:
         raise Exception(f"Failed to extract text from PDF: {e}")
 
 
-def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> List[dict]:
+def preprocess_pdf_text(t: str) -> str:
+    if not t: return t
+    # Remove soft hyphens and weird unicode spaces
+    t = t.replace("\u00ad", "").replace("\u200B", "")
+    # Merge hyphenation at line breaks: "pro-\ncedūra" -> "procedūra"
+    t = re.sub(r'(\w)[\--]\n(\w)', r'\1\2', t)
+    # Join lines that break mid-word without hyphen: "operācij\nām" -> "operācijām"
+    t = re.sub(r'(\w)\n(\w)', r'\1\2', t)
+    # Normalize leftover linebreaks -> paragraphs
+    t = re.sub(r'[ \t]*\n[ \t]*', '\n', t)
+    # Collapse excessive newlines/spaces
+    t = re.sub(r'\n{3,}', '\n\n', t)
+    t = re.sub(r'[ \t]{2,}', ' ', t)
+    return t
+
+
+def chunk_text(text: str, chunk_size: int = 1500, overlap: int = 300) -> List[dict]:
     """
     Split text into overlapping chunks.
     
     Args:
         text: Text to chunk
-        chunk_size: Target size of each chunk in characters
-        overlap: Number of characters to overlap between chunks
+        chunk_size: Target size of each chunk in characters (default: 1500)
+        overlap: Number of characters to overlap between chunks (default: 300)
     
     Returns:
         List of dicts with 'text' and 'metadata' keys
@@ -146,7 +163,11 @@ def reembed_file(file_id: int, conn, chunk_size: int = 1000, overlap: int = 200,
         
         print(f"[embedding] extracted {len(text)} characters")
         
-        # Step 3: Split into chunks
+        # Step 3: Clean up PDF artifacts and normalize text
+        text = preprocess_pdf_text(text)
+        print(f"[embedding] preprocessed text to {len(text)} characters")
+        
+        # Step 4: Split into chunks 
         print(f"[embedding] chunking text (size={chunk_size}, overlap={overlap})")
         chunks = chunk_text(text, chunk_size=chunk_size, overlap=overlap)
         
@@ -312,14 +333,14 @@ def main():
     parser.add_argument(
         "--chunk-size",
         type=int,
-        default=1000,
-        help="Target chunk size in characters (default: 1000)"
+        default=1500,
+        help="Target chunk size in characters (default: 1500)"
     )
     parser.add_argument(
         "--overlap",
         type=int,
-        default=200,
-        help="Overlap between chunks in characters (default: 200)"
+        default=300,
+        help="Overlap between chunks in characters (default: 300)"
     )
     parser.add_argument(
         "--dry-run",

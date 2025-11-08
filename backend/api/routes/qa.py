@@ -68,7 +68,32 @@ class AskRequest(BaseModel):
             raise ValueError("product_line must contain only letters (e.g., HEALTH)")
         return v.upper()
 
-SYSTEM_INSTRUCTIONS = """You are an insurance underwriting analyst.
+def _detect_latvian(text: str) -> bool:
+    """Simple heuristic for Latvian text detection."""
+    latvian_chars = set('āčēģīķļņōŗšūžĀČĒĢĪĶĻŅŌŖŠŪŽ')
+    text_chars = set(text)
+    return any(c in latvian_chars for c in text_chars)
+
+def _get_system_instructions(query: str) -> str:
+    """Get system instructions with appropriate language based on query."""
+    is_latvian = _detect_latvian(query)
+    
+    if is_latvian:
+        return """Tu esi apdrošināšanas risku analītiķis.
+Atgriezt TIKAI JSON formātu, bez papildus paskaidrojumiem. Atbildes formāts:
+{
+  "product_line": "<UPPER>",
+  "top3": [
+    {"insurer_code":"<KODS>","score":0.00,"reason":"...","sources":["<faila_nosaukums vai retrieval_id>", "..."]},
+    {"insurer_code":"<KODS>","score":0.00,"reason":"...","sources":["..."]},
+    {"insurer_code":"<KODS>","score":0.00,"reason":"...","sources":["..."]}
+  ],
+  "notes":"neobligāti"
+}
+Score jābūt 0..1. Izmanto pievienotos dokumentus (piedāvājumu kopumu + noteikumus). Katrai pozīcijai norādīt 2-5 avotus (failu nosaukumus vai ID).
+Ja esi nedrošs, tomēr atgriezt derīgu JSON ar labāko pieņēmumu un pieminēt šaubas notes laukā."""
+    
+    return """You are an insurance underwriting analyst.
 Return STRICT JSON only, no prose. Output format:
 {
   "product_line": "<UPPER>",
@@ -91,7 +116,8 @@ def ask(req: AskRequest, conn = Depends(get_db)):
     if not offer_vs:
         raise HTTPException(status_code=404, detail=f"No offer vector store for batch_token={req.batch_token}")
 
-    thread = client.beta.threads.create(messages=[{"role":"system","content":SYSTEM_INSTRUCTIONS},
+    system = _get_system_instructions(req.question)
+    thread = client.beta.threads.create(messages=[{"role":"system","content":system},
                                                   {"role":"user","content":req.question}])
 
     run = client.beta.threads.runs.create(
