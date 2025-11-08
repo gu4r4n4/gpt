@@ -1,77 +1,75 @@
 # app/routes/translate.py
-from __future__ import annotations
-import os
-from typing import Optional, Dict, Any
-from fastapi import APIRouter, Query, HTTPException
+from fastapi import APIRouter, Query
 from pydantic import BaseModel
-from openai import APIStatusError, APIConnectionError, RateLimitError
-from app.services.openai_client import client
+from typing import Optional
+import os, asyncio
+from openai import OpenAI, APIError, RateLimitError, APITimeoutError
 
 router = APIRouter(prefix="/api/translate", tags=["translate"])
-
+_client: Optional[OpenAI] = None
 DEFAULT_MODEL = os.getenv("TRANSLATE_MODEL", "gpt-4o-mini")
 
 class TranslateBody(BaseModel):
     text: str
-    targetLang: Optional[str] = None  # required for direction=out
+    targetLang: Optional[str] = None
+
+def _client_ok() -> bool:
+    return bool(os.getenv("OPENAI_API_KEY"))
+
+def _get_client() -> OpenAI:
+    global _client
+    if _client is None:
+        _client = OpenAI()
+    return _client
+
+async def _safe_translate(system: str, text: str, *, timeout_s: float = 20.0) -> str:
+    if not _client_ok() or not text.strip():
+        return text
+    client = _get_client()
+
+    async def _call():
+        resp = client.chat.completions.create(
+            model=DEFAULT_MODEL,
+            messages=[{"role":"system","content":system},{"role":"user","content":text}],
+            temperature=0,
+        )
+        out = (resp.choices[0].message.content or "").strip()
+        return out or text
+
+    for attempt in range(2):
+        try:
+            return await asyncio.wait_for(_call(), timeout=timeout_s)
+        except (RateLimitError, APITimeoutError, APIError):
+            if attempt == 0:
+                await asyncio.sleep(0.6)
+            else:
+                return text
+        except Exception:
+            return text
+    return text
 
 @router.post("")
 async def translate(
-    body: TranslateBody,
+    payload: TranslateBody,
     direction: str = Query(..., pattern="^(in|out)$"),
-    preserveMarkdown: Optional[bool] = Query(False),
+    preserveMarkdown: bool = Query(False),
 ):
-    raw = (body.text or "").strip()
-    if not raw:
-        return {"ok": True, "text": "", "translatedInput": None, "translatedOutput": None}
+    text = (payload.text or "").strip()
 
-    if direction == "out":
-        tl = (body.targetLang or "").strip()
-        if not tl:
-            raise HTTPException(status_code=400, detail="targetLang is required for direction=out")
-
-    pm = str(preserveMarkdown).lower() in {"1", "true", "yes"}
+    # No key? Fail-open echo (keeps your FE logic working)
+    if not _client_ok():
+        return {"translatedInput": text} if direction == "in" else {"translatedOutput": text}
 
     if direction == "in":
-        sys = (
-            "Translate the user's message into English. "
-            + ("Preserve original Markdown formatting, tables and code blocks. " if pm else "")
-            + "Return only the translated text."
-        )
-    else:
-        sys = (
-            f"Translate the user's message from English into {body.targetLang}. "
-            + ("Preserve Markdown tables, headings and code fences. " if pm else "")
-            + "Return only the translated text."
-        )
+        sys = "Translate into English. " + ("Preserve Markdown tables/code. " if preserveMarkdown else "") + "Return only translated text."
+        out = await _safe_translate(sys, text)
+        return {"translatedInput": out}
 
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        # Fail-open by returning original content unchanged
-        if direction == "in":
-            return {"ok": True, "text": raw, "translatedInput": raw, "translatedOutput": None}
-        return {"ok": True, "text": raw, "translatedInput": None, "translatedOutput": raw}
-
-    try:
-        rsp = client.chat.completions.create(
-            model=DEFAULT_MODEL,
-            messages=[{"role":"system","content":sys},{"role":"user","content":raw}],
-            temperature=0,
-        )
-        first_choice = rsp.choices[0]
-        message_content = first_choice.message.content if first_choice.message else ""
-        out = (message_content or "").strip()
-        if not out:
-            raise HTTPException(status_code=502, detail="Empty translation from model")
-        if direction == "in":
-            return {"ok": True, "text": out, "translatedInput": out, "translatedOutput": None}
-        else:
-            return {"ok": True, "text": out, "translatedInput": None, "translatedOutput": out}
-    except RateLimitError as e:
-        raise HTTPException(status_code=429, detail=f"OpenAI rate limit: {e}") from e
-    except APIConnectionError as e:
-        raise HTTPException(status_code=502, detail=f"OpenAI connection error: {e}") from e
-    except APIStatusError as e:
-        raise HTTPException(status_code=e.status_code or 502, detail=f"OpenAI API error: {e}") from e
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Translation failed: {e}") from e
+    # out: English -> target
+    tl = (payload.targetLang or "").strip()
+    if not tl:
+        # never throw; handshake stays stable
+        return {"translatedOutput": text}
+    sys = f"Translate from English into {tl}. " + ("Preserve Markdown tables/headings/code fences. " if preserveMarkdown else "") + "Return only translated text."
+    out = await _safe_translate(sys, text)
+    return {"translatedOutput": out}
