@@ -4,7 +4,7 @@ from typing import Dict, Any, Optional
 import os
 import uuid
 from psycopg2.extras import RealDictCursor
-from app.main import get_db_connection, _safe_filename
+from backend.api.routes.util import get_db_connection, safe_filename
 
 router = APIRouter(prefix="/api/offers", tags=["offers"])
 
@@ -17,7 +17,7 @@ async def upload_and_chunk(pdf: UploadFile = File(...)) -> Dict[str, Any]:
         raise HTTPException(status_code=415, detail="PDF required")
 
     # 1) Persist the file to disk
-    safe = _safe_filename(pdf.filename or "uploaded.pdf")
+    safe = safe_filename(pdf.filename or "uploaded.pdf")
     batch_token = f"bt_{uuid.uuid4().hex[:24]}"
     batch_dir = os.path.join(_storage_root(), "offers", batch_token)
     os.makedirs(batch_dir, exist_ok=True)

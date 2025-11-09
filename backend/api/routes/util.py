@@ -1,8 +1,19 @@
 """Utility functions for API routes"""
 import os
 from typing import Any, Dict
+from pathlib import Path
 import psycopg2
 from psycopg2.extras import RealDictCursor
+
+def safe_filename(filename: str) -> str:
+    """Sanitize filename for safe storage"""
+    # Remove path components and dangerous characters
+    safe = os.path.basename(filename)
+    # Replace unsafe characters with underscores
+    safe = "".join(c if c.isalnum() or c in ".-_" else "_" for c in safe)
+    # Limit length
+    safe = safe[:100] if len(safe) > 100 else safe
+    return safe or "uploaded_file"
 
 def get_db_connection():
     """Get a database connection using environment variables"""
