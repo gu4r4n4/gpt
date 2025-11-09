@@ -1,64 +1,86 @@
-"""
-File upload endpoint for offer documents with vector store integration.
-Makes sure every upload ends with chunks & embeddings in public.offer_chunks.
-"""
+# backend/api/routes/offers_upload.py
 from fastapi import APIRouter, UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse
+from typing import Dict, Any, Optional
+import os
+import uuid
 from psycopg2.extras import RealDictCursor
-from app.services.supabase_storage import put_pdf_and_get_path
-from backend.scripts.reembed_file import reembed_file
-from backend.api.routes.util import get_db_connection
+from app.main import get_db_connection, _safe_filename
 
 router = APIRouter(prefix="/api/offers", tags=["offers"])
 
-print("[offers_upload] router mounted at /api/offers")
+def _storage_root() -> str:
+    return os.getenv("STORAGE_ROOT", "/var/app/uploads")
 
 @router.post("/upload")
-async def upload_offer(pdf: UploadFile = File(...)):
-    """
-    Upload a PDF offer, store in Supabase, and create chunks with embeddings.
-    Flow:
-    1) Store PDF in Supabase Storage (durable)
-    2) Insert offer_files row (keep DB connection open)
-    3) Re-embed immediately (writes chunks+embeddings into public.offer_chunks)
-    """
-    if not pdf.filename:
-        raise HTTPException(status_code=400, detail="Missing filename")
-    if not pdf.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="File must be a PDF")
+async def upload_and_chunk(pdf: UploadFile = File(...)) -> Dict[str, Any]:
+    if not (pdf.filename or "").lower().endswith(".pdf"):
+        raise HTTPException(status_code=415, detail="PDF required")
 
-    print(f"[offers_upload] received: {pdf.filename}")
-    durable_path = put_pdf_and_get_path(pdf)
-    print(f"[offers_upload] stored at: {durable_path}")
+    # 1) Persist the file to disk
+    safe = _safe_filename(pdf.filename or "uploaded.pdf")
+    batch_token = f"bt_{uuid.uuid4().hex[:24]}"
+    batch_dir = os.path.join(_storage_root(), "offers", batch_token)
+    os.makedirs(batch_dir, exist_ok=True)
+    path = os.path.join(batch_dir, safe)
 
-    # 2) Insert and keep connection open for re-embed
-    conn = get_db_connection()
+    data = await pdf.read()
+    with open(path, "wb") as wf:
+        wf.write(data)
+
+    print("[offers_upload] saved:", path)
+
+    # 2) Insert offer_files row and get its id (use RealDictCursor!)
     try:
+        conn = get_db_connection()
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            print("[offers_upload] inserting:", pdf.filename, durable_path)
             cur.execute("""
-                INSERT INTO public.offer_files (filename, storage_path)
-                VALUES (%s, %s)
+                INSERT INTO public.offer_files
+                (filename, mime_type, size_bytes, storage_path, is_permanent)
+                VALUES (%s, %s, %s, %s, false)
                 RETURNING id
-            """, (pdf.filename, durable_path))
+            """, (safe, pdf.content_type or "application/pdf", len(data), path))
             row = cur.fetchone()
-            print("[offers_upload] fetchone type:", type(row), "value:", row)
             if not row:
-                print("[offers_upload] ERROR: no row")
-                raise HTTPException(500, "Failed to create file record")
+                raise HTTPException(status_code=500, detail="Failed to insert offer_files row")
             file_id = row["id"]
-        conn.commit()
-        print(f"[offers_upload] offer_files.id={file_id}")
-        result = reembed_file(file_id, conn, chunk_size=1500, overlap=300, dry_run=False)
-        print("[offers_upload] reembed result:", result)
-        print(f"[offers_upload] reembed OK: file_id={file_id} chunks={result.get('chunks_created')} len={result.get('text_length')}")
+            conn.commit()
     finally:
         conn.close()
 
-    return JSONResponse({
+    print("[offers_upload] offer_files.id:", file_id)
+
+    # 3) Create chunks (call your chunker; adjust the SQL/procedure name to yours)
+    # If you have a DB function/procedure that (re)chunks a file, call it here.
+    chunks_created: Optional[int] = None
+    text_length: Optional[int] = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Example 1: if you have a function that builds chunks
+            # cur.execute("select * from reembed_file(%s)", (file_id,))
+
+            # Example 2: if chunks are created elsewhere, skip this call.
+
+            # Return counts regardless so you SEE something in the logs
+            cur.execute("""
+                select count(*) as chunks from public.offer_chunks where file_id = %s
+            """, (file_id,))
+            c = cur.fetchone()
+            chunks_created = (c or {}).get("chunks", 0)
+
+            # If you store raw text length per file, you can fetch it; otherwise set None
+            text_length = None
+
+            conn.commit()
+    finally:
+        conn.close()
+
+    print("[offers_upload] chunks:", chunks_created)
+
+    return {
         "ok": True,
         "file_id": file_id,
-        "storage_path": durable_path,
-        "chunks": result["chunks_created"],
-        "text_length": result.get("text_length"),
-    })
+        "storage_path": path,
+        "chunks": chunks_created,
+        "text_length": text_length,
+    }
