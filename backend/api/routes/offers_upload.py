@@ -5,6 +5,7 @@ import os
 import uuid
 from psycopg2.extras import RealDictCursor
 from backend.api.routes.util import get_db_connection, safe_filename
+from backend.api.routes.qa import _reembed_file  # local chunker (no embeddings)
 
 router = APIRouter(prefix="/api/offers", tags=["offers"])
 
@@ -29,7 +30,7 @@ async def upload_and_chunk(pdf: UploadFile = File(...)) -> Dict[str, Any]:
 
     print("[offers_upload] saved:", path)
 
-    # 2) Insert offer_files row and get its id (use RealDictCursor!)
+    # 2) Insert offer_files row and get its id
     try:
         conn = get_db_connection()
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -44,38 +45,24 @@ async def upload_and_chunk(pdf: UploadFile = File(...)) -> Dict[str, Any]:
                 raise HTTPException(status_code=500, detail="Failed to insert offer_files row")
             file_id = row["id"]
             conn.commit()
+
+        # 3) Create chunks immediately (text-only chunks, fast & local)
+        #    _reembed_file uses the same DB; it replaces chunks for this file.
+        _ = _reembed_file(file_id, conn)
+
+        # 4) Return counts
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("select count(*) as chunks from public.offer_chunks where file_id = %s", (file_id,))
+            c = cur.fetchone()
+            chunks_created = (c or {}).get("chunks", 0)
+            text_length = None
+            conn.commit()
     finally:
         conn.close()
 
     print("[offers_upload] offer_files.id:", file_id)
 
-    # 3) Create chunks (call your chunker; adjust the SQL/procedure name to yours)
-    # If you have a DB function/procedure that (re)chunks a file, call it here.
-    chunks_created: Optional[int] = None
-    text_length: Optional[int] = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Example 1: if you have a function that builds chunks
-            # cur.execute("select * from reembed_file(%s)", (file_id,))
-
-            # Example 2: if chunks are created elsewhere, skip this call.
-
-            # Return counts regardless so you SEE something in the logs
-            cur.execute("""
-                select count(*) as chunks from public.offer_chunks where file_id = %s
-            """, (file_id,))
-            c = cur.fetchone()
-            chunks_created = (c or {}).get("chunks", 0)
-
-            # If you store raw text length per file, you can fetch it; otherwise set None
-            text_length = None
-
-            conn.commit()
-    finally:
-        conn.close()
-
-    print("[offers_upload] chunks:", chunks_created)
+    print(f"[offers_upload] chunks: {chunks_created}")
 
     return {
         "ok": True,
