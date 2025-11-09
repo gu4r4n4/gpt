@@ -181,6 +181,17 @@ def reembed_file(file_id: int, conn, chunk_size: int = 1000, overlap: int = 200,
 
         print(f"[embedding] file={filename} path={storage_path}")
 
+        # Handle both local paths and Supabase storage paths
+        if storage_path and storage_path.startswith("supabase://"):
+            from app.services.supabase_storage import get_pdf_from_storage
+            print(f"[embedding] resolving Supabase storage path: {storage_path}")
+            tmp_path = get_pdf_from_storage(storage_path)
+            if tmp_path:
+                storage_path = tmp_path
+            else:
+                raise Exception(f"Failed to get PDF from Supabase storage: {storage_path}")
+
+        # For local paths or OpenAI fallback
         if not storage_path or not os.path.exists(storage_path):
             if retrieval_file_id:
                 print(f"[embedding] local file missing — restoring from OpenAI file {retrieval_file_id}")

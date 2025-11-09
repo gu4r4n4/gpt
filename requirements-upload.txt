@@ -1,5 +1,6 @@
 # Additional dependencies for file upload functionality
-openai>=1.50.0
-psycopg2-binary>=2.9.0
+-r requirements.txt  # Base dependencies
+
+# Upload/embedding extras
 boto3>=1.34.0
 python-magic>=0.4.27
