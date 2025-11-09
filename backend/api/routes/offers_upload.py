@@ -5,7 +5,11 @@ import os
 import uuid
 from psycopg2.extras import RealDictCursor
 from backend.api.routes.util import get_db_connection, safe_filename
-from backend.api.routes.qa import _reembed_file  # local chunker (no embeddings)
+try:
+    from backend.api.routes.qa import _reembed_file
+except Exception:
+    # Fallback to direct function if qa router is not importable in this env
+    from backend.scripts.reembed_file import reembed_file as _reembed_file
 
 router = APIRouter(prefix="/api/offers", tags=["offers"])
 

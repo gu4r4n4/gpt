@@ -16,7 +16,18 @@ def safe_filename(filename: str) -> str:
     return safe or "uploaded_file"
 
 def get_db_connection():
-    """Get a database connection using environment variables"""
+    """
+    Prefer DATABASE_URL (single var, matches the rest of the app).
+    Fallback to PG* envs for local/dev if DATABASE_URL is not present.
+    """
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+
+    db_url = os.environ.get("DATABASE_URL")
+    if db_url:
+        return psycopg2.connect(db_url, cursor_factory=RealDictCursor)
+
+    # Fallback (dev)
     return psycopg2.connect(
         dbname=os.environ.get("PGDATABASE"),
         user=os.environ.get("PGUSER"),
