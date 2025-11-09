@@ -10,6 +10,8 @@ from backend.api.routes.util import get_db_connection
 
 router = APIRouter(prefix="/api/offers", tags=["offers"])
 
+print("[offers_upload] router mounted at /api/offers")
+
 @router.post("/upload")
 async def upload_offer(pdf: UploadFile = File(...)):
     """
@@ -24,35 +26,28 @@ async def upload_offer(pdf: UploadFile = File(...)):
     if not pdf.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="File must be a PDF")
 
-    # 1) Durable storage
+    print(f"[offers_upload] received: {pdf.filename}")
     durable_path = put_pdf_and_get_path(pdf)
+    print(f"[offers_upload] stored at: {durable_path}")
 
     # 2) Insert and keep connection open for re-embed
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                """
+            cur.execute("""
                 INSERT INTO public.offer_files (filename, storage_path)
                 VALUES (%s, %s)
                 RETURNING id
-                """,
-                (pdf.filename, durable_path),
-            )
+            """, (pdf.filename, durable_path))
             row = cur.fetchone()
             if not row:
-                raise HTTPException(status_code=500, detail="Failed to create file record")
+                print("[offers_upload] ERROR: no row")
+                raise HTTPException(500, "Failed to create file record")
             file_id = row["id"]
         conn.commit()
-
-        # 3) Re-embed immediately
-        result = reembed_file(
-            file_id,
-            conn,
-            chunk_size=1500,
-            overlap=300,
-            dry_run=False,
-        )
+        print(f"[offers_upload] offer_files.id={file_id}")
+        result = reembed_file(file_id, conn, chunk_size=1500, overlap=300, dry_run=False)
+        print(f"[offers_upload] reembed OK: file_id={file_id} chunks={result.get('chunks_created')} len={result.get('text_length')}")
     finally:
         conn.close()
 
