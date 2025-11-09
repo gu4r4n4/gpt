@@ -25,7 +25,6 @@ except Exception:  # pragma: no cover
     Client = None  # type: ignore
 
 import psycopg2.extras
-from psycopg2.extras import RealDictCursor
 
 from app.gpt_extractor import extract_offer_from_pdf_bytes, ExtractionError
 from app.routes.offers_by_documents import router as offers_by_documents_router
@@ -36,34 +35,28 @@ from backend.api.routes.batches import router as batches_router
 from backend.api.routes.qa import router as qa_router
 from app.routes.admin_insurers import router as admin_insurers_router
 from app.routes.admin_tc import router as admin_tc_router
-from app.routes.translate import router as translate_router  # translation endpoints
+from app.services.vector_batches import ensure_batch_vector_store, add_file_to_batch_vs, compute_sha256
 from app.extensions.pas_sidecar import run_batch_ingest_sidecar, infer_batch_token_for_docs
 
 APP_NAME = "GPT Offer Extractor"
 APP_VERSION = "1.0.0"
 
-# -------------------------------
-# Helpers: request context & DB
-# -------------------------------
+# Request context resolver
 def _coalesce_int(*vals) -> Optional[int]:
     for v in vals:
-        if v is None:
-            continue
+        if v is None: continue
         try:
             iv = int(v)
-            if iv > 0:
-                return iv
-        except:
-            pass
+            if iv > 0: return iv
+        except: pass
     return None
 
 def _ctx_or_defaults(org_id: Optional[int], user_id: Optional[int]) -> tuple[Optional[int], Optional[int]]:
+    """Apply environment defaults if org_id/user_id are None."""
     try_env_org = int(os.getenv("DEFAULT_ORG_ID", "0") or 0)
     try_env_user = int(os.getenv("DEFAULT_USER_ID", "0") or 0)
-    if org_id is None and try_env_org > 0:
-        org_id = try_env_org
-    if user_id is None and try_env_user > 0:
-        user_id = try_env_user
+    if org_id is None and try_env_org > 0: org_id = try_env_org
+    if user_id is None and try_env_user > 0: user_id = try_env_user
     return org_id, user_id
 
 async def resolve_request_context(
@@ -73,6 +66,7 @@ async def resolve_request_context(
     org_id_form: Optional[int] = None,
     created_by_user_id_form: Optional[int] = None,
 ) -> Tuple[int, int]:
+    # also read raw headers (in case CORS/proxy strips the annotated ones)
     h_org = request.headers.get("x-org-id")
     h_user = request.headers.get("x-user-id")
 
@@ -86,6 +80,7 @@ async def resolve_request_context(
         raise HTTPException(status_code=400, detail="Missing org_id or user_id (X-Org-Id/X-User-Id headers or form fields).")
     return org_id, user_id
 
+# Database helpers for batch integration
 def get_db_connection():
     import psycopg2
     db_url = os.getenv("DATABASE_URL")
@@ -94,19 +89,20 @@ def get_db_connection():
     return psycopg2.connect(db_url)
 
 def create_offer_batch(org_id: int, user_id: int, title: str = None) -> tuple[str, int]:
+    """Create a new offer batch and return (batch_token, batch_id)."""
+    import uuid
+    from datetime import datetime, timedelta, timezone
+    
     token = f"bt_{uuid.uuid4().hex[:24]}"
     expires_at = datetime.now(timezone.utc) + timedelta(days=30)
-
+    
     with get_db_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
+            cur.execute("""
                 INSERT INTO public.offer_batches (org_id, created_by_user_id, token, title, status, expires_at)
                 VALUES (%s, %s, %s, %s, 'active', %s)
                 RETURNING id, token
-                """,
-                (org_id, user_id, token, title, expires_at),
-            )
+            """, (org_id, user_id, token, title, expires_at))
             row = cur.fetchone()
             conn.commit()
             return row[1], row[0]  # token, batch_id
@@ -119,31 +115,30 @@ EXEC: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=EXTRACT_WORKERS)
 _JOBS_LOCK = threading.Lock()
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
-app.include_router(offers_by_documents_router)
+app.include_router(offers_by_documents_router)  # SQLAlchemy router
 app.include_router(debug_db_router)
 app.include_router(ingest_router)
-app.include_router(offers_upload_router)
-app.include_router(batches_router)
-app.include_router(qa_router)
-app.include_router(translate_router)  # translation endpoints
-app.include_router(admin_insurers_router)
-app.include_router(admin_tc_router)
+app.include_router(offers_upload_router)  # File upload with vector store integration
+app.include_router(batches_router)  # Batch management endpoints
+app.include_router(qa_router)  # Q&A endpoints
+app.include_router(admin_insurers_router)  # Admin insurers management
+app.include_router(admin_tc_router)  # Admin terms & conditions management
 
 # -------------------------------
-# CORS
+# CORS (adjust for production)
 # -------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In prod, list your exact FE origins
+    allow_origins=["*"],                 # or your FE origin(s)
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*", "X-Org-Id", "X-User-Id", "X-Share-Token", "X-Count-View"],
-    expose_headers=["X-Request-Id"],
+    allow_headers=["*", "X-Org-Id", "X-User-Id"],  # IMPORTANT
+    expose_headers=["X-Request-Id"],     # optional
     max_age=86400,
 )
 
 # -------------------------------
-# Supabase
+# Supabase setup
 # -------------------------------
 _SUPABASE_URL = os.getenv("SUPABASE_URL")
 _SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
@@ -158,15 +153,15 @@ if _SUPABASE_URL and _SUPABASE_KEY and create_client is not None:
         _supabase = None
 
 # -------------------------------
-# In-memory
+# In-memory helpers (single process)
 # -------------------------------
-_jobs: Dict[str, Dict[str, Any]] = {}
-_LAST_RESULTS: Dict[str, Dict[str, Any]] = {}
-_SHARES_FALLBACK: Dict[str, Dict[str, Any]] = {}
-_INSERTED_IDS: Dict[str, List[int]] = {}
+_jobs: Dict[str, Dict[str, Any]] = {}            # job_id -> { total, done, errors, docs, timings }
+_LAST_RESULTS: Dict[str, Dict[str, Any]] = {}    # doc_id -> payload (dev + supabase-fallback)
+_SHARES_FALLBACK: Dict[str, Dict[str, Any]] = {} # token -> row
+_INSERTED_IDS: Dict[str, List[int]] = {}         # doc_id -> [row ids]
 
 # -------------------------------
-# Context from headers
+# Request context (org & user)
 # -------------------------------
 def _ctx_ids(request: Optional[Request]) -> Tuple[Optional[int], Optional[int]]:
     if not request:
@@ -184,7 +179,7 @@ def _ctx_ids(request: Optional[Request]) -> Tuple[Optional[int], Optional[int]]:
     return org_id, user_id
 
 # -------------------------------
-# Health
+# Health & root
 # -------------------------------
 @app.get("/healthz")
 def healthz():
@@ -204,11 +199,12 @@ def root():
     return {"ok": True}
 
 # -------------------------------
-# Filename helpers
+# Filename sanitization (SAFE doc_id)
 # -------------------------------
 _SAFE_DOC_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
 
 def _safe_filename(name: str) -> str:
+    """Convert user filename to a safe ASCII variant so doc_ids are stable and queryable."""
     name = unicodedata.normalize("NFKD", name or "").encode("ascii", "ignore").decode("ascii")
     base = os.path.basename(name or "uploaded.pdf")
     root, ext = os.path.splitext(base)
@@ -219,12 +215,14 @@ def _safe_filename(name: str) -> str:
     return f"{root}{ext}"
 
 def _make_doc_id(prefix: str, idx: int, filename: str) -> str:
+    """Build the unique document_id used across the system and saved in offers.filename."""
     return f"{prefix}::{idx}::{_safe_filename(filename)}"
 
 # -------------------------------
 # Utilities
 # -------------------------------
 def _num(v: Any) -> Optional[float]:
+    """Best-effort numeric coercion. Returns None for blanks, dashes, N/A, etc."""
     if v is None:
         return None
     if isinstance(v, (int, float)):
@@ -234,9 +232,9 @@ def _num(v: Any) -> Optional[float]:
         if s in {"", "-", "–", "—", "n/a", "N/A", "NA"}:
             return None
         s = s.replace(" ", "").replace(",", ".")
-        if s.count(".") > 1:
-            head, _, tail = s.rpartition(".")
-            head = head.replace(".", "")
+        if s.count('.') > 1:
+            head, _, tail = s.rpartition('.')
+            head = head.replace('.', '')
             s = f"{head}.{tail}"
         try:
             return float(s)
@@ -244,18 +242,29 @@ def _num(v: Any) -> Optional[float]:
             return None
     return None
 
+
 def _inject_meta(payload: Dict[str, Any], *, insurer: str, company: str, insured_count: int, inquiry_id: str) -> None:
+    """Attach meta to payload; inquiry_id is optional/nullable."""
     payload["insurer_hint"] = insurer or payload.get("insurer_hint") or "-"
     payload["company_name"] = company or payload.get("company_name") or "-"
-    payload["employee_count"] = insured_count if isinstance(insured_count, int) else payload.get("employee_count")
+    payload["employee_count"] = (
+        insured_count if isinstance(insured_count, int) else payload.get("employee_count")
+    )
     payload["inquiry_id"] = int(inquiry_id) if str(inquiry_id).isdigit() else None
 
+
+# ---------- Helpers to avoid duplicate (filename, insurer, program_code) ----------
 def _feature_value(x: Any) -> Any:
     if isinstance(x, dict):
         return x.get("value")
     return x
 
 def _disambiguate_duplicate_program_codes(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    For the same (filename, insurer, program_code) appearing more than once,
+    append a meaningful suffix so it becomes unique (e.g., '— stacionārs 750 EUR'
+    or '— prēmija 282'). Falls back to '— variants #n'.
+    """
     groups: Dict[Tuple[str, str, str], List[int]] = {}
     for i, r in enumerate(rows):
         key = (
@@ -285,7 +294,7 @@ def _disambiguate_duplicate_program_codes(rows: List[Dict[str, Any]]) -> List[Di
 
             suffix = None
             if stac not in (None, "", "-"):
-                if isinstance(stac, (int, float)) or (isinstance(stac, str) and stac.replace(".", "", 1).isdigit()):
+                if isinstance(stac, (int, float)) or (isinstance(stac, str) and stac.replace('.', '', 1).isdigit()):
                     suffix = f"stacionārs {stac} EUR"
                 else:
                     suffix = str(stac)
@@ -305,10 +314,18 @@ def _disambiguate_duplicate_program_codes(rows: List[Dict[str, Any]]) -> List[Di
             rows[idx]["program_code"] = uniq
 
     return rows
+# --------------------------------------------------------------------------------------
+
 
 def _rows_for_offers_table(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Convert one normalized extractor payload (with .programs list)
+    into rows for public.offers (one row per program).
+    Uses payload['document_id'] as the 'filename' (unique per batch/job).
+    For "no programs", emits a single error row so the UI can show a failure card.
+    """
     doc_id = payload.get("document_id") or payload.get("source_file") or "uploaded.pdf"
-    inquiry_id = payload.get("inquiry_id")
+    inquiry_id = payload.get("inquiry_id")  # may be None
     company_name = payload.get("company_name")
     employee_count = payload.get("employee_count")
     hint = payload.get("insurer_hint") or None
@@ -320,53 +337,51 @@ def _rows_for_offers_table(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     if programs:
         for prog in programs:
             insurer_val = prog.get("insurer") or hint
-            rows.append(
-                {
-                    "insurer": insurer_val,
-                    "company_hint": hint,
-                    "program_code": prog.get("program_code"),
-                    "source": "api",
-                    "filename": doc_id,
-                    "inquiry_id": inquiry_id,
-                    "base_sum_eur": _num(prog.get("base_sum_eur")),
-                    "premium_eur": _num(prog.get("premium_eur")),
-                    "payment_method": prog.get("payment_method"),
-                    "features": prog.get("features") or {},
-                    "raw_json": payload,
-                    "status": "parsed",
-                    "error": None,
-                    "company_name": company_name,
-                    "employee_count": int(employee_count) if isinstance(employee_count, (int, float)) else None,
-                    "org_id": org_id,
-                    "created_by_user_id": created_by_user_id,
-                }
-            )
-        rows = _disambiguate_duplicate_program_codes(rows)
-    else:
-        rows.append(
-            {
-                "insurer": hint,
+            rows.append({
+                "insurer": insurer_val,
                 "company_hint": hint,
-                "program_code": None,
+                "program_code": prog.get("program_code"),
                 "source": "api",
                 "filename": doc_id,
                 "inquiry_id": inquiry_id,
-                "base_sum_eur": None,
-                "premium_eur": None,
-                "payment_method": None,
-                "features": {},
+                "base_sum_eur": _num(prog.get("base_sum_eur")),
+                "premium_eur": _num(prog.get("premium_eur")),
+                "payment_method": prog.get("payment_method"),
+                "features": prog.get("features") or {},
                 "raw_json": payload,
-                "status": "error",
-                "error": payload.get("_error") or "no programs",
+                "status": "parsed",
+                "error": None,
                 "company_name": company_name,
                 "employee_count": int(employee_count) if isinstance(employee_count, (int, float)) else None,
                 "org_id": org_id,
                 "created_by_user_id": created_by_user_id,
-            }
-        )
+            })
+        rows = _disambiguate_duplicate_program_codes(rows)
+    else:
+        rows.append({
+            "insurer": hint,
+            "company_hint": hint,
+            "program_code": None,
+            "source": "api",
+            "filename": doc_id,
+            "inquiry_id": inquiry_id,
+            "base_sum_eur": None,
+            "premium_eur": None,
+            "payment_method": None,
+            "features": {},
+            "raw_json": payload,
+            "status": "error",
+            "error": payload.get("_error") or "no programs",
+            "company_name": company_name,
+            "employee_count": int(employee_count) if isinstance(employee_count, (int, float)) else None,
+            "org_id": org_id,
+            "created_by_user_id": created_by_user_id,
+        })
     return rows
 
+
 def _aggregate_offers_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Aggregate DB rows to the FE shape grouped by source_file (document_id)."""
     grouped: Dict[str, Dict[str, Any]] = {}
     for r in rows:
         src = r.get("filename") or "-"
@@ -383,17 +398,15 @@ def _aggregate_offers_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "employee_count": r.get("employee_count"),
             }
         if (r.get("status") or "parsed") != "error":
-            grouped[src]["programs"].append(
-                {
-                    "row_id": r.get("id"),
-                    "insurer": r.get("insurer"),
-                    "program_code": r.get("program_code"),
-                    "base_sum_eur": r.get("base_sum_eur"),
-                    "premium_eur": r.get("premium_eur"),
-                    "payment_method": r.get("payment_method"),
-                    "features": r.get("features") or {},
-                }
-            )
+            grouped[src]["programs"].append({
+                "row_id": r.get("id"),
+                "insurer": r.get("insurer"),
+                "program_code": r.get("program_code"),
+                "base_sum_eur": r.get("base_sum_eur"),
+                "premium_eur": r.get("premium_eur"),
+                "payment_method": r.get("payment_method"),
+                "features": r.get("features") or {},
+            })
         if grouped[src]["status"] == "error" and (r.get("status") or "parsed") == "parsed":
             grouped[src]["status"] = "parsed"
             grouped[src]["error"] = None
@@ -404,7 +417,12 @@ def _aggregate_offers_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             g["error"] = "no programs"
     return list(grouped.values())
 
+
 def save_to_supabase(payload: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+    """
+    Insert one row per program into public.offers (or keep in memory if no Supabase).
+    Compatible with older supabase-py that doesn't support .insert(...).select(...).
+    """
     doc_id = payload.get("document_id") or payload.get("source_file") or "uploaded.pdf"
     _LAST_RESULTS[doc_id] = payload
 
@@ -413,10 +431,17 @@ def save_to_supabase(payload: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
 
     try:
         rows = _rows_for_offers_table(payload)
+
         _supabase.table(_OFFERS_TABLE).insert(rows).execute()
 
         try:
-            q = _supabase.table(_OFFERS_TABLE).select("id").eq("filename", doc_id).order("id", desc=False).execute()
+            q = (
+                _supabase.table(_OFFERS_TABLE)
+                .select("id")
+                .eq("filename", doc_id)
+                .order("id", desc=False)
+                .execute()
+            )
             ids = [r["id"] for r in (q.data or []) if isinstance(r, dict) and "id" in r]
             if ids:
                 _INSERTED_IDS[doc_id] = ids
@@ -424,11 +449,13 @@ def save_to_supabase(payload: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
             pass
 
         return True, None
+
     except Exception as e:
         payload["_error"] = f"supabase_insert: {e}"
         _LAST_RESULTS[doc_id] = payload
         print(f"[warn] Supabase insert failed for {doc_id}: {e}")
         return False, str(e)
+
 
 def _rows_from_fallback(doc_ids: List[str]) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
@@ -447,14 +474,21 @@ def _rows_from_fallback(doc_ids: List[str]) -> List[Dict[str, Any]]:
         rows.extend(rs)
     return rows
 
+
 def _offers_by_document_ids(doc_ids: List[str]) -> List[Dict[str, Any]]:
+    """Query offers by exact document_id list (stored in 'filename'). Falls back to memory if empty/error."""
     if not doc_ids:
         return []
     rows: List[Dict[str, Any]] = []
     used_fallback = False
     if _supabase:
         try:
-            res = _supabase.table(_OFFERS_TABLE).select("*").in_("filename", doc_ids).execute()
+            res = (
+                _supabase.table(_OFFERS_TABLE)
+                .select("*")
+                .in_("filename", doc_ids)
+                .execute()
+            )
             rows = res.data or []
         except Exception as e:
             print(f"[warn] Supabase select failed: {e}")
@@ -469,6 +503,7 @@ def _offers_by_document_ids(doc_ids: List[str]) -> List[Dict[str, Any]]:
         obj["_source"] = "fallback" if used_fallback else "supabase"
     return agg
 
+# ---------- NEW helper to derive meta from offers (for share creation) ----------
 def _derive_meta_from_offers(offers: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[int]]:
     company: Optional[str] = None
     employees: Optional[int] = None
@@ -533,6 +568,7 @@ async def extract_pdf(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
 
+# ---- Helper to parse multipart safely (no Pydantic validation for files) ----
 async def _parse_upload_form(request: Request) -> Dict[str, Any]:
     form = await request.form()
 
@@ -565,7 +601,7 @@ async def _parse_upload_form(request: Request) -> Dict[str, Any]:
     if len(insurers) < len(files):
         insurers += [""] * (len(files) - len(insurers))
     elif len(insurers) > len(files):
-        insurers = insurers[: len(files)]
+        insurers = insurers[:len(files)]
 
     return {
         "files": files,
@@ -574,6 +610,7 @@ async def _parse_upload_form(request: Request) -> Dict[str, Any]:
         "insured_count": insured_cnt,
         "inquiry_id": inquiry_id,
     }
+
 
 @app.post("/extract/multiple")
 async def extract_multiple(request: Request):
@@ -628,6 +665,7 @@ async def extract_multiple(request: Request):
 
     return JSONResponse({"documents": doc_ids, "results": results})
 
+
 @app.post("/extract/multiple-async", status_code=202)
 async def extract_multiple_async(request: Request, background_tasks: BackgroundTasks):
     org_id, user_id = _ctx_ids(request)
@@ -659,14 +697,14 @@ async def extract_multiple_async(request: Request, background_tasks: BackgroundT
         print("[sidecar] skip batch: missing org/user")
 
     doc_ids: List[str] = []
-
+    
     for idx, f in enumerate(files, start=1):
         filename = f.filename or "uploaded.pdf"
         doc_id = _make_doc_id(job_id, idx, filename)
         doc_ids.append(doc_id)
         data = await f.read()
-
-        # Persist the file to disk + offer_files row
+        
+        # --- NEW: persist file to disk + offer_files row ---
         if batch_id is not None:
             STORAGE_ROOT = os.getenv("STORAGE_ROOT", "/tmp")
             batch_dir = os.path.join(STORAGE_ROOT, "offers", batch_token)
@@ -680,20 +718,18 @@ async def extract_multiple_async(request: Request, background_tasks: BackgroundT
             # Insert offer_files row
             with get_db_connection() as conn:
                 with conn.cursor() as cur:
-                    cur.execute(
-                        """
+                    cur.execute("""
                         INSERT INTO public.offer_files
                         (org_id, created_by_user_id, batch_id, filename, mime_type, size_bytes, storage_path, insurer_code, is_permanent, product_line)
                         VALUES
                         (%s,%s,%s,%s,%s,%s,%s,%s,false,NULL)
-                        """,
-                        (org_id, user_id, batch_id, safe_name, f.content_type or "application/pdf", len(data), abs_path, insurers[idx - 1] or None),
-                    )
+                    """, (org_id, user_id, batch_id, safe_name, f.content_type or "application/pdf", len(data), abs_path, insurers[idx-1] or None))
                     conn.commit()
             print("[sidecar] offer-file-inserted", safe_name)
         else:
             print("[sidecar] skip persist: no batch_id")
-
+        # --- END NEW ---
+        
         EXEC.submit(
             _process_pdf_bytes,
             data=data,
@@ -711,12 +747,14 @@ async def extract_multiple_async(request: Request, background_tasks: BackgroundT
 
     with _JOBS_LOCK:
         _jobs[job_id]["docs"] = doc_ids
-
+    
+    # Add sidecar task if batch was created
     if batch_id and org_id:
         background_tasks.add_task(run_batch_ingest_sidecar, org_id, batch_id)
         print("[sidecar] scheduled", batch_id)
-
+    
     return {"job_id": job_id, "accepted": len(files), "documents": doc_ids}
+
 
 def _process_pdf_bytes(
     data: bytes,
@@ -787,6 +825,7 @@ def _process_pdf_bytes(
             if rec is not None:
                 rec["done"] += 1
 
+
 @app.get("/jobs/{job_id}")
 def job_status(job_id: str):
     with _JOBS_LOCK:
@@ -794,6 +833,7 @@ def job_status(job_id: str):
         if not job:
             raise HTTPException(status_code=404, detail="job not found")
         return job
+
 
 # -------------------------------
 # Templates API (create/list/instantiate)
@@ -805,7 +845,7 @@ def create_template(
     program_code: str = Form(""),
     label: str = Form(""),
     employees_bucket: int = Form(0),
-    defaults: Dict[str, Any] = Body({}, embed=True),
+    defaults: Dict[str, Any] = Body({}, embed=True),  # { premium_eur, base_sum_eur, payment_method, features:{} }
 ):
     org_id, user_id = _ctx_ids(request)
     if not _supabase:
@@ -823,6 +863,7 @@ def create_template(
     res = _supabase.table("offer_templates").insert(row).execute()
     return {"ok": True, "template": (res.data or [row])[0]}
 
+
 @app.get("/templates")
 def list_templates(request: Request, insurer: str = "", employees_bucket: int = 0, limit: int = 20):
     org_id, _ = _ctx_ids(request)
@@ -837,8 +878,13 @@ def list_templates(request: Request, insurer: str = "", employees_bucket: int = 
     res = q.execute()
     return res.data or []
 
+
 @app.post("/templates/{template_id}/instantiate")
 def instantiate_template(template_id: int, request: Request, company: str = Form(""), insured_count: int = Form(0)):
+    """
+    Create an 'offers' group from a template (source='template', status='draft').
+    Returns a 'document_id' (so the FE can use offers/by-documents exactly like PDFs).
+    """
     org_id, user_id = _ctx_ids(request)
     if not _supabase:
         raise HTTPException(status_code=503, detail="DB not configured")
@@ -849,7 +895,11 @@ def instantiate_template(template_id: int, request: Request, company: str = Form
     tpl = t.data[0]
 
     batch_id = str(uuid.uuid4())
-    doc_id = _make_doc_id(batch_id, 1, f"{tpl.get('insurer','template')}-{tpl.get('program_code') or 'DRAFT'}.tmpl.json")
+    doc_id = _make_doc_id(
+        batch_id,
+        1,
+        f"{tpl.get('insurer','template')}-{tpl.get('program_code') or 'DRAFT'}.tmpl.json"
+    )
     defaults = tpl.get("defaults") or {}
 
     row = {
@@ -892,6 +942,7 @@ def offers_by_job(job_id: str):
     doc_ids = job.get("docs") or []
     return _offers_by_document_ids(doc_ids)
 
+
 class OfferUpdateBody(BaseModel):
     premium_eur: Optional[Any] = None
     base_sum_eur: Optional[Any] = None
@@ -900,10 +951,13 @@ class OfferUpdateBody(BaseModel):
     insurer: Optional[str] = None
     program_code: Optional[str] = None
 
-# -------------------------------
-# Share links
-# -------------------------------
+# ---------- Share token helpers ----------
 def _load_share_record(token: str, attempts: int = 25, delay_s: float = 0.2) -> Optional[Dict[str, Any]]:
+    """
+    Try DB a few times (to bridge replication/lag across instances),
+    then fall back to in-proc cache.
+    Total wait ~5s by default.
+    """
     if not token:
         return None
 
@@ -918,9 +972,14 @@ def _load_share_record(token: str, attempts: int = 25, delay_s: float = 0.2) -> 
                 print(f"[warn] share select failed (attempt {i+1}/{attempts}): {e}")
             if i + 1 < attempts:
                 time.sleep(delay_s)
+
+    # Same-dyno hot cache (works when GET hits the same process as POST)
     return _SHARES_FALLBACK.get(token)
 
 def _parse_to_utc_naive(s: Optional[str]) -> Optional[datetime]:
+    """
+    Parse ISO string with 'Z', '+00:00', or no tz, return UTC-naive datetime.
+    """
     if not s:
         return None
     try:
@@ -945,26 +1004,27 @@ def _ensure_share_editable(share_token: Optional[str]) -> None:
     if not bool(payload.get("editable")):
         raise HTTPException(status_code=403, detail="Share is read-only")
 
+
 def _bump_share_edit(token: Optional[str]) -> None:
+    """Increment edit_count and update last_edited_at for a share token (Supabase-safe)."""
     if not token:
         return
     try:
         if _supabase:
-            _supabase.table(_SHARE_TABLE).update({"last_edited_at": datetime.utcnow().isoformat() + "Z"}).eq("token", token).execute()
+            _supabase.table(_SHARE_TABLE).update({
+                "last_edited_at": datetime.utcnow().isoformat() + "Z"
+            }).eq("token", token).execute()
 
-        # Manual SQL fallback to increment edit_count too
+        # Manual SQL fallback (in case supabase-py doesn't support arithmetic updates)
         try:
             conn = get_db_connection()
             with conn.cursor() as cur:
-                cur.execute(
-                    """
+                cur.execute("""
                     UPDATE share_links
                     SET edit_count = COALESCE(edit_count, 0) + 1,
                         last_edited_at = now()
                     WHERE token = %s
-                    """,
-                    (token,),
-                )
+                """, (token,))
                 conn.commit()
             conn.close()
         except Exception as e:
@@ -980,6 +1040,8 @@ def delete_offer(offer_id: int, x_share_token: Optional[str] = Header(default=No
         raise HTTPException(status_code=503, detail="DB not configured")
     try:
         _supabase.table(_OFFERS_TABLE).delete().eq("id", offer_id).execute()
+
+        # 👇 NEW: bump share edit stats for deletions initiated from share page
         _bump_share_edit(x_share_token)
 
         for doc_id, ids in list(_INSERTED_IDS.items()):
@@ -994,6 +1056,7 @@ def update_offer(
     body: OfferUpdateBody,
     x_share_token: Optional[str] = Header(default=None, alias="X-Share-Token"),
 ):
+    # Share token must be valid & editable when present
     _ensure_share_editable(x_share_token)
 
     if not _supabase:
@@ -1001,18 +1064,20 @@ def update_offer(
 
     updates: Dict[str, Any] = {}
 
+    # --- numeric fields (with robust coercion) ---
     if body.premium_eur is not None:
         v = _num(body.premium_eur)
         if v is None:
             raise HTTPException(status_code=400, detail="premium_eur must be numeric")
         updates["premium_eur"] = v
 
-    if body.base_sum_eur is not None:
+    if body.base_sum_eur is not None:  # <-- FIXED: was 'base_sum_er'
         v = _num(body.base_sum_eur)
         if v is None:
             raise HTTPException(status_code=400, detail="base_sum_eur must be numeric")
         updates["base_sum_eur"] = v
 
+    # --- text/json fields ---
     if body.payment_method is not None:
         updates["payment_method"] = body.payment_method
     if body.features is not None:
@@ -1026,23 +1091,35 @@ def update_offer(
         raise HTTPException(status_code=400, detail="no changes provided")
 
     try:
+        # 1) Perform the update (NO .select() chaining here)
         _supabase.table(_OFFERS_TABLE).update(updates).eq("id", offer_id).execute()
+
+        # 2) Fetch updated row explicitly
         sel = _supabase.table(_OFFERS_TABLE).select("*").eq("id", offer_id).limit(1).execute()
         rows = sel.data or []
         if not rows:
             raise HTTPException(status_code=404, detail="offer not found")
+        # 👇 NEW: bump share edit stats if this edit came from a share page
         _bump_share_edit(x_share_token)
+
         return {"ok": True, "offer": rows[0]}
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"update failed: {e}")
 
+
+# (legacy — still available)
 @app.get("/offers/by-inquiry/{inquiry_id}")
 def offers_by_inquiry(inquiry_id: int):
     if _supabase:
         try:
-            res = _supabase.table(_OFFERS_TABLE).select("*").eq("inquiry_id", inquiry_id).execute()
+            res = (
+                _supabase.table(_OFFERS_TABLE)
+                .select("*")
+                .eq("inquiry_id", inquiry_id)
+                .execute()
+            )
             rows = res.data or []
         except Exception as e:
             print(f"[warn] Supabase by-inquiry failed: {e}")
@@ -1056,9 +1133,10 @@ def offers_by_inquiry(inquiry_id: int):
     return _aggregate_offers_rows(rows)
 
 # -------------------------------
-# Share APIs
+# Token-only Share links (public.share_links)
 # -------------------------------
 class ShareCreateBody(BaseModel):
+    """Create a token that represents a snapshot or a dynamic by-documents view."""
     title: Optional[str] = None
     company_name: Optional[str] = None
     employees_count: Optional[int] = None
@@ -1069,57 +1147,21 @@ class ShareCreateBody(BaseModel):
     role: Optional[str] = None
     allow_edit_fields: Optional[List[str]] = None
     insurer_only: Optional[str] = None
-    batch_token: Optional[str] = None
+    batch_token: Optional[str] = None  # batch for vector store access
+    # FE view preferences (column order, hidden rows, etc.)
     view_prefs: Optional[Dict[str, Any]] = None
 
 def _gen_token() -> str:
     return secrets.token_urlsafe(16)
 
-def _infer_batch_token_via_doc_ids(doc_ids: list[str]) -> Optional[str]:
-    """
-    Infer batch_token ONLY from document_ids by matching filenames in offer_files/offer_batches.
-    No org/user assumptions.
-    """
-    if not doc_ids:
-        return None
-    # extract sanitized filenames from the last "::" part
-    fnames: list[str] = []
-    for d in doc_ids:
-        try:
-            fn = d.split("::", 2)[-1]
-        except Exception:
-            continue
-        if fn:
-            fnames.append(_safe_filename(fn))
-    if not fnames:
-        return None
-    try:
-        conn = get_db_connection()
-        try:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(
-                    """
-                    SELECT ob.token AS batch_token
-                    FROM offer_files of
-                    JOIN offer_batches ob ON ob.id = of.batch_id
-                    WHERE of.filename = ANY(%s)
-                    ORDER BY of.id DESC
-                    LIMIT 1
-                    """,
-                    (fnames,),
-                )
-                row = cur.fetchone()
-                return row["batch_token"] if row and row.get("batch_token") else None
-        finally:
-            conn.close()
-    except Exception:
-        return None
 
 @app.post("/shares")
 def create_share_token_only(body: ShareCreateBody, request: Request):
     token = _gen_token()
+
     mode = "snapshot" if (body.results and len(body.results) > 0) else "by-documents"
 
+    # NEW: derive company/employees when not sent from FE
     derived_company = body.company_name
     derived_employees = body.employees_count
     try:
@@ -1135,16 +1177,21 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
             if derived_employees is None:
                 derived_employees = de
     except Exception:
+        # never block share creation on derivation issues
         pass
 
+    # Get org_id for inference
     org_id, user_id = _ctx_ids(request)
     org_id, user_id = _ctx_or_defaults(org_id, user_id)
-
+    
+    # Try to infer batch_token if not provided
     inferred_batch_token = body.batch_token
     if not inferred_batch_token and body.document_ids:
-        # org-less inference to avoid crossing into foreign batches
-        inferred_batch_token = _infer_batch_token_via_doc_ids(body.document_ids)
-
+        try:
+            inferred_batch_token = infer_batch_token_for_docs(body.document_ids, org_id)
+        except Exception as e:
+            print(f"[shares] Failed to infer batch_token: {e}")
+    
     payload = {
         "mode": mode,
         "title": body.title,
@@ -1156,7 +1203,7 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
         "role": body.role,
         "allow_edit_fields": body.allow_edit_fields,
         "insurer_only": body.insurer_only,
-        "batch_token": inferred_batch_token,
+        "batch_token": inferred_batch_token,  # Include batch token for vector store access
         "view_prefs": body.view_prefs or {},
     }
 
@@ -1169,8 +1216,8 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
         "inquiry_id": None,
         "payload": payload,
         "expires_at": expires_at,
-        "view_prefs": body.view_prefs or {},
-        "org_id": org_id,
+        "view_prefs": body.view_prefs or {},  # stored in dedicated column too
+        "org_id": org_id,  # Set org_id for proper isolation
     }
 
     if _supabase:
@@ -1179,6 +1226,7 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Share create failed: {e}")
 
+    # Always keep a hot cache copy so GET works even if RLS/replication blocks reads.
     _SHARES_FALLBACK[token] = row
 
     base = os.getenv("SHARE_BASE_URL")
@@ -1190,18 +1238,25 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
         except Exception:
             url = f"/shares/{token}"
 
+    # Returning view_prefs here is harmless; FE reads the payload on GET.
     return {"ok": True, "token": token, "url": url, "title": body.title, "view_prefs": body.view_prefs or {}}
+
 
 @app.get("/shares/{token}", name="get_share_token_only")
 def get_share_token_only(token: str, request: Request):
+    """Return snapshot results or dynamic offers for a token.
+       View counting is **opt-in** via ?count=1 or header X-Count-View: 1.
+    """
     share = _load_share_record(token)
     if not share:
         raise HTTPException(status_code=404, detail="Share token not found")
 
+    # Expiry check (robust)
     exp = _parse_to_utc_naive(share.get("expires_at"))
     if exp is not None and datetime.utcnow() > exp:
         raise HTTPException(status_code=404, detail="Share token expired")
 
+    # ---- NEW: opt-in counting ----
     qp_count = (request.query_params.get("count") or "").strip()
     hdr_count = (request.headers.get("X-Count-View") or "").strip()
     should_count_view = qp_count == "1" or hdr_count == "1"
@@ -1212,16 +1267,13 @@ def get_share_token_only(token: str, request: Request):
             conn = get_db_connection()
             try:
                 with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                    cur.execute(
-                        """
+                    cur.execute("""
                         UPDATE share_links
                         SET views_count = COALESCE(views_count, 0) + 1,
                             last_viewed_at = now()
                         WHERE token = %s
                         RETURNING views_count, edit_count, last_viewed_at, last_edited_at
-                        """,
-                        (token,),
-                    )
+                    """, (token,))
                     row = cur.fetchone()
                     if row:
                         updated_stats = dict(row)
@@ -1240,6 +1292,7 @@ def get_share_token_only(token: str, request: Request):
     payload = share.get("payload") or {}
     mode = payload.get("mode") or "snapshot"
 
+    # Build offers (snapshot or dynamic)
     if mode == "snapshot" and payload.get("results"):
         offers = payload["results"]
     elif mode == "by-documents":
@@ -1248,6 +1301,7 @@ def get_share_token_only(token: str, request: Request):
     else:
         offers = []
 
+    # Optional: filter by a single insurer (insurer confirmation links)
     def _norm(s: Optional[str]) -> str:
         return (s or "").strip().lower()
 
@@ -1262,6 +1316,7 @@ def get_share_token_only(token: str, request: Request):
                 filtered.append(ng)
         offers = filtered
 
+    # Shape EXACTLY as Share.tsx expects:
     response_payload = {
         "company_name": payload.get("company_name"),
         "employees_count": payload.get("employees_count"),
@@ -1271,6 +1326,7 @@ def get_share_token_only(token: str, request: Request):
         "view_prefs": share.get("view_prefs") or payload.get("view_prefs") or {},
     }
 
+    # stats for response (if we didn't count this time, fall back to stored values)
     views_count = (updated_stats or share).get("views_count", 0)
     edit_count = (updated_stats or share).get("edit_count", 0)
     last_viewed_at = (updated_stats or share).get("last_viewed_at")
@@ -1279,7 +1335,7 @@ def get_share_token_only(token: str, request: Request):
     return {
         "ok": True,
         "token": token,
-        "payload": response_payload,
+        "payload": response_payload,   # FE reads editable & view_prefs from here
         "offers": offers,
         "views": views_count,
         "edits": edit_count,
@@ -1293,9 +1349,7 @@ def get_share_token_only(token: str, request: Request):
         "last_edited_at": last_edited_at,
     }
 
-# -------------------------------
-# Update share header/meta
-# -------------------------------
+# ---------- update share header/meta (company/employees/view_prefs) ----------
 class ShareUpdateBody(BaseModel):
     company_name: Optional[str] = None
     employees_count: Optional[int] = Field(None, ge=0)
@@ -1322,34 +1376,44 @@ def update_share_token_only(token: str, body: ShareUpdateBody, request: Request)
         raise HTTPException(status_code=404, detail="Share token expired")
 
     payload = rec.get("payload") or {}
+    changed = False
 
+    # Apply known edits into payload/view_prefs
     if body.company_name is not None:
         _share_is_editable(rec, field="company_name")
         payload["company_name"] = body.company_name
+        changed = True
 
     if body.employees_count is not None:
         _share_is_editable(rec, field="employees_count")
         payload["employees_count"] = int(body.employees_count)
+        changed = True
 
     if body.view_prefs is not None:
         _share_is_editable(rec, field="view_prefs")
         payload["view_prefs"] = body.view_prefs
         rec["view_prefs"] = body.view_prefs
+        changed = True
 
     if body.title is not None:
         _share_is_editable(rec, field="title")
         payload["title"] = body.title
+        changed = True
 
+    # NEW: allow broker_profile to be stored inside payload
     if body.broker_profile is not None:
+        # (optionally gate with _share_is_editable if you want)
         payload["broker_profile"] = body.broker_profile
+        changed = True
 
+    # 🔢 Always increment edit_count and set last_edited_at — even if no fields changed.
     updated_stats = None
     try:
         conn = get_db_connection()
         try:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute(
-                    """
+                # 1) Always upsert payload + increment edits
+                cur.execute("""
                     UPDATE share_links
                     SET payload = %s,
                         payload_updated_at = now(),
@@ -1357,28 +1421,25 @@ def update_share_token_only(token: str, body: ShareUpdateBody, request: Request)
                         last_edited_at = now()
                     WHERE token = %s
                     RETURNING views_count, edit_count, last_viewed_at, last_edited_at
-                    """,
-                    (json.dumps(payload), token),
-                )
+                """, (json.dumps(payload), token))
                 row = cur.fetchone()
                 if row:
                     updated_stats = dict(row)
 
+                # 2) Keep dedicated view_prefs column in sync if provided
                 if body.view_prefs is not None:
-                    cur.execute(
-                        """
+                    cur.execute("""
                         UPDATE share_links
                         SET view_prefs = %s
                         WHERE token = %s
-                        """,
-                        (json.dumps(body.view_prefs), token),
-                    )
-
+                    """, (json.dumps(body.view_prefs), token))
+                
                 conn.commit()
         finally:
             conn.close()
     except Exception as e:
         print(f"[warn] Failed to update share and increment edit_count for token {token}: {e}")
+        # Fallback: write via Supabase client (will NOT increment edit_count here)
         if _supabase:
             try:
                 upd_fields: Dict[str, Any] = {"payload": payload}
@@ -1390,11 +1451,13 @@ def update_share_token_only(token: str, body: ShareUpdateBody, request: Request)
         else:
             raise HTTPException(status_code=500, detail=f"Share update failed: {e}")
 
+    # hot cache update
     rec["payload"] = payload
     if body.view_prefs is not None:
         rec["view_prefs"] = body.view_prefs
     _SHARES_FALLBACK[token] = rec
 
+    # optional propagation to offers rows (unchanged)
     if (request.query_params.get("propagate_offers") or "").lower() in {"1", "true", "yes"}:
         try:
             doc_ids = (payload.get("document_ids") or [])
@@ -1416,6 +1479,7 @@ def update_share_token_only(token: str, body: ShareUpdateBody, request: Request)
         except Exception as e:
             print(f"[warn] offers propagation failed: {e}")
 
+    # Response shape (with fresh stats)
     response_payload = {
         "company_name": payload.get("company_name"),
         "employees_count": payload.get("employees_count"),
@@ -1429,7 +1493,7 @@ def update_share_token_only(token: str, body: ShareUpdateBody, request: Request)
     edit_count = (updated_stats or rec).get("edit_count", 0) or 0
     last_viewed_at = (updated_stats or rec).get("last_viewed_at")
     last_edited_at = (updated_stats or rec).get("last_edited_at")
-
+    
     return {
         "ok": True,
         "token": token,
@@ -1442,15 +1506,17 @@ def update_share_token_only(token: str, body: ShareUpdateBody, request: Request)
         },
     }
 
+# POST alias so FE fallback works
 @app.post("/shares/{token}")
 def post_update_share_token_only(token: str, body: ShareUpdateBody, request: Request):
     return update_share_token_only(token, body, request)
 
 @app.get("/shares/{token}/qa")
 async def list_share_qa_public(token: str, limit: int = 200, offset: int = 0):
+    """List Q&A logs for a share token (public endpoint)."""
     if not _supabase:
         raise HTTPException(status_code=503, detail="Database not available")
-
+    
     q = (
         _supabase.table("offer_qa_logs")
         .select("created_at,question,answer,asked_by_user_id,meta")
@@ -1467,36 +1533,33 @@ async def list_share_qa_public(token: str, limit: int = 200, offset: int = 0):
         actor = "broker" if r.get("asked_by_user_id") else "client"
         m = r.get("meta") or {}
         m["actor"] = m.get("actor", actor)
-        items.append(
-            {
-                "created_at": r["created_at"],
-                "question": r["question"],
-                "answer": r["answer"],
-                "meta": m,
-            }
-        )
+        items.append({
+            "created_at": r["created_at"],
+            "question": r["question"],
+            "answer": r["answer"],
+            "meta": m,
+        })
     return {"items": items}
 
 # -------------------------------
-# Debug
+# Debug helpers
 # -------------------------------
 @app.get("/debug/last-results")
 def debug_last_results():
     out = []
     for doc_id, p in _LAST_RESULTS.items():
         status = "parsed" if (p.get("programs") or []) else "error"
-        out.append(
-            {
-                "document_id": doc_id,
-                "original_filename": p.get("original_filename"),
-                "status": status,
-                "error": p.get("_error"),
-                "insurer_hint": p.get("insurer_hint"),
-                "company_name": p.get("company_name"),
-                "employee_count": p.get("employee_count"),
-            }
-        )
+        out.append({
+            "document_id": doc_id,
+            "original_filename": p.get("original_filename"),
+            "status": status,
+            "error": p.get("_error"),
+            "insurer_hint": p.get("insurer_hint"),
+            "company_name": p.get("company_name"),
+            "employee_count": p.get("employee_count"),
+        })
     return out
+
 
 @app.get("/debug/doc/{doc_id}")
 def debug_doc(doc_id: str):
