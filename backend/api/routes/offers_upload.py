@@ -4,6 +4,7 @@ Makes sure every upload ends with chunks & embeddings in public.offer_chunks.
 """
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
+from psycopg2.extras import RealDictCursor
 from app.services.supabase_storage import put_pdf_and_get_path
 from backend.scripts.reembed_file import reembed_file
 from backend.api.routes.util import get_db_connection
@@ -33,13 +34,15 @@ async def upload_offer(pdf: UploadFile = File(...)):
     # 2) Insert and keep connection open for re-embed
     conn = get_db_connection()
     try:
-        with conn.cursor() as cur:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            print("[offers_upload] inserting:", pdf.filename, durable_path)
             cur.execute("""
                 INSERT INTO public.offer_files (filename, storage_path)
                 VALUES (%s, %s)
                 RETURNING id
             """, (pdf.filename, durable_path))
             row = cur.fetchone()
+            print("[offers_upload] fetchone type:", type(row), "value:", row)
             if not row:
                 print("[offers_upload] ERROR: no row")
                 raise HTTPException(500, "Failed to create file record")
@@ -47,6 +50,7 @@ async def upload_offer(pdf: UploadFile = File(...)):
         conn.commit()
         print(f"[offers_upload] offer_files.id={file_id}")
         result = reembed_file(file_id, conn, chunk_size=1500, overlap=300, dry_run=False)
+        print("[offers_upload] reembed result:", result)
         print(f"[offers_upload] reembed OK: file_id={file_id} chunks={result.get('chunks_created')} len={result.get('text_length')}")
     finally:
         conn.close()
