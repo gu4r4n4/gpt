@@ -39,32 +39,8 @@ from app.routes.admin_tc import router as admin_tc_router
 from app.routes.translate import router as translate_router  # translation endpoints
 from app.extensions.pas_sidecar import run_batch_ingest_sidecar, infer_batch_token_for_docs
 
-# App Info
 APP_NAME = "GPT Offer Extractor"
 APP_VERSION = "1.0.0"
-
-# FastAPI App
-app = FastAPI(title=APP_NAME, version=APP_VERSION)
-
-# CORS Configuration
-ALLOWED_ORIGINS = [
-    "https://v2.ongo.lv",
-    "http://localhost:5173",  # dev 
-    "http://localhost:3000",  # dev
-]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=[
-        "*",
-        "X-Share-Token",  # For document sharing
-        "X-Count-View",   # For view counting
-    ],
-    expose_headers=["Content-Disposition"],  # For file downloads
-)
 
 # -------------------------------
 # Helpers: request context & DB
