@@ -1077,39 +1077,43 @@ def _gen_token() -> str:
 
 def _infer_batch_token_via_doc_ids(doc_ids: list[str]) -> Optional[str]:
     """
-    Infer batch_token ONLY from document_ids by matching filenames in offer_files/offer_batches.
-    No org/user assumptions.
+    Infer batch_token ONLY from document_ids by matching sanitized filenames in offer_files→offer_batches.
+    Chooses the batch that contains the MOST of the given filenames.
     """
     if not doc_ids:
         return None
-    # extract sanitized filenames from the last "::" part
+
+    # Extract sanitized filenames from the last '::' segment of each document_id
     fnames: list[str] = []
     for d in doc_ids:
         try:
             fn = d.split("::", 2)[-1]
+            if fn:
+                fnames.append(_safe_filename(fn))
         except Exception:
             continue
-        if fn:
-            fnames.append(_safe_filename(fn))
     if not fnames:
         return None
+
     try:
         conn = get_db_connection()
         try:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                # Count how many of the provided filenames each batch contains; pick the top batch.
                 cur.execute(
                     """
-                    SELECT ob.token AS batch_token
-                    FROM offer_files of
-                    JOIN offer_batches ob ON ob.id = of.batch_id
+                    SELECT ob.token AS batch_token, COUNT(*) AS match_count
+                    FROM public.offer_files of
+                    JOIN public.offer_batches ob ON ob.id = of.batch_id
                     WHERE of.filename = ANY(%s)
-                    ORDER BY of.id DESC
+                    GROUP BY ob.token
+                    ORDER BY match_count DESC, ob.id DESC
                     LIMIT 1
                     """,
                     (fnames,),
                 )
                 row = cur.fetchone()
-                return row["batch_token"] if row and row.get("batch_token") else None
+                return (row or {}).get("batch_token")
         finally:
             conn.close()
     except Exception:
