@@ -124,7 +124,7 @@ app.include_router(debug_db_router)
 app.include_router(ingest_router)
 app.include_router(offers_upload_router)
 app.include_router(batches_router)
-app.include_router(qa_router)
+app.include_router(qa_router, prefix="/api")
 app.include_router(translate_router)  # translation endpoints
 app.include_router(admin_insurers_router)
 app.include_router(admin_tc_router)
