@@ -324,12 +324,20 @@ def ask_share_ping():
     """Health check endpoint for ask-share route"""
     return {"ok": True, "endpoint": "ask-share", "status": "available"}
 
+@router.post("/ask-share/test")
+def ask_share_test():
+    """Simple test endpoint without dependencies or validation"""
+    print("[qa] ask-share/test POST received!")
+    return {"ok": True, "message": "ask-share test endpoint works", "path": "/api/qa/ask-share/test"}
+
 @router.post("/ask-share", response_model=QAAskResponse)
 def ask_share_qa(req: QAAskRequest, conn = Depends(get_db)):
     """Answer using DB chunks for OFFERS (source of truth) and T&C VS for optional extra citations."""
+    print(f"[qa] ask-share POST received: question={req.question[:50] if req.question else 'None'}, share_token={req.share_token[:10] if req.share_token else 'None'}...")
     start_time = time.time()
 
     if not req.question or not req.share_token:
+        print("[qa] ask-share validation failed: missing question or share_token")
         raise HTTPException(status_code=400, detail="Missing question or share_token")
 
     try:

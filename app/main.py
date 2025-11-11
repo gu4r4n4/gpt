@@ -1521,3 +1521,15 @@ async def print_routes():
             methods = ",".join(route.methods)
             print(f"[route] {route.path:50s} {methods}")
     print("=================================\n")
+
+# Request logging middleware
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    path = request.url.path
+    method = request.method
+    if "/api/qa/" in path:
+        print(f"[middleware] {method} {path} - BEFORE route handler")
+    response = await call_next(request)
+    if "/api/qa/" in path:
+        print(f"[middleware] {method} {path} - AFTER route handler - status: {response.status_code}")
+    return response
