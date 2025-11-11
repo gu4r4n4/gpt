@@ -429,7 +429,7 @@ def ask_share_qa(req: QAAskRequest, conn = Depends(get_db)):
         chunk_texts = [(r["text"][:2000] or "") for r in rows]
         
         # Batch embedding to handle large numbers of chunks without timeout
-        BATCH_SIZE = 50
+        BATCH_SIZE = 20  # Conservative batch size to avoid rate limits
         chunk_embs = []
         total_chunks = len(chunk_texts)
         print(f"[qa] Embedding {total_chunks} chunks in batches of {BATCH_SIZE}")
@@ -441,6 +441,10 @@ def ask_share_qa(req: QAAskRequest, conn = Depends(get_db)):
             batch_num = i // BATCH_SIZE + 1
             total_batches = (total_chunks + BATCH_SIZE - 1) // BATCH_SIZE
             print(f"[qa] Embedded batch {batch_num}/{total_batches} ({len(batch)} chunks)")
+            
+            # Add delay between batches to avoid rate limits (skip on last batch)
+            if i + BATCH_SIZE < total_chunks:
+                time.sleep(0.3)
         
         scored = [(_cosine(q_emb, e), r) for e, r in zip(chunk_embs, rows)]
         scored.sort(reverse=True)
