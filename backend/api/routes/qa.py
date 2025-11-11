@@ -451,14 +451,16 @@ def ask_share_qa(req: QAAskRequest, conn = Depends(get_db)):
         out_lang = "lv" if (req.lang or "").lower().startswith("lv") else "en"
         system_msg = (
             "You are a broker assistant.\n"
+            f"CRITICAL: You MUST answer in {'LATVIAN language (latviešu valoda)' if out_lang=='lv' else 'ENGLISH language'} ONLY.\n"
             "Answer ONLY from the provided 'Context' (offers from database) and, if needed, Insurer T&C.\n"
             "If data is missing, say it briefly and continue. Keep it concise.\n"
             "If a table is requested, output it; use '—' for missing cells.\n"
             "When appropriate, add short inline references like [ERGO_-_VA.pdf]."
         )
         user_msg = (
-            f"Question ({'Latvian' if out_lang=='lv' else 'English'}): {question}\n\n"
+            f"Question: {question}\n\n"
             f"Context (offers from database):\n{context}\n\n"
+            f"{'SVARĪGI: Atbildi TIKAI latviešu valodā!' if out_lang=='lv' else 'IMPORTANT: Answer ONLY in English!'}\n"
             "If you must use insurer T&C knowledge, keep references concise."
         )
 
