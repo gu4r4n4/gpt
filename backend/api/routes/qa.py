@@ -427,7 +427,21 @@ def ask_share_qa(req: QAAskRequest, conn = Depends(get_db)):
         question = req.question.strip()
         q_emb = _embed([question])[0]
         chunk_texts = [(r["text"][:2000] or "") for r in rows]
-        chunk_embs = _embed(chunk_texts)
+        
+        # Batch embedding to handle large numbers of chunks without timeout
+        BATCH_SIZE = 50
+        chunk_embs = []
+        total_chunks = len(chunk_texts)
+        print(f"[qa] Embedding {total_chunks} chunks in batches of {BATCH_SIZE}")
+        
+        for i in range(0, total_chunks, BATCH_SIZE):
+            batch = chunk_texts[i:i+BATCH_SIZE]
+            batch_embs = _embed(batch)
+            chunk_embs.extend(batch_embs)
+            batch_num = i // BATCH_SIZE + 1
+            total_batches = (total_chunks + BATCH_SIZE - 1) // BATCH_SIZE
+            print(f"[qa] Embedded batch {batch_num}/{total_batches} ({len(batch)} chunks)")
+        
         scored = [(_cosine(q_emb, e), r) for e, r in zip(chunk_embs, rows)]
         scored.sort(reverse=True)
 
