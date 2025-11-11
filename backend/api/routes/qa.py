@@ -465,7 +465,7 @@ def ask_share_qa(req: QAAskRequest, conn = Depends(get_db)):
             raise
         
         scored = [(_cosine(q_emb, e), r) for e, r in zip(chunk_embs, rows)]
-        scored.sort(reverse=True)
+        scored.sort(key=lambda x: x[0], reverse=True)  # Sort by score only, not row objects
 
         TOP_K = int(os.getenv("QA_TOPK", "12"))
         top = scored[:TOP_K]
