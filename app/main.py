@@ -38,6 +38,7 @@ from app.routes.admin_insurers import router as admin_insurers_router
 from app.routes.admin_tc import router as admin_tc_router
 from app.routes.translate import router as translate_router  # translation endpoints
 from app.extensions.pas_sidecar import run_batch_ingest_sidecar, infer_batch_token_for_docs
+from backend.api.routes.util import safe_filename as _safe_filename  # Unified filename sanitization
 
 APP_NAME = "GPT Offer Extractor"
 APP_VERSION = "1.0.0"
@@ -206,17 +207,9 @@ def root():
 # -------------------------------
 # Filename helpers
 # -------------------------------
-_SAFE_DOC_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
-
-def _safe_filename(name: str) -> str:
-    name = unicodedata.normalize("NFKD", name or "").encode("ascii", "ignore").decode("ascii")
-    base = os.path.basename(name or "uploaded.pdf")
-    root, ext = os.path.splitext(base)
-    root = _SAFE_DOC_CHARS.sub("_", root).strip("._")
-    root = re.sub(r"_+", "_", root)
-    root = root[:100] or "uploaded"
-    ext = ext if ext else ".pdf"
-    return f"{root}{ext}"
+# Note: _safe_filename is now imported from backend.api.routes.util to ensure
+# consistent filename normalization across upload and share inference paths.
+# This prevents batch_token inference failures due to filename mismatches.
 
 def _make_doc_id(prefix: str, idx: int, filename: str) -> str:
     return f"{prefix}::{idx}::{_safe_filename(filename)}"
