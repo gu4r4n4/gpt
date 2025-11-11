@@ -1056,6 +1056,7 @@ class ShareCreateBody(BaseModel):
     company_name: Optional[str] = None
     employees_count: Optional[int] = None
     document_ids: Optional[List[str]] = None
+    file_ids: Optional[List[int]] = Field(None, description="Direct file IDs for multi-file shares")
     results: Optional[List[Dict[str, Any]]] = None
     expires_in_hours: Optional[int] = Field(720, ge=0, description="0 = never expires")
     editable: Optional[bool] = None
@@ -1148,6 +1149,7 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
         "company_name": derived_company,
         "employees_count": derived_employees,
         "document_ids": body.document_ids or [],
+        "file_ids": body.file_ids or [],  # Support direct file IDs for multi-file shares
         "results": body.results if mode == "snapshot" else None,
         "editable": body.editable,
         "role": body.role,

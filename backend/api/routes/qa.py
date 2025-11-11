@@ -26,6 +26,36 @@ def _embed(texts: List[str]) -> List[List[float]]:
     )
     return [d.embedding for d in res.data]
 
+def _select_offer_chunks_by_file_ids(
+    conn,
+    file_ids: List[int],
+    insurer_only: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """
+    Query chunks directly by file IDs (for multi-file shares).
+    Returns: {file_id, filename, chunk_index, text, insurer_code}
+    """
+    with conn.cursor() as cur:
+        params: List[Any] = [file_ids]
+        where_parts = ["oc.file_id = ANY(%s)"]
+        
+        if insurer_only:
+            where_parts.append("(of.insurer_code ILIKE %s OR of.filename ILIKE %s)")
+            like = f"%{insurer_only}%"
+            params.extend([like, like])
+        
+        where_sql = " AND ".join(where_parts)
+        
+        cur.execute(f"""
+            SELECT oc.file_id, of.filename, oc.chunk_index, oc.text, of.insurer_code
+            FROM public.offer_chunks oc
+            JOIN public.offer_files of ON of.id = oc.file_id
+            WHERE {where_sql}
+            ORDER BY oc.file_id, oc.chunk_index
+        """, tuple(params))
+        
+        return cur.fetchall()
+
 def _select_offer_chunks_from_db(
     conn,
     org_id: int,
@@ -364,19 +394,32 @@ def ask_share_qa(req: QAAskRequest, conn = Depends(get_db)):
         if not org_id:
             raise HTTPException(status_code=404, detail="Organization not found")
 
-        if not batch_token:
-            document_ids = payload.get("document_ids", []) or []
-            if document_ids:
-                batch_token = infer_batch_token_for_docs(document_ids, org_id)
-
         # ---------- OFFERS: DB chunks ----------
-        rows = _select_offer_chunks_from_db(
-            conn=conn,
-            org_id=org_id,
-            batch_token=batch_token,
-            document_ids=payload.get("document_ids", []),
-            insurer_only=req.insurer_only
-        )
+        # Priority: file_ids > batch_token > document_ids inference
+        file_ids = payload.get("file_ids", []) or []
+        
+        if file_ids:
+            # NEW: Direct file_ids support (multi-file shares)
+            print(f"[qa] ask-share using file_ids: {file_ids}")
+            rows = _select_offer_chunks_by_file_ids(
+                conn=conn,
+                file_ids=file_ids,
+                insurer_only=req.insurer_only
+            )
+        else:
+            # Legacy: batch_token or document_ids inference
+            if not batch_token:
+                document_ids = payload.get("document_ids", []) or []
+                if document_ids:
+                    batch_token = infer_batch_token_for_docs(document_ids, org_id)
+            
+            rows = _select_offer_chunks_from_db(
+                conn=conn,
+                org_id=org_id,
+                batch_token=batch_token,
+                document_ids=payload.get("document_ids", []),
+                insurer_only=req.insurer_only
+            )
         if not rows:
             raise HTTPException(status_code=404, detail="No offer chunks available for this share")
 
