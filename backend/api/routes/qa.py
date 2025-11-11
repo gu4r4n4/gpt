@@ -85,7 +85,7 @@ try:
 except ImportError:  # pydantic v1
     from pydantic import validator as _validator  # type: ignore
 
-router = APIRouter(prefix="/api/qa", tags=["qa"])
+router = APIRouter(prefix="/qa", tags=["qa"])
 
 def get_db():
     conn = psycopg2.connect(os.getenv("DATABASE_URL"), cursor_factory=RealDictCursor)
