@@ -26,6 +26,31 @@ def _embed(texts: List[str]) -> List[List[float]]:
     )
     return [d.embedding for d in res.data]
 
+def _detect_language(text: str) -> str:
+    """Detect if text is in Latvian based on special characters and common words."""
+    if not text:
+        return "en"
+    
+    text_lower = text.lower()
+    
+    # Check for Latvian-specific characters
+    latvian_chars = set('āčēģīķļņšūž')
+    if any(c in text_lower for c in latvian_chars):
+        return "lv"
+    
+    # Check for common Latvian words
+    latvian_words = ['kā', 'kas', 'vai', 'apdrošināšanas', 'programmu', 
+                     'izveidot', 'salīdzināt', 'norādot', 'izmantojiet',
+                     'lūdzu', 'produktu', 'sīki', 'skaidri', 'ierobežojumus']
+    words = text_lower.split()
+    latvian_word_count = sum(1 for w in words if w in latvian_words)
+    
+    # If more than 10% of words are Latvian, it's Latvian
+    if len(words) > 0 and latvian_word_count / len(words) > 0.1:
+        return "lv"
+    
+    return "en"
+
 def _select_offer_chunks_by_file_ids(
     conn,
     file_ids: List[int],
@@ -467,8 +492,39 @@ def ask_share_qa(req: QAAskRequest, conn = Depends(get_db)):
         scored = [(_cosine(q_emb, e), r) for e, r in zip(chunk_embs, rows)]
         scored.sort(key=lambda x: x[0], reverse=True)  # Sort by score only, not row objects
 
-        TOP_K = int(os.getenv("QA_TOPK", "12"))
-        top = scored[:TOP_K]
+        # Smart chunk selection: ensure coverage across all files/insurers
+        # At least 3 chunks per file to cover all insurers in comparisons
+        CHUNKS_PER_FILE = 3
+        MAX_TOTAL_CHUNKS = 50  # Hard limit to avoid context overflow
+        
+        unique_files = set(r.get('file_id') for _, r in scored if r.get('file_id'))
+        num_files = len(unique_files)
+        print(f"[qa] Selecting chunks from {num_files} files (at least {CHUNKS_PER_FILE} per file)")
+        
+        top = []
+        file_chunk_counts = {}
+        
+        # First pass: ensure minimum coverage per file
+        for score, row in scored:
+            file_id = row.get('file_id')
+            count = file_chunk_counts.get(file_id, 0)
+            
+            if count < CHUNKS_PER_FILE:
+                top.append((score, row))
+                file_chunk_counts[file_id] = count + 1
+            
+            if len(top) >= MAX_TOTAL_CHUNKS:
+                break
+        
+        # Second pass: fill remaining with highest scoring chunks
+        if len(top) < MAX_TOTAL_CHUNKS:
+            for score, row in scored:
+                if len(top) >= MAX_TOTAL_CHUNKS:
+                    break
+                if (score, row) not in top:
+                    top.append((score, row))
+        
+        print(f"[qa] Selected {len(top)} total chunks (coverage: {len(file_chunk_counts)} files)")
 
         # Build context & sources (filenames only)
         context_parts: List[str] = []
@@ -484,14 +540,21 @@ def ask_share_qa(req: QAAskRequest, conn = Depends(get_db)):
         context = "".join(context_parts) if context_parts else "—"
 
         # ---------- Generate answer from DB context via Chat ----------
-        out_lang = "lv" if (req.lang or "").lower().startswith("lv") else "en"
+        # Auto-detect language from question text (more reliable than lang parameter)
+        out_lang = _detect_language(question)
+        print(f"[qa] Detected language: {out_lang} (req.lang was: {req.lang})")
+        
         system_msg = (
-            "You are a broker assistant.\n"
-            f"CRITICAL: You MUST answer in {'LATVIAN language (latviešu valoda)' if out_lang=='lv' else 'ENGLISH language'} ONLY.\n"
-            "Answer ONLY from the provided 'Context' (offers from database) and, if needed, Insurer T&C.\n"
-            "If data is missing, say it briefly and continue. Keep it concise.\n"
-            "If a table is requested, output it; use '—' for missing cells.\n"
-            "When appropriate, add short inline references like [ERGO_-_VA.pdf]."
+            "You are an expert insurance broker assistant.\n"
+            f"CRITICAL: You MUST answer in {'LATVIAN (latviešu valoda)' if out_lang=='lv' else 'ENGLISH'} ONLY.\n"
+            "Answer ONLY from the provided Context (insurance offers from database).\n\n"
+            "IMPORTANT RULES:\n"
+            "- When creating comparison tables, include ALL insurers/programs from the context\n"
+            "- Do not omit any insurer - if specific data is missing, use '—' or 'Nav norādīts'\n"
+            "- Ensure all rows (insurers/programs) and columns (features/parameters) are complete\n"
+            "- For detailed comparisons, organize by categories (e.g., papildprogrammas, limits, costs)\n"
+            "- Add inline file references like [ERGO_VA.pdf] when citing specific offers\n"
+            "- Be thorough and detailed when requested, but stay concise for simple questions"
         )
         user_msg = (
             f"Question: {question}\n\n"
