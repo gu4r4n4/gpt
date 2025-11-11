@@ -1508,3 +1508,16 @@ def debug_doc(doc_id: str):
     if not p:
         raise HTTPException(status_code=404, detail="not found")
     return p
+
+# -------------------------------
+# Route debugging (temporary)
+# -------------------------------
+@app.on_event("startup")
+async def print_routes():
+    from fastapi.routing import APIRoute
+    print("\n=== REGISTERED FASTAPI ROUTES ===")
+    for route in app.routes:
+        if isinstance(route, APIRoute):
+            methods = ",".join(route.methods)
+            print(f"[route] {route.path:50s} {methods}")
+    print("=================================\n")

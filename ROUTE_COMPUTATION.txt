@@ -1,0 +1,112 @@
+╔════════════════════════════════════════════════════════════════════╗
+║           ROUTE PATH COMPUTATION FOR /ask-share                    ║
+╚════════════════════════════════════════════════════════════════════╝
+
+┌─────────────────────────────────────────────────────────────────┐
+│ STEP 1: Router Definition (backend/api/routes/qa.py:88)        │
+├─────────────────────────────────────────────────────────────────┤
+│   router = APIRouter(prefix="/qa", tags=["qa"])                │
+│                                                                 │
+│   Result: Router prefix = "/qa"                                │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│ STEP 2: Endpoint Definition (backend/api/routes/qa.py:327)     │
+├─────────────────────────────────────────────────────────────────┤
+│   @router.post("/ask-share", response_model=QAAskResponse)     │
+│   def ask_share_qa(req: QAAskRequest, ...):                    │
+│                                                                 │
+│   Result: Endpoint path = "/ask-share"                         │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│ STEP 3: Router Mount (app/main.py:127)                         │
+├─────────────────────────────────────────────────────────────────┤
+│   app.include_router(qa_router, prefix="/api")                 │
+│                                                                 │
+│   Result: Mount prefix = "/api"                                │
+└─────────────────────────────────────────────────────────────────┘
+
+╔═════════════════════════════════════════════════════════════════╗
+║ FINAL COMPUTATION                                               ║
+╠═════════════════════════════════════════════════════════════════╣
+║                                                                 ║
+║   Mount prefix:     /api                                        ║
+║   Router prefix:  + /qa                                         ║
+║   Endpoint:       + /ask-share                                  ║
+║   ─────────────────────────────                                 ║
+║   EFFECTIVE PATH:   /api/qa/ask-share    ✅ CORRECT            ║
+║                                                                 ║
+╚═════════════════════════════════════════════════════════════════╝
+
+┌─────────────────────────────────────────────────────────────────┐
+│ CONCLUSION                                                      │
+├─────────────────────────────────────────────────────────────────┤
+│ ✅ NO DOUBLE /api PREFIX                                        │
+│ ✅ ROUTING CONFIGURATION IS CORRECT                             │
+│ ❌ NO PATCH NEEDED FOR ROUTING                                  │
+│                                                                 │
+│ The 404 error is NOT due to routing misconfiguration.          │
+│ Most likely causes:                                             │
+│   1. Server needs restart                                       │
+│   2. Route not loading (import issue)                           │
+│   3. Data dependency problem                                    │
+└─────────────────────────────────────────────────────────────────┘
+
+╔═════════════════════════════════════════════════════════════════╗
+║ VERIFICATION STEPS                                              ║
+╠═════════════════════════════════════════════════════════════════╣
+║                                                                 ║
+║ 1. RESTART SERVER                                               ║
+║    → Loads new debugging code                                   ║
+║                                                                 ║
+║ 2. CHECK STARTUP LOGS                                           ║
+║    → Should show: [route] /api/qa/ask-share     POST           ║
+║                                                                 ║
+║ 3. TEST PING ENDPOINT                                           ║
+║    → curl https://gpt-vis.onrender.com/api/qa/ask-share/ping   ║
+║    → Should return: {"ok": true, ...}                           ║
+║                                                                 ║
+║ 4. TEST POST ENDPOINT                                           ║
+║    → Use test_commands.sh or test_commands.bat                  ║
+║                                                                 ║
+║ 5. IF STILL 404: Check import in main.py                       ║
+║    → Line 36: from backend.api.routes.qa import router ...     ║
+║                                                                 ║
+║ 6. IF RETURNS DATA ERROR: Check chunks                          ║
+║    → GET /api/qa/chunks-report?share_token=...                  ║
+║    → If total_chunks = 0, re-embed files                        ║
+║                                                                 ║
+╚═════════════════════════════════════════════════════════════════╝
+
+╔═════════════════════════════════════════════════════════════════╗
+║ FILES MODIFIED                                                  ║
+╠═════════════════════════════════════════════════════════════════╣
+║ ✅ app/main.py (line 1515)                                      ║
+║    → Added startup event to print all routes                    ║
+║                                                                 ║
+║ ✅ backend/api/routes/qa.py (line 322)                          ║
+║    → Added GET /ask-share/ping endpoint                         ║
+║                                                                 ║
+║ ✅ test_commands.sh                                             ║
+║    → Bash script with all test commands                         ║
+║                                                                 ║
+║ ✅ test_commands.bat                                            ║
+║    → Windows batch script with all test commands                ║
+║                                                                 ║
+║ ✅ ROUTING_ANALYSIS.md                                          ║
+║    → Comprehensive analysis document                            ║
+║                                                                 ║
+║ ✅ QUICK_FIX.md                                                 ║
+║    → Quick reference card                                       ║
+║                                                                 ║
+║ ✅ ROUTE_COMPUTATION.txt (this file)                            ║
+║    → Visual route path computation                              ║
+║                                                                 ║
+╚═════════════════════════════════════════════════════════════════╝
+
+                     ┌─────────────────────┐
+                     │  NEXT ACTION:       │
+                     │  Restart the server │
+                     └─────────────────────┘
+

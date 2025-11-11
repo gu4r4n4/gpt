@@ -319,6 +319,11 @@ def _count_vs_files(vector_store_id: str) -> int:
         print(f"[qa] vs-count warn for {vector_store_id}: {e}")
         return -1
 
+@router.get("/ask-share/ping")
+def ask_share_ping():
+    """Health check endpoint for ask-share route"""
+    return {"ok": True, "endpoint": "ask-share", "status": "available"}
+
 @router.post("/ask-share", response_model=QAAskResponse)
 def ask_share_qa(req: QAAskRequest, conn = Depends(get_db)):
     """Answer using DB chunks for OFFERS (source of truth) and T&C VS for optional extra citations."""
