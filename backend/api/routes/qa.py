@@ -397,15 +397,21 @@ def ask_share_qa(req: QAAskRequest, conn = Depends(get_db)):
         # ---------- OFFERS: DB chunks ----------
         # Priority: file_ids > batch_token > document_ids inference
         file_ids = payload.get("file_ids", []) or []
+        print(f"[qa] Share loaded: org_id={org_id}, batch_token={batch_token}, file_ids={file_ids}")
         
         if file_ids:
             # NEW: Direct file_ids support (multi-file shares)
             print(f"[qa] ask-share using file_ids: {file_ids}")
-            rows = _select_offer_chunks_by_file_ids(
-                conn=conn,
-                file_ids=file_ids,
-                insurer_only=req.insurer_only
-            )
+            try:
+                rows = _select_offer_chunks_by_file_ids(
+                    conn=conn,
+                    file_ids=file_ids,
+                    insurer_only=req.insurer_only
+                )
+                print(f"[qa] Retrieved {len(rows)} chunks from database")
+            except Exception as e:
+                print(f"[qa] ERROR querying chunks by file_ids: {type(e).__name__}: {str(e)}")
+                raise
         else:
             # Legacy: batch_token or document_ids inference
             if not batch_token:
@@ -425,7 +431,15 @@ def ask_share_qa(req: QAAskRequest, conn = Depends(get_db)):
 
         # Rank chunks vs question
         question = req.question.strip()
-        q_emb = _embed([question])[0]
+        print(f"[qa] Starting embedding process for question and {len(rows)} chunks")
+        
+        try:
+            q_emb = _embed([question])[0]
+            print(f"[qa] Question embedded successfully")
+        except Exception as e:
+            print(f"[qa] ERROR embedding question: {type(e).__name__}: {str(e)}")
+            raise
+        
         chunk_texts = [(r["text"][:2000] or "") for r in rows]
         
         # Batch embedding to handle large numbers of chunks without timeout
@@ -434,17 +448,21 @@ def ask_share_qa(req: QAAskRequest, conn = Depends(get_db)):
         total_chunks = len(chunk_texts)
         print(f"[qa] Embedding {total_chunks} chunks in batches of {BATCH_SIZE}")
         
-        for i in range(0, total_chunks, BATCH_SIZE):
-            batch = chunk_texts[i:i+BATCH_SIZE]
-            batch_embs = _embed(batch)
-            chunk_embs.extend(batch_embs)
-            batch_num = i // BATCH_SIZE + 1
-            total_batches = (total_chunks + BATCH_SIZE - 1) // BATCH_SIZE
-            print(f"[qa] Embedded batch {batch_num}/{total_batches} ({len(batch)} chunks)")
-            
-            # Add delay between batches to avoid rate limits (skip on last batch)
-            if i + BATCH_SIZE < total_chunks:
-                time.sleep(0.3)
+        try:
+            for i in range(0, total_chunks, BATCH_SIZE):
+                batch = chunk_texts[i:i+BATCH_SIZE]
+                batch_embs = _embed(batch)
+                chunk_embs.extend(batch_embs)
+                batch_num = i // BATCH_SIZE + 1
+                total_batches = (total_chunks + BATCH_SIZE - 1) // BATCH_SIZE
+                print(f"[qa] Embedded batch {batch_num}/{total_batches} ({len(batch)} chunks)")
+                
+                # Add delay between batches to avoid rate limits (skip on last batch)
+                if i + BATCH_SIZE < total_chunks:
+                    time.sleep(0.3)
+        except Exception as e:
+            print(f"[qa] ERROR during batch embedding: {type(e).__name__}: {str(e)}")
+            raise
         
         scored = [(_cosine(q_emb, e), r) for e, r in zip(chunk_embs, rows)]
         scored.sort(reverse=True)
@@ -595,8 +613,10 @@ def ask_share_qa(req: QAAskRequest, conn = Depends(get_db)):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[qa] error: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+        print(f"[qa] FATAL ERROR: {type(e).__name__}: {str(e)}")
+        import traceback
+        traceback.print_exc()  # Print full stack trace to logs
+        raise HTTPException(status_code=500, detail=f"Internal error: {type(e).__name__}: {str(e)}")
 
 # --------------------------------------------------------------------
 # Seed T&C (unchanged)
