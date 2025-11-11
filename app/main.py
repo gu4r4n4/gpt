@@ -34,6 +34,7 @@ from app.routes.ingest import router as ingest_router
 from backend.api.routes.offers_upload import router as offers_upload_router
 from backend.api.routes.batches import router as batches_router
 from backend.api.routes.qa import router as qa_router
+from backend.api.routes.tc import router as tc_router
 from app.routes.admin_insurers import router as admin_insurers_router
 from app.routes.admin_tc import router as admin_tc_router
 from app.routes.translate import router as translate_router  # translation endpoints
@@ -126,6 +127,7 @@ app.include_router(ingest_router)
 app.include_router(offers_upload_router)
 app.include_router(batches_router)
 app.include_router(qa_router, prefix="/api")
+app.include_router(tc_router, prefix="/api/tc")  # T&C and law document management
 app.include_router(translate_router)  # translation endpoints
 app.include_router(admin_insurers_router)
 app.include_router(admin_tc_router)

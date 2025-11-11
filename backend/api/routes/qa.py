@@ -51,6 +51,98 @@ def _detect_language(text: str) -> str:
     
     return "en"
 
+def _extract_insurer_from_filename(filename: str) -> Optional[str]:
+    """
+    Extract insurer name from filename.
+    Examples: "ERGO_VA.pdf" -> "ERGO", "BTA_Health.pdf" -> "BTA"
+    """
+    if not filename:
+        return None
+    
+    # Common insurer name patterns
+    insurer_mapping = {
+        "ERGO": ["ERGO", "Ergo"],
+        "BTA": ["BTA", "Bta"],
+        "GJENSIDIGE": ["GJENSIDIGE", "Gjensidige"],
+        "IF": ["IF", "If"],
+        "SEESAM": ["SEESAM", "Seesam"],
+        "COMPENSA": ["COMPENSA", "Compensa"],
+        "BALCIA": ["BALCIA", "Balcia"],
+        "BALTA": ["BALTA", "Balta"],
+        "ADB": ["ADB", "Adb"],
+        "PZU": ["PZU", "Pzu"]
+    }
+    
+    # Check for insurer names in filename
+    filename_upper = filename.upper()
+    for canonical_name, patterns in insurer_mapping.items():
+        for pattern in patterns:
+            if pattern.upper() in filename_upper:
+                return canonical_name
+    
+    # Try to extract first part before underscore or dash
+    parts = filename.replace("-", "_").split("_")
+    if parts:
+        first_part = parts[0].upper()
+        # Check if it matches any known insurer
+        for canonical_name in insurer_mapping.keys():
+            if first_part == canonical_name:
+                return canonical_name
+    
+    return None
+
+def _select_tc_chunks(
+    conn,
+    org_id: int,
+    insurers: List[str],
+    product_line: str
+) -> List[Dict[str, Any]]:
+    """
+    Get T&C chunks for specific insurers and product line.
+    Returns: {file_id, insurer_name, filename, chunk_index, text}
+    """
+    if not insurers:
+        return []
+    
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT tc.file_id, tf.insurer_name, tf.filename, 
+                   tc.chunk_index, tc.text
+            FROM public.tc_chunks tc
+            JOIN public.tc_files tf ON tf.id = tc.file_id
+            WHERE tf.org_id = %s
+              AND tf.insurer_name = ANY(%s)
+              AND tf.product_line = %s
+              AND tf.embeddings_ready = true
+              AND (tf.expires_at IS NULL OR tf.expires_at > NOW())
+            ORDER BY tf.effective_from DESC NULLS LAST, tf.insurer_name, tc.chunk_index
+        """, (org_id, insurers, product_line))
+        
+        return cur.fetchall()
+
+def _select_law_chunks(
+    conn,
+    product_line: str,
+    top_k: int = 20
+) -> List[Dict[str, Any]]:
+    """
+    Get relevant law chunks for a product line.
+    Returns: {file_id, law_name, filename, chunk_index, text}
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT lc.file_id, lf.law_name, lf.filename,
+                   lc.chunk_index, lc.text
+            FROM public.law_chunks lc
+            JOIN public.law_files lf ON lf.id = lc.file_id
+            WHERE lf.embeddings_ready = true
+              AND (lf.product_line IS NULL OR lf.product_line = %s)
+            ORDER BY lf.effective_from DESC NULLS LAST, lc.chunk_index
+            LIMIT %s
+        """, (product_line, top_k))
+        
+        return cur.fetchall()
+
 def _select_offer_chunks_by_file_ids(
     conn,
     file_ids: List[int],
@@ -454,9 +546,54 @@ def ask_share_qa(req: QAAskRequest, conn = Depends(get_db)):
         if not rows:
             raise HTTPException(status_code=404, detail="No offer chunks available for this share")
 
+        # ---------- T&C & LAWS: Enhance context ----------
+        # Extract insurers from offer chunks to get relevant T&C
+        insurers_in_offers = set()
+        for row in rows:
+            filename = row.get("filename") or ""
+            insurer = _extract_insurer_from_filename(filename)
+            if insurer:
+                insurers_in_offers.add(insurer)
+        
+        print(f"[qa] Identified insurers in offers: {insurers_in_offers}")
+        
+        # Get T&C chunks for these insurers (Health product line for now)
+        # TODO: Auto-detect product line from context or make it configurable
+        tc_rows = []
+        law_rows = []
+        
+        if insurers_in_offers:
+            try:
+                product_line = "Health"  # TODO: Make dynamic
+                tc_rows = _select_tc_chunks(
+                    conn=conn,
+                    org_id=org_id,
+                    insurers=list(insurers_in_offers),
+                    product_line=product_line
+                )
+                print(f"[qa] Retrieved {len(tc_rows)} T&C chunks for {product_line}")
+            except Exception as e:
+                print(f"[qa] WARN: T&C retrieval failed: {e}")
+        
+        # Get relevant law chunks
+        try:
+            product_line = "Health"  # TODO: Make dynamic
+            law_rows = _select_law_chunks(
+                conn=conn,
+                product_line=product_line,
+                top_k=20
+            )
+            print(f"[qa] Retrieved {len(law_rows)} law chunks for {product_line}")
+        except Exception as e:
+            print(f"[qa] WARN: Law retrieval failed: {e}")
+        
+        # Combine all chunks for ranking (offer + T&C + laws)
+        all_rows = rows + tc_rows + law_rows
+        print(f"[qa] Total chunks for ranking: {len(all_rows)} (offers: {len(rows)}, T&C: {len(tc_rows)}, laws: {len(law_rows)})")
+
         # Rank chunks vs question
         question = req.question.strip()
-        print(f"[qa] Starting embedding process for question and {len(rows)} chunks")
+        print(f"[qa] Starting embedding process for question and {len(all_rows)} chunks")
         
         try:
             q_emb = _embed([question])[0]
@@ -465,7 +602,7 @@ def ask_share_qa(req: QAAskRequest, conn = Depends(get_db)):
             print(f"[qa] ERROR embedding question: {type(e).__name__}: {str(e)}")
             raise
         
-        chunk_texts = [(r["text"][:2000] or "") for r in rows]
+        chunk_texts = [(r["text"][:2000] or "") for r in all_rows]
         
         # Batch embedding to handle large numbers of chunks without timeout
         BATCH_SIZE = 20  # Conservative batch size to avoid rate limits
@@ -489,7 +626,7 @@ def ask_share_qa(req: QAAskRequest, conn = Depends(get_db)):
             print(f"[qa] ERROR during batch embedding: {type(e).__name__}: {str(e)}")
             raise
         
-        scored = [(_cosine(q_emb, e), r) for e, r in zip(chunk_embs, rows)]
+        scored = [(_cosine(q_emb, e), r) for e, r in zip(chunk_embs, all_rows)]
         scored.sort(key=lambda x: x[0], reverse=True)  # Sort by score only, not row objects
 
         # Smart chunk selection: ensure coverage across all files/insurers
@@ -499,7 +636,7 @@ def ask_share_qa(req: QAAskRequest, conn = Depends(get_db)):
         
         unique_files = set(r.get('file_id') for _, r in scored if r.get('file_id'))
         num_files = len(unique_files)
-        print(f"[qa] Selecting chunks from {num_files} files (at least {CHUNKS_PER_FILE} per file)")
+        print(f"[qa] Selecting chunks from {num_files} files (at least {CHUNKS_PER_FILE} per file, includes T&C and laws)")
         
         top = []
         file_chunk_counts = {}
@@ -547,20 +684,21 @@ def ask_share_qa(req: QAAskRequest, conn = Depends(get_db)):
         system_msg = (
             "You are an expert insurance broker assistant.\n"
             f"CRITICAL: You MUST answer in {'LATVIAN (latviešu valoda)' if out_lang=='lv' else 'ENGLISH'} ONLY.\n"
-            "Answer ONLY from the provided Context (insurance offers from database).\n\n"
+            "Answer ONLY from the provided Context (insurance offers, Terms & Conditions, and legal regulations).\n\n"
             "IMPORTANT RULES:\n"
             "- When creating comparison tables, include ALL insurers/programs from the context\n"
             "- Do not omit any insurer - if specific data is missing, use '—' or 'Nav norādīts'\n"
             "- Ensure all rows (insurers/programs) and columns (features/parameters) are complete\n"
             "- For detailed comparisons, organize by categories (e.g., papildprogrammas, limits, costs)\n"
-            "- Add inline file references like [ERGO_VA.pdf] when citing specific offers\n"
+            "- Add inline file references like [ERGO_VA.pdf] or [ERGO_TC.pdf] when citing specific documents\n"
+            "- When citing T&C or legal requirements, clearly indicate the source\n"
             "- Be thorough and detailed when requested, but stay concise for simple questions"
         )
         user_msg = (
             f"Question: {question}\n\n"
-            f"Context (offers from database):\n{context}\n\n"
+            f"Context (includes offers, insurer T&C, and applicable laws):\n{context}\n\n"
             f"{'SVARĪGI: Atbildi TIKAI latviešu valodā!' if out_lang=='lv' else 'IMPORTANT: Answer ONLY in English!'}\n"
-            "If you must use insurer T&C knowledge, keep references concise."
+            "Use all available information to provide accurate and complete answers."
         )
 
         chat = client.chat.completions.create(
