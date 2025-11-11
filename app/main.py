@@ -1069,6 +1069,50 @@ class ShareCreateBody(BaseModel):
 def _gen_token() -> str:
     return secrets.token_urlsafe(16)
 
+def _infer_file_ids_from_document_ids(doc_ids: List[str], org_id: Optional[int] = None) -> List[int]:
+    """
+    Extract filenames from document_ids and find matching file_ids in offer_files.
+    Returns list of file_ids that can be used for Q&A chunks.
+    """
+    if not doc_ids:
+        return []
+    
+    # Extract sanitized filenames from document_ids (format: "uuid::1::filename.pdf")
+    filenames: List[str] = []
+    for d in doc_ids:
+        try:
+            fn = d.split("::", 2)[-1]
+            if fn:
+                filenames.append(_safe_filename(fn))
+        except Exception:
+            continue
+    
+    if not filenames:
+        return []
+    
+    try:
+        conn = get_db_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                # Find file_ids for matching filenames
+                cur.execute("""
+                    SELECT id 
+                    FROM public.offer_files
+                    WHERE filename = ANY(%s)
+                      AND (%s IS NULL OR org_id = %s)
+                    ORDER BY created_at DESC
+                """, (filenames, org_id, org_id))
+                
+                file_ids = [row['id'] for row in cur.fetchall()]
+                if file_ids:
+                    print(f"[share] Inferred file_ids from document_ids: {file_ids}")
+                return file_ids
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[share] Failed to infer file_ids from document_ids: {e}")
+        return []
+
 def _infer_batch_token_via_doc_ids(doc_ids: list[str]) -> Optional[str]:
     """
     Infer batch_token ONLY from document_ids by matching sanitized filenames in offer_files→offer_batches.
@@ -1138,6 +1182,12 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
     org_id, user_id = _ctx_ids(request)
     org_id, user_id = _ctx_or_defaults(org_id, user_id)
 
+    # Auto-infer file_ids from document_ids if not provided (bridges comparison table + Q&A)
+    file_ids = body.file_ids or []
+    if not file_ids and body.document_ids:
+        file_ids = _infer_file_ids_from_document_ids(body.document_ids, org_id)
+        print(f"[share] Auto-inferred file_ids: {file_ids}")
+
     inferred_batch_token = body.batch_token
     if not inferred_batch_token and body.document_ids:
         # org-less inference to avoid crossing into foreign batches
@@ -1149,7 +1199,7 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
         "company_name": derived_company,
         "employees_count": derived_employees,
         "document_ids": body.document_ids or [],
-        "file_ids": body.file_ids or [],  # Support direct file IDs for multi-file shares
+        "file_ids": file_ids,  # Now auto-populated from document_ids!
         "results": body.results if mode == "snapshot" else None,
         "editable": body.editable,
         "role": body.role,
