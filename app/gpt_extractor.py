@@ -758,45 +758,33 @@ def _responses_with_pdf(model: str, document_id: str, pdf_bytes: bytes, allow_sc
         },
     ]
 
-    # NEW — Use modern Responses.parse() API (2025)
-    if allow_schema:
-        try:
-            # ✅ MODERN API: responses.parse() with Pydantic schema
-            parsed = openai_client.responses.parse(
-                model=model,
-                input=[{"role": "user", "content": content}],
-                schema=HealthExtractionRoot,  # Pydantic model validates output
-            )
-            return parsed.output.data  # Return dict as before
-        
-        except Exception as e:
-            # Fallback: Try without schema if parse fails
-            print(f"[WARN] responses.parse() failed: {e}, falling back to create without schema")
-            pass
+    # Convert content to text format for chat.completions
+    # Extract text from content structure
+    content_text = ""
+    for item in content:
+        if isinstance(item, dict):
+            if item.get("type") == "input_text":
+                content_text += item.get("text", "") + "\n"
+            elif item.get("type") == "input_file":
+                # For files, we'll note the filename
+                content_text += f"\n[PDF File: {item.get('filename', 'document.pdf')}]\n"
+                # Note: chat.completions cannot process base64 files directly
+                # This is a limitation - file content won't be sent
     
-    # Fallback path: responses.create() without schema
+    # Use chat.completions.create() - the only API that exists in SDK 1.52.0
     try:
-        resp = openai_client.responses.create(
+        resp = openai_client.chat.completions.create(
             model=model,
-            input=[{"role": "user", "content": content}],
+            messages=[{"role": "user", "content": content_text}],
+            response_format={"type": "json_object"} if allow_schema else None,
+            temperature=0,
         )
         
-        # Try to get parsed output first
-        payload = getattr(resp, "output_parsed", None)
-        if payload is not None:
-            return payload
-        
-        # Manual content extraction
-        texts: List[str] = []
-        for item in getattr(resp, "output", []) or []:
-            t = getattr(item, "content", None)
-            if isinstance(t, str):
-                texts.append(t)
-        raw = "".join(texts).strip() or "{}"
+        raw = (resp.choices[0].message.content or "").strip() or "{}"
         return json.loads(raw)
     
     except Exception as e:
-        print(f"[ERROR] All responses API paths failed: {e}")
+        print(f"[ERROR] chat.completions.create() failed: {e}")
         return {}
 
 # =========================

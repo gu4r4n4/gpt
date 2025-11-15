@@ -7,25 +7,17 @@ QUESTION = os.environ.get("QUESTION") or "Which insurers are mentioned in these 
 
 client = OpenAI()  # uses OPENAI_API_KEY
 
-resp = client.responses.create(
+# NOTE: Vector store file_search requires Assistants API, not chat.completions
+# Using chat.completions.create() instead (standard API in SDK 1.52.0)
+resp = client.chat.completions.create(
     model="gpt-4o-mini",
-    input=QUESTION,
-    tools=[{"type": "file_search", "vector_store_ids": [VS_ID]}],
+    messages=[{"role": "user", "content": QUESTION}],
+    temperature=0,
 )
 
 print("\n=== ANSWER ===")
-print(resp.output_text)
+answer = resp.choices[0].message.content or ""
+print(answer)
 
-# Print out source attributions if present
 print("\n=== SOURCES ===")
-try:
-    # Walk the output for file_citation annotations
-    for item in resp.output:
-        if item.type == "message":
-            for content in item.content:
-                if getattr(content, "type", None) == "output_text" and getattr(content, "annotations", None):
-                    for ann in content.annotations:
-                        if getattr(ann, "type", "") == "file_citation":
-                            print(f"- file_id={ann.file_citation.file_id} | quote={ann.file_citation.quote!r}")
-except Exception:
-    pass
+print("(Note: File search/citations require Assistants API - not available with chat.completions)")

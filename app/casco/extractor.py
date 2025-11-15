@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import List, Optional
 
 from pydantic import BaseModel
@@ -97,10 +98,10 @@ def extract_casco_offers_from_text(
     model: str = "gpt-5.1",
 ) -> List[CascoExtractionResult]:
     """
-    Core hybrid extractor using NEW OpenAI Responses API (2025).
+    Core hybrid extractor using OpenAI Chat Completions API (SDK 1.52.0).
     
-    Uses client.responses.parse() with Pydantic schema enforcement.
-    This is the correct modern API - no response_format parameter.
+    Uses client.chat.completions.create() with JSON response format.
+    Validates output against Pydantic schema for type safety.
     
     This function is PURE w.r.t. HEALTH logic: it only knows about CASCO and CascoCoverage.
     """
@@ -109,7 +110,7 @@ def extract_casco_offers_from_text(
     system_prompt = _build_system_prompt()
     user_prompt = _build_user_prompt(pdf_text=pdf_text, insurer_name=insurer_name, pdf_filename=pdf_filename)
 
-    # Define response structure using Pydantic models
+    # Define response structure using Pydantic models for validation
     class Offer(BaseModel):
         structured: CascoCoverage
         raw_text: str
@@ -117,18 +118,27 @@ def extract_casco_offers_from_text(
     class ResponseRoot(BaseModel):
         offers: List[Offer]
 
-    # ---- NEW OpenAI Responses.parse() API ----
-    parsed = client.responses.parse(
-        model=model,
-        input=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        schema=ResponseRoot,  # Pydantic model defines the output structure
-    )
+    # ---- Use chat.completions.create() - the actual API in SDK 1.52.0 ----
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0,
+        )
 
-    # parsed.output is the validated ResponseRoot instance
-    root: ResponseRoot = parsed.output
+        # Parse JSON response
+        raw = (resp.choices[0].message.content or "").strip() or "{}"
+        payload = json.loads(raw)
+        
+        # Validate against Pydantic model
+        root = ResponseRoot(**payload)
+
+    except Exception as e:
+        raise ValueError(f"CASCO extraction failed: {e}") from e
 
     results: List[CascoExtractionResult] = []
 
