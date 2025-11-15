@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import json
 from typing import List, Optional
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
 from .schema import CascoCoverage
 
@@ -38,50 +37,7 @@ def _get_openai_client():
     # return get_openai_client()
 
 
-def _build_casco_json_schema() -> dict:
-    """
-    Build JSON schema for the Responses API using the existing CascoCoverage model.
-    The top-level shape is:
-
-    {
-      "offers": [
-        {
-          "structured": CascoCoverage JSON Schema,
-          "raw_text": "source snippet where info comes from"
-        }
-      ]
-    }
-    """
-    coverage_schema = CascoCoverage.model_json_schema(ref_template="#/components/schemas/{model}")
-    return {
-        "name": "casco_extraction",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "offers": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {
-                            "structured": coverage_schema,
-                            "raw_text": {
-                                "type": "string",
-                                "description": (
-                                    "Exact paragraph(s) or section(s) from the PDF where "
-                                    "you found information for this offer."
-                                ),
-                            },
-                        },
-                        "required": ["structured", "raw_text"],
-                    },
-                },
-            },
-            "required": ["offers"],
-        },
-    }
+# Removed: _build_casco_json_schema() - No longer needed with responses.parse()
 
 
 def _build_system_prompt() -> str:
@@ -141,69 +97,51 @@ def extract_casco_offers_from_text(
     model: str = "gpt-5.1",
 ) -> List[CascoExtractionResult]:
     """
-    Core hybrid extractor: calls OpenAI Responses API and returns structured coverage + raw_text.
-
+    Core hybrid extractor using NEW OpenAI Responses API (2025).
+    
+    Uses client.responses.parse() with Pydantic schema enforcement.
+    This is the correct modern API - no response_format parameter.
+    
     This function is PURE w.r.t. HEALTH logic: it only knows about CASCO and CascoCoverage.
     """
     client = _get_openai_client()
 
     system_prompt = _build_system_prompt()
     user_prompt = _build_user_prompt(pdf_text=pdf_text, insurer_name=insurer_name, pdf_filename=pdf_filename)
-    json_schema = _build_casco_json_schema()
 
-    # ---- OpenAI Responses API call ----
-    response = client.responses.create(
+    # Define response structure using Pydantic models
+    class Offer(BaseModel):
+        structured: CascoCoverage
+        raw_text: str
+
+    class ResponseRoot(BaseModel):
+        offers: List[Offer]
+
+    # ---- NEW OpenAI Responses.parse() API ----
+    parsed = client.responses.parse(
         model=model,
         input=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        response_format={
-            "type": "json_schema",
-            "json_schema": json_schema,
-        },
+        schema=ResponseRoot,  # Pydantic model defines the output structure
     )
 
-    # Parse JSON payload from the first output block
-    try:
-        content_block = response.output[0].content[0]
-        if getattr(content_block, "type", None) == "output_text":
-            raw_json = content_block.text
-        else:
-            # Fallback if the SDK object differs slightly
-            raw_json = getattr(content_block, "text", None) or str(content_block)
-    except (AttributeError, IndexError, KeyError) as e:
-        raise ValueError(f"Unexpected OpenAI response format for CASCO extraction: {e}") from e
-
-    try:
-        payload = json.loads(raw_json)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Failed to decode CASCO extraction JSON: {e}") from e
-
-    offers_data = payload.get("offers", [])
-    if not isinstance(offers_data, list):
-        raise ValueError("CASCO extraction JSON must contain 'offers' as a list.")
+    # parsed.output is the validated ResponseRoot instance
+    root: ResponseRoot = parsed.output
 
     results: List[CascoExtractionResult] = []
 
-    for offer in offers_data:
-        structured = offer.get("structured", {})
-        raw_text_section = offer.get("raw_text", "")
-
-        # Inject known metadata into the structured part
-        structured.setdefault("insurer_name", insurer_name)
+    for offer in root.offers:
+        # Inject known metadata into the structured coverage
+        offer.structured.insurer_name = insurer_name
         if pdf_filename:
-            structured.setdefault("pdf_filename", pdf_filename)
-
-        try:
-            coverage = CascoCoverage(**structured)
-        except ValidationError as e:
-            raise ValueError(f"CASCO coverage validation error: {e}") from e
+            offer.structured.pdf_filename = pdf_filename
 
         results.append(
             CascoExtractionResult(
-                coverage=coverage,
-                raw_text=raw_text_section or "",
+                coverage=offer.structured,
+                raw_text=offer.raw_text or "",
             )
         )
 
