@@ -95,7 +95,7 @@ def extract_casco_offers_from_text(
     pdf_text: str,
     insurer_name: str,
     pdf_filename: Optional[str] = None,
-    model: str = "gpt-5.1",
+    model: str = "gpt-4o",
 ) -> List[CascoExtractionResult]:
     """
     Core hybrid extractor using OpenAI Chat Completions API (SDK 1.52.0).
