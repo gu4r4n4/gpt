@@ -1,0 +1,104 @@
+[
+  {
+    "file": "app/gpt_extractor.py",
+    "line": 752,
+    "issue": "uses response_format with responses.create",
+    "severity": "CRITICAL",
+    "snippet": "kwargs[\"response_format\"] = {\n    \"type\": \"json_schema\",\n    \"json_schema\": {\"name\": \"InsurerOfferExtraction_v1\", \"schema\": INSURER_OFFER_SCHEMA, \"strict\": True},\n}",
+    "function": "_responses_with_pdf",
+    "api_call": "openai_client.responses.create(**kwargs)",
+    "status": "HEALTH EXTRACTOR - ACTIVE BUG",
+    "impact": "This is the INHERITED bug from HEALTH that affects CASCO",
+    "notes": "This is used for HEALTH extraction and was copied to CASCO originally. CASCO is now fixed but HEALTH still has this bug."
+  },
+  {
+    "file": "app/gpt_extractor.py",
+    "line": 757,
+    "issue": "calls responses.create with response_format",
+    "severity": "CRITICAL",
+    "snippet": "resp = openai_client.responses.create(**kwargs)",
+    "function": "_responses_with_pdf",
+    "status": "HEALTH EXTRACTOR - WILL FAIL",
+    "impact": "HEALTH PDF extraction will fail if OpenAI SDK is updated",
+    "notes": "Currently works if using old SDK, but will break with SDK update"
+  },
+  {
+    "file": "app/gpt_extractor.py",
+    "line": 789,
+    "issue": "uses response_format with chat.completions",
+    "severity": "LOW",
+    "snippet": "response_format={\"type\": \"json_object\"}",
+    "function": "_chat_with_text",
+    "api_call": "openai_client.chat.completions.create",
+    "status": "FALLBACK PATH - OK",
+    "impact": "This is chat.completions API, not responses API - different parameter set",
+    "notes": "response_format is VALID for chat.completions.create() - only forbidden for responses.create()"
+  },
+  {
+    "file": "app/gpt_extractor.py",
+    "line": 783,
+    "issue": "uses chat.completions.create",
+    "severity": "INFO",
+    "snippet": "resp = openai_client.chat.completions.create(\n    model=model,\n    messages=[...],\n    response_format={\"type\": \"json_object\"}",
+    "function": "_chat_with_text",
+    "status": "FALLBACK - OK",
+    "impact": "Valid fallback when responses API fails",
+    "notes": "This is intentional fallback logic, not a bug"
+  },
+  {
+    "file": "app/gpt_extractor.py",
+    "line": 794,
+    "issue": "uses chat.completions.create without response_format",
+    "severity": "INFO",
+    "snippet": "resp = openai_client.chat.completions.create(\n    model=model,\n    messages=[...]",
+    "function": "_chat_with_text",
+    "status": "FALLBACK - OK",
+    "impact": "Second fallback when first fails",
+    "notes": "This is intentional fallback logic"
+  },
+  {
+    "file": "backend/api/routes/qa.py",
+    "line": 704,
+    "issue": "uses chat.completions.create",
+    "severity": "INFO",
+    "snippet": "chat = client.chat.completions.create(\n    model=os.getenv(\"QA_MODEL\", \"gpt-4o-mini\"),\n    messages=[...",
+    "function": "qa_chat_endpoint",
+    "status": "QA FEATURE - OK",
+    "impact": "Q&A chat feature, different API",
+    "notes": "Chat completions API is correct for Q&A feature"
+  },
+  {
+    "file": "app/routes/translate.py",
+    "line": 31,
+    "issue": "uses chat.completions.create",
+    "severity": "INFO",
+    "snippet": "resp = client.chat.completions.create(\n    model=DEFAULT_MODEL,\n    messages=[{\"role\":\"system\",\"content\":system},{\"role\":\"user\",\"content\":text}]",
+    "function": "translate_endpoint",
+    "status": "TRANSLATION - OK",
+    "impact": "Translation feature, different API",
+    "notes": "Chat completions API is correct for translation"
+  },
+  {
+    "file": "scripts/probe_vector_store.py",
+    "line": 10,
+    "issue": "uses responses.create without response_format",
+    "severity": "INFO",
+    "snippet": "resp = client.responses.create(\n    model=\"gpt-4o-mini\",\n    input=QUESTION,\n    tools=[{\"type\": \"file_search\", \"vector_store_ids\": [VS_ID]}]",
+    "function": "main script",
+    "status": "SCRIPT - OK",
+    "impact": "Utility script for testing vector stores",
+    "notes": "No response_format used - this is safe"
+  },
+  {
+    "file": "app/casco/extractor.py",
+    "line": 121,
+    "issue": "uses responses.parse (NEW API)",
+    "severity": "FIXED",
+    "snippet": "parsed = client.responses.parse(\n    model=model,\n    input=[...],\n    schema=ResponseRoot",
+    "function": "extract_casco_offers_from_text",
+    "status": "CASCO EXTRACTOR - FIXED",
+    "impact": "CASCO now uses modern API correctly",
+    "notes": "This is the CORRECT implementation using responses.parse() with Pydantic schema"
+  }
+]
+

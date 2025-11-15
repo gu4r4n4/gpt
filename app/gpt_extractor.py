@@ -31,11 +31,22 @@ from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from jsonschema import Draft202012Validator
 from pypdf import PdfReader
+from pydantic import BaseModel
 from app.services.openai_client import client as openai_client
 if TYPE_CHECKING:  # pragma: no cover
     from openai import OpenAI
 
 from app.normalizer import normalize_offer_json
+
+# =========================
+# Pydantic Model for Modern Responses API
+# =========================
+class HealthExtractionRoot(BaseModel):
+    """
+    Modern schema for Responses.parse() API.
+    Wraps the unstructured HEALTH extraction JSON format.
+    """
+    data: Dict[str, Any]
 
 # =========================
 # STRICT JSON SCHEMA
@@ -747,26 +758,46 @@ def _responses_with_pdf(model: str, document_id: str, pdf_bytes: bytes, allow_sc
         },
     ]
 
-    kwargs: Dict[str, Any] = {"model": model, "input": [{"role": "user", "content": content}]}
+    # NEW — Use modern Responses.parse() API (2025)
     if allow_schema:
-        kwargs["response_format"] = {
-            "type": "json_schema",
-            "json_schema": {"name": "InsurerOfferExtraction_v1", "schema": INSURER_OFFER_SCHEMA, "strict": True},
-        }
-
-    resp = openai_client.responses.create(**kwargs)
-
-    payload = getattr(resp, "output_parsed", None)
-    if payload is not None:
-        return payload
-
-    texts: List[str] = []
-    for item in getattr(resp, "output", []) or []:
-        t = getattr(item, "content", None)
-        if isinstance(t, str):
-            texts.append(t)
-    raw = "".join(texts).strip() or "{}"
-    return json.loads(raw)
+        try:
+            # ✅ MODERN API: responses.parse() with Pydantic schema
+            parsed = openai_client.responses.parse(
+                model=model,
+                input=[{"role": "user", "content": content}],
+                schema=HealthExtractionRoot,  # Pydantic model validates output
+            )
+            return parsed.output.data  # Return dict as before
+        
+        except Exception as e:
+            # Fallback: Try without schema if parse fails
+            print(f"[WARN] responses.parse() failed: {e}, falling back to create without schema")
+            pass
+    
+    # Fallback path: responses.create() without schema
+    try:
+        resp = openai_client.responses.create(
+            model=model,
+            input=[{"role": "user", "content": content}],
+        )
+        
+        # Try to get parsed output first
+        payload = getattr(resp, "output_parsed", None)
+        if payload is not None:
+            return payload
+        
+        # Manual content extraction
+        texts: List[str] = []
+        for item in getattr(resp, "output", []) or []:
+            t = getattr(item, "content", None)
+            if isinstance(t, str):
+                texts.append(t)
+        raw = "".join(texts).strip() or "{}"
+        return json.loads(raw)
+    
+    except Exception as e:
+        print(f"[ERROR] All responses API paths failed: {e}")
+        return {}
 
 # =========================
 # Fallback: Chat Completions with extracted text
