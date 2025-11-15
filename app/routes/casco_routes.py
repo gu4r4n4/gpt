@@ -12,7 +12,7 @@ from typing import Optional, List
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from fastapi import APIRouter, UploadFile, Form, HTTPException, Depends
+from fastapi import APIRouter, UploadFile, Form, HTTPException, Depends, Request
 
 from app.casco.service import process_casco_pdf
 from app.casco.comparator import build_casco_comparison_matrix
@@ -263,8 +263,7 @@ async def upload_casco_offer(
 # ---------------------------
 @router.post("/upload/batch")
 async def upload_casco_offers_batch(
-    files: List[UploadFile],
-    insurers: str = Form(...),  # JSON string: ["Balta", "Gjensidige", ...]
+    request: Request,
     reg_number: str = Form(...),
     inquiry_id: Optional[int] = Form(None),
     conn = Depends(get_db),
@@ -272,27 +271,43 @@ async def upload_casco_offers_batch(
     """
     Upload multiple CASCO PDFs at once (one per insurer).
     
-    Args:
-        files: List of PDF files
-        insurers: JSON string array of insurer names (must match files length)
-        reg_number: Vehicle registration number
-        inquiry_id: Optional inquiry ID to link offers
+    Frontend sends multiple form fields:
+        files=file1.pdf
+        files=file2.pdf
+        insurers=BALTA
+        insurers=BALCIA
+        insurers=IF
+    
+    This endpoint properly extracts repeated form fields using .getlist()
     """
-    import json as json_module
     
     try:
-        # Parse insurers JSON
-        insurer_list = json_module.loads(insurers)
+        # FIX: Properly extract repeated form fields
+        form = await request.form()
+        insurers_list = form.getlist("insurers")   # Frontend sends multiple "insurers" fields
+        files_list = form.getlist("files")          # List[UploadFile]
         
-        if len(files) != len(insurer_list):
+        if not insurers_list:
             raise HTTPException(
                 status_code=400,
-                detail=f"Files count ({len(files)}) and insurers count ({len(insurer_list)}) mismatch"
+                detail="No insurers provided. Send multiple 'insurers' form fields."
+            )
+        
+        if not files_list:
+            raise HTTPException(
+                status_code=400,
+                detail="No files provided. Send multiple 'files' form fields."
+            )
+        
+        if len(files_list) != len(insurers_list):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Files count ({len(files_list)}) and insurers count ({len(insurers_list)}) mismatch"
             )
         
         inserted_ids = []
         
-        for file, insurer in zip(files, insurer_list):
+        for file, insurer in zip(files_list, insurers_list):
             # Validate file type
             if not file.filename.lower().endswith('.pdf'):
                 continue  # Skip non-PDF files
@@ -333,6 +348,8 @@ async def upload_casco_offers_batch(
             "total_offers": len(inserted_ids)
         }
     
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Batch upload failed: {str(e)}")
 
