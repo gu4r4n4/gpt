@@ -1,9 +1,26 @@
+"""
+CASCO Extraction Module - ISOLATED from HEALTH logic
+
+This module handles CASCO (car insurance) PDF extraction using OpenAI Chat Completions API.
+
+OPENAI CALL SITES:
+- extract_casco_offers_from_text() → client.chat.completions.create()
+  Uses model "gpt-4o" with response_format={"type": "json_object"}
+
+KEY FUNCTIONS:
+- _safe_parse_casco_json(): Robust JSON parser with repair heuristics
+- extract_casco_offers_from_text(): Main extraction function (called by service.py)
+- _ensure_structured_field(): Defensive validation for offer structure
+
+HEALTH EXTRACTION: Completely separate - see app/gpt_extractor.py
+"""
 from __future__ import annotations
 
 import json
+import re
 from typing import List, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from .schema import CascoCoverage
 
@@ -41,6 +58,86 @@ def _get_openai_client():
 # Removed: _build_casco_json_schema() - No longer needed with responses.parse()
 
 
+def _safe_parse_casco_json(raw: str) -> dict:
+    """
+    Robust JSON parser for CASCO extraction - tries hard to recover from common issues.
+    
+    Steps:
+    1. Strip code fences (```json, ```)
+    2. Extract content between first '{' and last '}'
+    3. Try json.loads() directly
+    4. If it fails, apply cosmetic fixes:
+       - Remove trailing commas before } or ]
+       - Remove common control characters
+    5. If still fails, raise ValueError with preview
+    
+    This is CASCO-specific and does NOT affect HEALTH extraction.
+    """
+    if not raw or not raw.strip():
+        raise ValueError("Empty JSON string from model")
+    
+    # Step 1: Strip code fences if present
+    cleaned = raw.strip()
+    
+    # Remove markdown code blocks
+    if cleaned.startswith("```"):
+        lines = cleaned.split("\n")
+        # Remove lines that start with ``` (opening and closing)
+        cleaned = "\n".join(
+            line for line in lines 
+            if not line.strip().startswith("```")
+        ).strip()
+    
+    # Step 2: Extract JSON object (from first { to last })
+    first_brace = cleaned.find("{")
+    last_brace = cleaned.rfind("}")
+    
+    if first_brace == -1 or last_brace == -1 or last_brace < first_brace:
+        preview = cleaned[:500] if len(cleaned) > 500 else cleaned
+        raise ValueError(
+            f"No valid JSON object found in model output. "
+            f"Preview (first 500 chars): {preview}"
+        )
+    
+    cleaned = cleaned[first_brace:last_brace + 1]
+    
+    # Step 3: Try direct parsing
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError as e:
+        # Step 4: Apply cosmetic repairs
+        
+        # Fix 1: Remove trailing commas before } or ]
+        # Pattern: , followed by optional whitespace, then } or ]
+        repaired = re.sub(r',\s*([}\]])', r'\1', cleaned)
+        
+        # Fix 2: Remove common control characters that might slip through
+        repaired = repaired.replace('\r', '').replace('\x00', '')
+        
+        # Fix 3: Try to fix unescaped quotes in strings (conservative)
+        # This is risky, so only do it if we detect obvious issues
+        
+        try:
+            return json.loads(repaired)
+        except json.JSONDecodeError as e2:
+            # Step 5: Give up and provide helpful error
+            preview_start = cleaned[:300] if len(cleaned) > 300 else cleaned
+            preview_end = cleaned[-200:] if len(cleaned) > 500 else ""
+            
+            char_pos = getattr(e2, 'pos', 0)
+            context_start = max(0, char_pos - 100)
+            context_end = min(len(repaired), char_pos + 100)
+            error_context = repaired[context_start:context_end]
+            
+            raise ValueError(
+                f"Invalid JSON from model after repair attempts. "
+                f"Error: {e2}. "
+                f"Preview (first 300 chars): {preview_start}... "
+                f"Preview (last 200 chars): ...{preview_end}. "
+                f"Error context (±100 chars around position {char_pos}): {error_context}"
+            )
+
+
 def _build_system_prompt() -> str:
     """
     System prompt for CASCO extraction - STRICTLY enforces JSON schema compliance.
@@ -53,32 +150,29 @@ def _build_system_prompt() -> str:
     - ALWAYS include "offers" array with "structured" and "raw_text" fields
     """
     return (
-        "You are an expert CASCO (car insurance) offers extraction engine.\n"
-        "Your job is to extract structured data about insurance coverages from Latvian PDF offers.\n\n"
-        "CRITICAL OUTPUT REQUIREMENTS:\n"
-        "1. You MUST return ONLY valid JSON - no markdown, no explanations, no extra text\n"
-        "2. The JSON MUST have this EXACT structure:\n"
-        "   {\n"
-        '     "offers": [\n'
-        "       {\n"
-        '         "structured": { ...all CascoCoverage fields... },\n'
-        '         "raw_text": "exact quotes from PDF where you found the data"\n'
-        "       }\n"
-        "     ]\n"
-        "   }\n"
-        "3. The 'structured' object MUST include ALL fields from CascoCoverage schema\n"
-        "4. If a field value is unknown or not found, set it to null (not omit it)\n"
-        "5. The 'offers' array MUST contain at least one offer\n\n"
+        "You are an expert CASCO (car insurance) extraction engine for Latvian PDFs.\n\n"
+        "OUTPUT FORMAT - YOU MUST RETURN ONLY VALID JSON:\n"
+        "{\n"
+        '  "offers": [\n'
+        "    {\n"
+        '      "structured": { ...CascoCoverage fields... },\n'
+        '      "raw_text": "1-3 sentence summary"\n'
+        "    }\n"
+        "  ]\n"
+        "}\n\n"
+        "CRITICAL RULES:\n"
+        "1. Return a SINGLE JSON object - no markdown, no commentary, no text before or after\n"
+        "2. The top-level object MUST have an 'offers' array\n"
+        "3. Each offer MUST have 'structured' and 'raw_text' keys\n"
+        "4. Include ALL CascoCoverage fields in 'structured' - use null if not found\n"
+        "5. NEVER omit a field - always include it with null if unknown\n"
+        "6. Keep raw_text SHORT (1-3 sentences max) - NOT the entire document\n\n"
         "EXTRACTION RULES:\n"
-        "- Be fully objective and neutral\n"
-        "- Extract ONLY what is clearly stated in the document\n"
-        "- If a coverage, limit, or feature is not explicitly present, set that field to null\n"
-        "- Do NOT guess or infer missing data\n"
-        "- Booleans must be true ONLY if the coverage is explicitly included, otherwise null\n"
-        "- Numeric fields must be parsed as numbers in EUR\n"
-        "- Map each benefit or feature to the most appropriate field\n"
-        "- Preserve insurer-specific nuances in the raw_text field\n"
-        "- If the document contains only one offer, return a single-element offers array"
+        "- Be objective and neutral\n"
+        "- Booleans: true ONLY if coverage explicitly included, otherwise null\n"
+        "- Numbers: parse as numeric values in EUR, or null\n"
+        "- Strings: short and precise\n"
+        "- If document has one offer, return single-element array"
     )
 
 
@@ -94,38 +188,31 @@ def _build_user_prompt(pdf_text: str, insurer_name: str, pdf_filename: Optional[
     """
     filename_part = f" (file: {pdf_filename})" if pdf_filename else ""
     return (
-        f"Extract CASCO insurance offer data for insurer '{insurer_name}'{filename_part} "
-        f"from the following PDF text.\n\n"
-        f"PDF TEXT START:\n{pdf_text}\nPDF TEXT END.\n\n"
-        "REQUIRED OUTPUT FORMAT (STRICT):\n"
+        f"Extract CASCO offer from insurer '{insurer_name}'{filename_part}.\n\n"
+        f"PDF TEXT:\n{pdf_text}\n\n"
+        "Return ONLY a JSON object with this structure:\n"
         "{\n"
         '  "offers": [\n'
         "    {\n"
         '      "structured": {\n'
-        '        "insurer_name": "' + insurer_name + '",\n'
-        '        "product_name": null or "...",\n'
-        '        "offer_id": null or "...",\n'
+        f'        "insurer_name": "{insurer_name}",\n'
         f'        "pdf_filename": "{pdf_filename or ""}",\n'
-        '        "damage": null or true/false,\n'
-        '        "total_loss": null or true/false,\n'
-        '        "theft": null or true/false,\n'
-        "        ... (ALL 60+ CascoCoverage fields - use null if not found)\n"
+        '        "damage": true/false/null,\n'
+        '        "theft": true/false/null,\n'
+        '        "territory": "Latvija"/null,\n'
+        '        "insured_value_eur": 15000/null,\n'
+        '        ... (ALL CascoCoverage fields)\n'
         "      },\n"
-        '      "raw_text": "exact quotes from PDF sections where coverage data was found"\n'
+        '      "raw_text": "Short 1-3 sentence summary of key coverage"\n'
         "    }\n"
         "  ]\n"
         "}\n\n"
-        "EXTRACTION INSTRUCTIONS:\n"
-        "- The document typically contains ONE CASCO offer for this insurer\n"
-        "- You MUST include ALL fields from CascoCoverage in 'structured'\n"
-        "- If a specific coverage, limit, or feature is not clearly specified, set its value to null\n"
-        "- NEVER omit a field - always include it with null if unknown\n"
-        "- Booleans: true ONLY if coverage is explicitly included, otherwise null\n"
-        "- Numeric fields (limits, sums, deductibles): parse as numbers in EUR, or null if not found\n"
-        "- territory: short string like 'Latvija', 'Baltija', 'Eiropa', or null\n"
-        "- insured_value_type: MUST be 'market', 'new', or 'other' (use 'other' if unclear), or null\n"
-        "- raw_text: include precise sentences, bullet points or table snippets where you found the data\n"
-        "- Return ONLY valid JSON - no markdown formatting, no explanations before or after"
+        "RULES:\n"
+        "- Include ALL fields (use null if not found)\n"
+        "- Keep raw_text SHORT (1-3 sentences max, NOT full document text)\n"
+        "- Booleans: true only if explicitly covered\n"
+        "- Numbers: parse as numbers in EUR\n"
+        "- Return ONLY JSON - no markdown, no extra text"
     )
 
 
@@ -203,20 +290,14 @@ def extract_casco_offers_from_text(
                 temperature=0,
             )
 
-            # Parse JSON response
-            raw = (resp.choices[0].message.content or "").strip()
+            # Get raw response
+            raw_content = (resp.choices[0].message.content or "").strip()
             
-            if not raw or raw == "{}":
+            if not raw_content:
                 raise ValueError("Empty response from model")
             
-            # Remove markdown formatting if present
-            if raw.startswith("```"):
-                # Extract JSON from markdown code block
-                lines = raw.split("\n")
-                raw = "\n".join(line for line in lines if not line.startswith("```"))
-                raw = raw.strip()
-            
-            payload = json.loads(raw)
+            # Use robust parser (handles markdown, trailing commas, etc.)
+            payload = _safe_parse_casco_json(raw_content)
             
             # Defensive validation: ensure "offers" key exists
             if "offers" not in payload:
@@ -229,26 +310,49 @@ def extract_casco_offers_from_text(
                 raise ValueError("'offers' array is empty")
             
             # Defensive logic: ensure each offer has 'structured' and 'raw_text'
+            valid_offers = []
             for i, offer in enumerate(payload["offers"]):
                 if not isinstance(offer, dict):
-                    raise ValueError(f"Offer {i} is not a dict")
-                payload["offers"][i] = _ensure_structured_field(offer, insurer_name, pdf_filename)
+                    print(f"[WARN] CASCO offer {i} is not a dict, skipping")
+                    continue
+                
+                # Ensure required keys exist
+                offer = _ensure_structured_field(offer, insurer_name, pdf_filename)
+                
+                # Try to validate this single offer against Pydantic
+                try:
+                    validated_offer = Offer(**offer)
+                    valid_offers.append(validated_offer)
+                except ValidationError as ve:
+                    print(f"[WARN] CASCO offer {i} failed Pydantic validation: {ve}")
+                    # Continue with other offers rather than failing completely
+                    continue
             
-            # Validate against Pydantic model
-            root = ResponseRoot(**payload)
+            if len(valid_offers) == 0:
+                raise ValueError("All offers failed validation")
+            
+            # Create ResponseRoot with valid offers
+            root = ResponseRoot(offers=valid_offers)
             
             # If we got here, extraction succeeded
             break
 
-        except json.JSONDecodeError as e:
-            last_error = ValueError(f"Invalid JSON from model (attempt {attempt + 1}/{max_retries + 1}): {e}")
+        except ValueError as e:
+            # Enhance error message with context
+            error_msg = f"CASCO extraction failed (attempt {attempt + 1}/{max_retries + 1}): {str(e)}"
+            last_error = ValueError(error_msg)
+            
             if attempt < max_retries:
+                print(f"[RETRY] {error_msg}")
                 continue
             raise last_error
 
         except Exception as e:
-            last_error = ValueError(f"CASCO extraction failed (attempt {attempt + 1}/{max_retries + 1}): {e}")
+            error_msg = f"CASCO extraction unexpected error (attempt {attempt + 1}/{max_retries + 1}): {type(e).__name__}: {str(e)}"
+            last_error = ValueError(error_msg)
+            
             if attempt < max_retries:
+                print(f"[RETRY] {error_msg}")
                 continue
             raise last_error
 
