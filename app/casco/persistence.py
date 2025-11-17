@@ -134,8 +134,7 @@ async def fetch_casco_offers_by_inquiry(
         premium_breakdown,
         coverage,
         raw_text,
-        created_at,
-        updated_at
+        created_at
     FROM public.offers_casco
     WHERE inquiry_id = $1
     ORDER BY created_at DESC;
@@ -168,8 +167,7 @@ async def fetch_casco_offers_by_reg_number(
         premium_breakdown,
         coverage,
         raw_text,
-        created_at,
-        updated_at
+        created_at
     FROM public.offers_casco
     WHERE reg_number = $1
     ORDER BY created_at DESC;

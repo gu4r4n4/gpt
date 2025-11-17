@@ -121,8 +121,7 @@ def _fetch_casco_offers_by_inquiry_sync(conn, inquiry_id: int) -> List[dict]:
         premium_breakdown,
         coverage,
         raw_text,
-        created_at,
-        updated_at
+        created_at
     FROM public.offers_casco
     WHERE inquiry_id = %s
     ORDER BY created_at DESC;
@@ -151,8 +150,7 @@ def _fetch_casco_offers_by_reg_number_sync(conn, reg_number: str) -> List[dict]:
         premium_breakdown,
         coverage,
         raw_text,
-        created_at,
-        updated_at
+        created_at
     FROM public.offers_casco
     WHERE reg_number = %s
     ORDER BY created_at DESC;
