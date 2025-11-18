@@ -140,107 +140,379 @@ def _safe_parse_casco_json(raw: str) -> dict:
 
 def _build_system_prompt() -> str:
     """
-    System prompt for CASCO extraction - STRICTLY enforces JSON schema compliance.
-
-    Key rules:
-    - MUST return valid JSON matching EXACT schema structure
-    - Be objective, no marketing language
-    - Never hallucinate coverages – if not clearly included, set field to null
-    - All insurers MUST be comparable across the same field set
-    - ALWAYS include "offers" array with "structured" and "raw_text" fields
+    SIMPLIFIED 19-FIELD SYSTEM PROMPT for CASCO extraction.
+    
+    Returns the exact prompt provided by the user, implementing:
+    - 19 Latvian-named fields
+    - "v" (covered), "-" (not covered), or descriptive values
+    - Special rules for Vandālisms, Stiklojums, etc.
     """
-    return (
-        "You are an expert CASCO (car insurance) extraction engine for Latvian PDFs.\n\n"
-        "OUTPUT FORMAT - YOU MUST RETURN ONLY VALID JSON:\n"
-        "{\n"
-        '  "offers": [\n'
-        "    {\n"
-        '      "structured": { ...CascoCoverage fields... },\n'
-        '      "raw_text": "1-3 sentence summary"\n'
-        "    }\n"
-        "  ]\n"
-        "}\n\n"
-        "CRITICAL RULES:\n"
-        "1. Return a SINGLE JSON object - no markdown, no commentary, no text before or after\n"
-        "2. The top-level object MUST have an 'offers' array\n"
-        "3. Each offer MUST have 'structured' and 'raw_text' keys\n"
-        "4. Include ALL CascoCoverage fields in 'structured' - use null if not found\n"
-        "5. NEVER omit a field - always include it with null if unknown\n"
-        "6. Keep raw_text SHORT (1-3 sentences max) - NOT the entire document\n\n"
-        "EXTRACTION RULES:\n"
-        "- Be objective and neutral\n"
-        "- Booleans: true ONLY if coverage explicitly included, otherwise null\n"
-        "- Numbers: parse as numeric values in EUR, or null\n"
-        "- Strings: short and precise\n"
-        "- If document has one offer, return single-element array"
-    )
+    return """You are a strict CASCO insurance PDF parser.
+
+You receive the FULL TEXT of one CASCO insurance offer (for one insurer). Your task is to read the whole document and return a SINGLE JSON object with exactly 19 fields describing coverage.
+
+IMPORTANT GENERAL RULES
+- Work ONLY from the provided document text.
+- Think like an underwriter, not a marketing writer.
+- If coverage exists (risk is insured) in any positive/covered context → mark "v".
+- If risk is clearly NOT covered, or only appears in exclusions, disclaimers, or is not mentioned at all → mark "-".
+- For some fields you must extract a VALUE (limit, number of days, EUR amount). If a value is clearly present, return that value as a human-readable string (e.g. "15 dienas / 30 EUR dienā", "Eiropa", "160 EUR").
+- If a field expects a value but the document clearly includes coverage with no obvious numeric / limit → return "v".
+- NEVER invent values. If unsure about the exact number/limit, but the coverage is present, just use "v".
+- If coverage is not present at all, or only in exclusions, return "-".
+- Output MUST be pure JSON, no comments, no explanations, no extra keys.
+
+RETURN EXACTLY THIS JSON SHAPE (19 KEYS)
+
+Return a single JSON object:
+
+{
+  "Bojājumi": "...",
+  "Bojāeja": "...",
+  "Zādzība": "...",
+  "Apzagšana": "...",
+  "Teritorija": "...",
+  "Pašrisks – bojājumi": "...",
+  "Stiklojums bez pašriska": "...",
+  "Maiņas / nomas auto (dienas)": "...",
+  "Palīdzība uz ceļa": "...",
+  "Hidrotrieciens": "...",
+  "Personīgās mantas / bagāža": "...",
+  "Atslēgu zādzība/atjaunošana": "...",
+  "Degvielas sajaukšana/tīrīšana": "...",
+  "Riepas / diski": "...",
+  "Numurzīmes": "...",
+  "Nelaimes gad. vadīt./pasažieriem": "...",
+  "Sadursme ar dzīvnieku": "...",
+  "Uguns / dabas stihijas": "...",
+  "Vandālisms": "..."
+}
+
+Allowed values per field:
+- For boolean-type coverage: "v" or "-"
+- For value-type coverage: either a non-empty string with the value / limit / description, OR "v" if coverage exists but no clear numeric/territorial value is extractable, OR "-" if no coverage.
+
+DETAILED FIELD RULES
+
+1. "Bojājumi"
+Goal: is damage coverage included?
+
+Search for words like:
+- "Bojājumi", "Avārija"
+
+If the document lists "Bojājumi" or similar in covered risks (e.g., "Bojājumi, Bojāeja …"), mark:
+- "Bojājumi": "v"
+
+If not mentioned in covered risks → "Bojājumi": "-".
+
+2. "Bojāeja"
+Goal: is total loss / destruction covered?
+
+Search for:
+- "Bojāeja", "bojāejas", "Pilnīga bojāeja"
+
+If present in coverage lists → "Bojāeja": "v", else "-".
+
+3. "Zādzība"
+Goal: theft coverage.
+
+Search for:
+- "Zādzība", "Zādzības risks", "Zādzība un laupīšana", "Zādzībai"
+
+If coverage present → "Zādzība": "v", else "-".
+
+4. "Apzagšana"
+Goal: burglary / robbery coverage (separate from theft of whole car).
+
+Search for:
+- "Apzagšana", "Laupīšanas risks", "laupīšana"
+
+If coverage present → "Apzagšana": "v", else "-".
+
+5. "Teritorija"
+Goal: extract insurance territory text.
+
+Search for:
+- "Teritorija", "Apdrošināšanas teritorija",
+  "Apdrošināšanas līguma darbības teritorija",
+  "Teritoriālais segums", " Latvija,"
+Look especially near premium/variants tables.
+
+If found, return the CLEANED HUMAN STRING, e.g.:
+- "Eiropa"
+- "Eiropa (izņemot Baltkrieviju, Krieviju, Moldovu un Ukrainu)"
+- "Latvija"
+- "Eiropa bez NVS"
+If not clearly mentioned → "Teritorija": "-".
+
+6. "Pašrisks – bojājumi"
+Goal: self-risk (deductible) for damage.
+
+Search for:
+- "Paša risks", "Pašrisks bojājumiem", "Paša risks bojājumiem",
+  "Pašrisks", "Bojājumiem, apzagšanai", "Bojājumiem",
+  "Klienta pašrisks", "Pamata Pašrisks"
+
+Extract the main damage deductible for this offer (or the default/most relevant variant), e.g.:
+- "100 EUR"
+- "160 EUR"
+- "0 (140) EUR / 150 EUR / 200 EUR"
+If cannot identify any damage deductible but coverage exists → "v".
+If not present at all → "-".
+
+7. "Stiklojums bez pašriska"
+Goal: is glass covered with 0% / 0 EUR or special favorable condition.
+
+Search for any of the following or very similar:
+- "Stiklojums bez paša riska bojājumiem"
+- "Pirmajam stiklu plīsuma riska gadījumam tiek noteikts 0% pašrisks"
+- "Visu salona stiklu apdrošināšana bez paša riska neierobežotam gadījumu skaitam"
+- "Stiklojumam", "Stiklojums"
+- "Pašrisks vējstiklam 0.00 EUR"
+- "Pašrisks Stiklojuma bojājumiem 0 €"
+- Balcia special case:
+  "Pirmajam stiklu plīsuma riska gadījumam tiek noteikts 0% pašrisks, ja stikla nomaiņa tiek veikta Balcia norādītā remontuzņēmumā"
+- BTA special case:
+  "Stiklu plīsuma riska gadījumam tiek piemērots šajā apdrošināšanas polisē norādītais bojājumu pašrisks bez gadījumu skaita ierobežojuma, ja stikla nomaiņa tiek veikta klienta izvēlētā remontuzņēmumā un ar šo apdrošināšanas līgumu (polisi) ir iegādāta papildus apdrošināšanas aizsardzība 'Remonts klienta izvēlētā servisā'"
+
+If ANY of these or equivalent meaning appears in coverage/special conditions:
+- "Stiklojums bez pašriska": "v"
+If no glass special coverage → "-".
+
+8. "Maiņas / nomas auto (dienas)"
+Goal: replacement / rental car coverage and value.
+
+Search for:
+- "Aizvietošanas auto", "Bezmaksas maiņas auto (A variants)",
+- "Maiņas auto līdz 15 dienām ar limitu 30.00 EUR diennaktī",
+- "Maiņas auto nodrošināšanas apdrošināšana",
+- "Transportlīdzekļa aizvietošana (20 dienas / 30 EUR dienā)",
+- "Transportlīdzekļa aizvietošanas apdrošināšana",
+- "Auto aizvietošana",
+- "Nomas transportlīdzeklis līdz 30 dienām (kompaktā klase)"
+
+If there is a clear number of days and/or daily limit, return it as string:
+- e.g. "15 dienas / 30 EUR dienā", "20 dienas / 30 EUR dienā", "līdz 30 dienām (kompaktā klase)"
+If coverage exists but no clear numeric/value → "v".
+If no coverage → "-".
+
+9. "Palīdzība uz ceļa"
+Goal: roadside assistance.
+
+Search for:
+- "Palīdzība uz ceļa",
+- "Diennakts autopalīdzības pakalpojumi, ieskaitot evakuāciju Latvijas teritorijā, bez limita un Eiropas teritorijā ar limitu 1 000.00 EUR",
+- "Transportlīdzekļa transportēšana pēc apdrošināšanas gadījuma, limits līdz 750.00 EUR līguma darbības laikā.",
+- "Autohelp24",
+- "Diennakts autopalīdzība",
+- "Izdevumi nokļūšanai remonta iestādē"
+
+If limit/value given, return that string (e.g. "LV bez limita, Eiropā 1000 EUR", "transportēšana līdz 750 EUR").
+If only generic assistance mentioned but no clear limit → "v".
+If no assistance → "-".
+
+10. "Hidrotrieciens"
+Goal: hydro strike risk.
+
+Search for:
+- "Hidrotrieciens", "Hidrotrieciena risks",
+- "Elektriskie vai mehāniskie bojājumi hidrotrieciena dēļ bez paša riska ar limitu 7 000.00 EUR",
+- "Ekstra apdrošināšana" when clearly tied to hidrotrieciens.
+
+If coverage present with limit, return value string (e.g. "bez paša riska ar limitu 7000 EUR").
+If coverage present but no limit → "v".
+If absent → "-".
+
+11. "Personīgās mantas / bagāža"
+Goal: personal items / baggage risk.
+
+Search for:
+- "Personisko mantu apdrošināšana",
+- "Personīgo mantu bojājumi vai zādzība",
+- "Personisko mantu un bagāžas adprošināšana bez paša riska ar limitu",
+- "Bezrūpības risks",
+- "Mantas un inventāra apdrošināšana",
+- "Mantas apdrošināšana",
+- "Bagāžas apdrošināšana",
+- "Personīgo mantu bojājums vai zādzība"
+
+If limit/value is stated → return e.g. "bez paša riska ar limitu 1000 EUR".
+If coverage exists but no clear limit → "v".
+If absent → "-".
+
+12. "Atslēgu zādzība/atjaunošana"
+Goal: keys theft/replacement.
+
+Search for:
+- "Atslēgu aizvietošana",
+- "Atslēgu zādzība",
+- "Atslēgu un dokumentu atjaunošana bez paša riska vienu reizi polises darbības laikā",
+- "Atslēgu atjaunošana",
+- "Atslēgu risks",
+- "Atslēgu zādzība vai degvielas sajaukšana"
+
+Coverage present → return value if any (e.g. "bez paša riska 1 reizi polises laikā"), else "v".
+If absent → "-".
+
+13. "Degvielas sajaukšana/tīrīšana"
+Goal: wrong fuel / fuel system cleaning.
+
+Search for:
+- "Degvielas padeves sistēmas tīrīšanas izdevumi",
+- "Degvielas padeves sistēmas tīrīšanas izdevumi bez paša riska vienu reizi polises darbības",
+- "Degvielas sistēmas tīrīšana",
+- "Neatbilstošas degvielas iepildes risks",
+- "Degvielas padeves sistēmas tīrīšana",
+- "Atslēgu zādzība vai degvielas sajaukšana"
+
+Coverage present → return value if any (e.g. "bez paša riska 1 reizi polises laikā"), else "v".
+If absent → "-".
+
+14. "Riepas / diski"
+Goal: tyre and wheel damage coverage.
+
+Search for:
+- "Bojājumi riepām / diskiem no iebraukšanas bedrē bez paša riska",
+- "Riepu un disku bojājumi",
+- "Iebraukšana bedrē bez paša riska vienu reizi polises darbības laikā",
+- "Par pirmo apdrošināšanas gadījumu, kurā bojāta ... riepa (-as) un/vai disks (-i) ... 0 EUR pašrisks",
+- "Papildu nulles pašrisks transportlīdzekļa riepu un disku bojājumiem",
+- "Vienas transportlīdzekļa ass visu riepu nomaiņa",
+- "Riepu un numurzīmes apdrošināšana"
+
+If coverage present → return main phrase/value (e.g. "0 EUR pašrisks pirmajam gadījumam", "Papildu nulles pašrisks riepu un disku bojājumiem"), otherwise "-".
+
+15. "Numurzīmes"
+Goal: registration plates / documents.
+
+Search for:
+- "Numura zīmes pazaudēšana / zādzība",
+- "Numura zīmes atjaunošana bez paša riska vienu reizi polises darbības laikā",
+- "Reģistrācijas dokumentu un numurzīmju atjaunošana",
+- "Atslēgu, numuru un dokumentu apdrošināšana zādzības un nozaudēšanas gadījumam.",
+- "Transportlīdzekļa numurzīme",
+- "Riepu un numurzīmes apdrošināšana"
+
+If coverage present → return phrase/value (e.g. "atjaunošana bez paša riska 1 reizi polises laikā"), else "-".
+
+16. "Nelaimes gad. vadīt./pasažieriem"
+Goal: accident insurance for driver and passengers.
+
+Search for:
+- "Transportlīdzekļa vadītājs un pasažieri",
+- "Transportlīdzekļa vadītājs un četri pasažieri",
+- "Nelaimes gadījumu apdrošināšana transportlīdzekļa vadītājam un pasažieriem 7500.00 EUR",
+- "Vadītāja un pasažieru nelaimes gadījumu apdrošināšana",
+- "Transportlīdzekļa vadītāja un pasažieru nelaimes gadījumu apdrošināšana"
+
+If present, return the coverage sums string:
+- e.g. "Nāve 2500 EUR, invaliditāte 5000 EUR, traumas 5000 EUR"
+If clearly not included → "-".
+
+17. "Sadursme ar dzīvnieku"
+Goal: collision with animal (often with special self-risk).
+
+Search for:
+- "Sadursme ar dzīvnieku bez pašriska bojājumiem",
+- "Pirmajam sadursmes gadījumam ar dzīvnieku netiek piemērots bojājumu pašrisks ...",
+- "Sadursme ar dzīvnieku bez paša riska vienu reizi polises darbības laikā",
+- "Apdrošināšanas līguma darbības laikā par pirmo ... sadursmes gadījumu ar dzīvnieku tiek noteikts 0 EUR pašrisks",
+- phrases where "Bojājumi, Bojāeja" list includes "dzīvnieku nodarīto bojājumu",
+- "Sadursme ar dzīvnieku bez pašriska",
+- "Sadursme ar dzīvnieku"
+
+If such coverage exists (even with conditions) → "v", else "-".
+
+18. "Uguns / dabas stihijas"
+Goal: fire & natural perils.
+
+Search for:
+- "Bojājumi, tajā skaitā (bet ne tikai) CSNg, ugunsgrēks, dabas stihijas, krītoši priekšmeti, trešo personu prettiesiska rīcība",
+- "Dabas stihijas risks",
+- similar phrasing indicating damage or total loss from fire or natural perils,
+- "Ceļu satiksmes negadījums, uguns risks, dabas spēku iedarbība, dažādu priekšmetu un vielu iedarbība, iegruvums, trešo personu prettiesiska darbība, dzīvnieku, putnu nodarīti bojājumi.",
+- "no dabas stihijas iedarbības;",
+- "Dabas stihijas"
+
+If present → "v", else "-".
+
+19. "Vandālisms"
+Goal: vandalism/third-party malicious damage.
+
+Search for:
+- "Vandālisms",
+- "Bojājumi, tajā skaitā (bet ne tikai) CSNg, ugunsgrēks, dabas stihijas, krītoši priekšmeti, trešo personu prettiesiska rīcība",
+- "Bojājumi" in a context of broad damage coverage including third-party malicious actions,
+- "Aerogrāfija",
+- "Segums ārpus ceļu satiksmes",
+- "Ekstra apdrošināšana" when clearly extending to such damage.
+
+SPECIAL RULE FOR THIS FIELD:
+- If the policy clearly includes general "Bojājumi" coverage (standard CASCO damage coverage) and does NOT explicitly exclude vandalism/third-party malicious actions, then set:
+  "Vandālisms": "v"
+even if the exact word "vandālisms" does not appear.
+- Only set "-" if damage is not covered at all or vandalism-type damage is clearly excluded.
+
+OUTPUT FORMAT
+- Output MUST be a single valid JSON object.
+- Use EXACTLY the 19 keys specified.
+- Values must be strings.
+- Do NOT include any extra keys, comments, explanations, or trailing commas."""
 
 
 def _build_user_prompt(pdf_text: str, insurer_name: str, pdf_filename: Optional[str]) -> str:
     """
-    User message that gives the raw PDF text and asks for STRICTLY structured JSON.
-
-    Emphasizes:
-    - EXACT JSON structure required
-    - Each PDF usually represents a single offer from a single insurer
-    - All fields from CascoCoverage must be present (null if not found)
-    - No additional text outside JSON
+    User message with PDF text for 19-field extraction.
+    Simple and direct - just provides document text.
     """
     filename_part = f" (file: {pdf_filename})" if pdf_filename else ""
-    return (
-        f"Extract CASCO offer from insurer '{insurer_name}'{filename_part}.\n\n"
-        f"PDF TEXT:\n{pdf_text}\n\n"
-        "Return ONLY a JSON object with this structure:\n"
-        "{\n"
-        '  "offers": [\n'
-        "    {\n"
-        '      "structured": {\n'
-        f'        "insurer_name": "{insurer_name}",\n'
-        f'        "pdf_filename": "{pdf_filename or ""}",\n'
-        '        "damage": true/false/null,\n'
-        '        "theft": true/false/null,\n'
-        '        "territory": "Latvija"/null,\n'
-        '        "insured_value_eur": 15000/null,\n'
-        '        ... (ALL CascoCoverage fields)\n'
-        "      },\n"
-        '      "raw_text": "Short 1-3 sentence summary of key coverage"\n'
-        "    }\n"
-        "  ]\n"
-        "}\n\n"
-        "RULES:\n"
-        "- Include ALL fields (use null if not found)\n"
-        "- Keep raw_text SHORT (1-3 sentences max, NOT full document text)\n"
-        "- Booleans: true only if explicitly covered\n"
-        "- Numbers: parse as numbers in EUR\n"
-        "- Return ONLY JSON - no markdown, no extra text"
-    )
+    return f"""Extract CASCO insurance offer data for insurer '{insurer_name}'{filename_part}.
+
+DOCUMENT TEXT START:
+{pdf_text}
+DOCUMENT TEXT END.
+
+Return the JSON object with exactly 19 coverage fields as specified in the system prompt."""
 
 
-def _ensure_structured_field(offer_dict: dict, insurer_name: str, pdf_filename: Optional[str]) -> dict:
+def _map_json_keys_to_python(raw_json: dict) -> dict:
     """
-    Defensive logic: ensures 'structured' field exists and has required metadata.
-    If missing or incomplete, creates minimal valid structure with all fields as null.
+    Maps JSON keys (with spaces, dashes, slashes) to Python-friendly attribute names.
+    
+    Mapping:
+    - "Pašrisks – bojājumi" → "Pašrisks_bojājumi"
+    - "Stiklojums bez pašriska" → "Stiklojums_bez_pašriska"
+    - "Maiņas / nomas auto (dienas)" → "Maiņas_nomas_auto_dienas"
+    - "Palīdzība uz ceļa" → "Palīdzība_uz_ceļa"
+    - "Personīgās mantas / bagāža" → "Personīgās_mantas_bagāža"
+    - "Atslēgu zādzība/atjaunošana" → "Atslēgu_zādzība_atjaunošana"
+    - "Degvielas sajaukšana/tīrīšana" → "Degvielas_sajaukšana_tīrīšana"
+    - "Riepas / diski" → "Riepas_diski"
+    - "Nelaimes gad. vadīt./pasažieriem" → "Nelaimes_gad_vadīt_pasažieriem"
+    - "Sadursme ar dzīvnieku" → "Sadursme_ar_dzīvnieku"
+    - "Uguns / dabas stihijas" → "Uguns_dabas_stihijas"
     """
-    if "structured" not in offer_dict or not isinstance(offer_dict["structured"], dict):
-        # Create minimal valid structured object with all fields as null
-        offer_dict["structured"] = {
-            "insurer_name": insurer_name,
-            "product_name": None,
-            "offer_id": None,
-            "pdf_filename": pdf_filename,
-            # All other fields will be None by default due to Pydantic Optional
-        }
-    else:
-        # Ensure metadata is present
-        offer_dict["structured"].setdefault("insurer_name", insurer_name)
-        if pdf_filename:
-            offer_dict["structured"].setdefault("pdf_filename", pdf_filename)
+    key_mapping = {
+        "Pašrisks – bojājumi": "Pašrisks_bojājumi",
+        "Stiklojums bez pašriska": "Stiklojums_bez_pašriska",
+        "Maiņas / nomas auto (dienas)": "Maiņas_nomas_auto_dienas",
+        "Palīdzība uz ceļa": "Palīdzība_uz_ceļa",
+        "Personīgās mantas / bagāža": "Personīgās_mantas_bagāža",
+        "Atslēgu zādzība/atjaunošana": "Atslēgu_zādzība_atjaunošana",
+        "Degvielas sajaukšana/tīrīšana": "Degvielas_sajaukšana_tīrīšana",
+        "Riepas / diski": "Riepas_diski",
+        "Nelaimes gad. vadīt./pasažieriem": "Nelaimes_gad_vadīt_pasažieriem",
+        "Sadursme ar dzīvnieku": "Sadursme_ar_dzīvnieku",
+        "Uguns / dabas stihijas": "Uguns_dabas_stihijas",
+    }
     
-    # Ensure raw_text exists
-    if "raw_text" not in offer_dict:
-        offer_dict["raw_text"] = ""
+    mapped = {}
+    for json_key, value in raw_json.items():
+        # Use mapping if exists, otherwise keep original key
+        python_key = key_mapping.get(json_key, json_key)
+        mapped[python_key] = value
     
-    return offer_dict
+    return mapped
 
 
 def extract_casco_offers_from_text(
@@ -251,29 +523,20 @@ def extract_casco_offers_from_text(
     max_retries: int = 2,
 ) -> List[CascoExtractionResult]:
     """
-    Core hybrid extractor using OpenAI Chat Completions API (SDK 1.52.0).
+    Simplified 19-field CASCO extractor using OpenAI Chat Completions API.
     
-    ROBUST EXTRACTION with:
-    - Strict schema enforcement via prompts
-    - Retry mechanism for failures
-    - Defensive key validation
-    - Pydantic validation
-    - Automatic field population for missing data
+    NEW IN THIS VERSION:
+    - Direct 19-field JSON output (no "offers" wrapper)
+    - All fields are strings ("v", "-", or descriptive values)
+    - Python-friendly field name mapping
+    - Single offer per PDF (typical use case)
     
-    This function is PURE w.r.t. HEALTH logic: it only knows about CASCO and CascoCoverage.
+    Returns a single-element list for API compatibility.
     """
     client = _get_openai_client()
 
     system_prompt = _build_system_prompt()
     user_prompt = _build_user_prompt(pdf_text=pdf_text, insurer_name=insurer_name, pdf_filename=pdf_filename)
-
-    # Define response structure using Pydantic models for validation
-    class Offer(BaseModel):
-        structured: CascoCoverage
-        raw_text: str
-
-    class ResponseRoot(BaseModel):
-        offers: List[Offer]
 
     last_error: Optional[Exception] = None
 
@@ -299,43 +562,35 @@ def extract_casco_offers_from_text(
             # Use robust parser (handles markdown, trailing commas, etc.)
             payload = _safe_parse_casco_json(raw_content)
             
-            # Defensive validation: ensure "offers" key exists
-            if "offers" not in payload:
-                raise ValueError("Response missing 'offers' key")
+            # Map JSON keys to Python-friendly names
+            mapped_payload = _map_json_keys_to_python(payload)
             
-            if not isinstance(payload["offers"], list):
-                raise ValueError("'offers' must be a list")
+            # Add metadata
+            mapped_payload["insurer_name"] = insurer_name
+            if pdf_filename:
+                mapped_payload["pdf_filename"] = pdf_filename
             
-            if len(payload["offers"]) == 0:
-                raise ValueError("'offers' array is empty")
+            # Validate against Pydantic model
+            try:
+                coverage = CascoCoverage(**mapped_payload)
+            except ValidationError as ve:
+                raise ValueError(f"19-field validation failed: {ve}")
             
-            # Defensive logic: ensure each offer has 'structured' and 'raw_text'
-            valid_offers = []
-            for i, offer in enumerate(payload["offers"]):
-                if not isinstance(offer, dict):
-                    print(f"[WARN] CASCO offer {i} is not a dict, skipping")
-                    continue
-                
-                # Ensure required keys exist
-                offer = _ensure_structured_field(offer, insurer_name, pdf_filename)
-                
-                # Try to validate this single offer against Pydantic
-                try:
-                    validated_offer = Offer(**offer)
-                    valid_offers.append(validated_offer)
-                except ValidationError as ve:
-                    print(f"[WARN] CASCO offer {i} failed Pydantic validation: {ve}")
-                    # Continue with other offers rather than failing completely
-                    continue
+            # Generate raw_text summary (simple extraction-based summary)
+            covered_fields = [
+                key for key, val in mapped_payload.items() 
+                if val and val not in ["-", "None", None] and key not in ["insurer_name", "pdf_filename"]
+            ]
+            raw_text = f"Extracted {len(covered_fields)} coverage fields for {insurer_name}"
             
-            if len(valid_offers) == 0:
-                raise ValueError("All offers failed validation")
-            
-            # Create ResponseRoot with valid offers
-            root = ResponseRoot(offers=valid_offers)
+            # Create result
+            result = CascoExtractionResult(
+                coverage=coverage,
+                raw_text=raw_text,
+            )
             
             # If we got here, extraction succeeded
-            break
+            return [result]  # Single-element list for API compatibility
 
         except ValueError as e:
             # Enhance error message with context
@@ -355,23 +610,8 @@ def extract_casco_offers_from_text(
                 print(f"[RETRY] {error_msg}")
                 continue
             raise last_error
-
-    # Build results
-    results: List[CascoExtractionResult] = []
-
-    for offer in root.offers:
-        # Ensure metadata is properly set (redundant but safe)
-        offer.structured.insurer_name = insurer_name
-        if pdf_filename:
-            offer.structured.pdf_filename = pdf_filename
-
-        results.append(
-            CascoExtractionResult(
-                coverage=offer.structured,
-                raw_text=offer.raw_text or "",
-            )
-        )
-
-    return results
+    
+    # Should never reach here due to retry loop raising
+    raise last_error or ValueError("Extraction failed for unknown reason")
 
 

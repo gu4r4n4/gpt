@@ -97,11 +97,11 @@ async def process_and_persist_casco_pdf(
     for result in extraction_results:
         coverage = result.coverage
         
-        # Use coverage fields if not provided explicitly
-        territory_val = coverage.territory if coverage.territory else None
-        insured_amt = insured_amount or (
-            Decimal(str(coverage.insured_value_eur)) if coverage.insured_value_eur else None
-        )
+        # Extract territory from new 19-field model (Teritorija field)
+        territory_val = coverage.Teritorija if coverage.Teritorija and coverage.Teritorija != "-" else None
+        
+        # In new model, there's no insured_value_eur - use provided value or None
+        insured_amt = insured_amount or None
         
         # Parse dates if provided as strings
         period_from_date = None
