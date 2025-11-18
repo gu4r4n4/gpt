@@ -377,11 +377,9 @@ async def casco_compare_by_inquiry(
                 "message": "No CASCO offers found for this inquiry"
             }
         
-        # Parse coverage JSONB into CascoCoverage objects
-        offers = [CascoCoverage(**o["coverage"]) for o in raw_offers]
-        
+        # ✅ FIX: Pass raw_offers directly (includes premium_total, etc.)
         # Build comparison matrix
-        comparison = build_casco_comparison_matrix(offers)
+        comparison = build_casco_comparison_matrix(raw_offers)
         
         return {
             "offers": raw_offers,
@@ -416,11 +414,9 @@ async def casco_compare_by_vehicle(
                 "message": f"No CASCO offers found for vehicle {reg_number}"
             }
         
-        # Parse coverage JSONB into CascoCoverage objects
-        offers = [CascoCoverage(**o["coverage"]) for o in raw_offers]
-        
+        # ✅ FIX: Pass raw_offers directly (includes premium_total, etc.)
         # Build comparison matrix
-        comparison = build_casco_comparison_matrix(offers)
+        comparison = build_casco_comparison_matrix(raw_offers)
         
         return {
             "offers": raw_offers,
