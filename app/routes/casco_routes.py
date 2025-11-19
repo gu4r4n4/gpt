@@ -57,8 +57,7 @@ def _save_casco_offer_sync(
         insured_amount,
         currency,
         territory,
-        period_from,
-        period_to,
+        period,
         premium_total,
         premium_breakdown,
         coverage,
@@ -66,7 +65,7 @@ def _save_casco_offer_sync(
         product_line
     ) VALUES (
         %s, %s, %s, %s,
-        %s, %s, %s, %s, %s,
+        %s, %s, %s, %s,
         %s, %s, %s, %s, %s
     )
     RETURNING id;
@@ -91,13 +90,12 @@ def _save_casco_offer_sync(
                 offer.insured_amount,
                 offer.currency,
                 offer.territory,
-                offer.period_from,
-                offer.period_to,
+                offer.period,  # "12 mēneši"
                 offer.premium_total,
                 json.dumps(premium_breakdown),
                 json.dumps(coverage_payload),
                 offer.raw_text,
-                offer.product_line,
+                offer.product_line,  # Always 'casco' via default
             )
         )
         row = cur.fetchone()
@@ -120,8 +118,7 @@ def _fetch_casco_offers_by_inquiry_sync(conn, inquiry_id: int) -> List[dict]:
         insured_amount,
         currency,
         territory,
-        period_from,
-        period_to,
+        period,
         premium_total,
         premium_breakdown,
         coverage,
@@ -154,8 +151,7 @@ def _fetch_casco_offers_by_reg_number_sync(conn, reg_number: str) -> List[dict]:
         insured_amount,
         currency,
         territory,
-        period_from,
-        period_to,
+        period,
         premium_total,
         premium_breakdown,
         coverage,
@@ -182,10 +178,6 @@ async def upload_casco_offer(
     insurer_name: str = Form(...),
     reg_number: str = Form(...),
     inquiry_id: Optional[int] = Form(None),
-    premium_total: Optional[float] = Form(None),
-    insured_amount: Optional[float] = Form(None),
-    period_from: Optional[str] = Form(None),
-    period_to: Optional[str] = Form(None),
     conn = Depends(get_db),
 ):
     """
@@ -220,22 +212,24 @@ async def upload_casco_offer(
         for result in extraction_results:
             coverage = result.coverage
             
-            # Parse dates if provided
-            from datetime import datetime
-            period_from_date = None
-            period_to_date = None
+            # Extract financial fields from GPT result
+            premium_total_str = coverage.premium_total if hasattr(coverage, 'premium_total') else None
+            insured_amount_str = coverage.insured_amount if hasattr(coverage, 'insured_amount') else None
+            period_str = coverage.period if hasattr(coverage, 'period') else "12 mēneši"
             
-            if period_from:
+            # Convert to Decimal (handle "-" and non-numeric values)
+            def to_decimal(val):
+                if not val or val == "-":
+                    return None
                 try:
-                    period_from_date = datetime.fromisoformat(period_from).date()
-                except Exception:
-                    pass
+                    # Remove currency symbols and spaces
+                    cleaned = val.replace("EUR", "").replace("€", "").replace(" ", "").strip()
+                    return Decimal(cleaned)
+                except:
+                    return None
             
-            if period_to:
-                try:
-                    period_to_date = datetime.fromisoformat(period_to).date()
-                except Exception:
-                    pass
+            premium_total_decimal = to_decimal(premium_total_str)
+            insured_amount_decimal = to_decimal(insured_amount_str)
             
             # Build record
             offer_record = CascoOfferRecord(
@@ -243,12 +237,11 @@ async def upload_casco_offer(
                 reg_number=reg_number,
                 inquiry_id=inquiry_id,
                 insured_entity=None,
-                insured_amount=Decimal(str(insured_amount)) if insured_amount else None,
+                insured_amount=insured_amount_decimal,
                 currency="EUR",
                 territory=coverage.Teritorija if coverage.Teritorija and coverage.Teritorija != "-" else None,
-                period_from=period_from_date,
-                period_to=period_to_date,
-                premium_total=Decimal(str(premium_total)) if premium_total else None,
+                period=period_str,  # "12 mēneši"
+                premium_total=premium_total_decimal,
                 premium_breakdown=None,
                 coverage=coverage,
                 raw_text=result.raw_text,
@@ -333,19 +326,39 @@ async def upload_casco_offers_batch(
             
             # Save each extracted offer
             for result in extraction_results:
+                coverage = result.coverage
+                
+                # Extract financial fields from GPT result
+                premium_total_str = coverage.premium_total if hasattr(coverage, 'premium_total') else None
+                insured_amount_str = coverage.insured_amount if hasattr(coverage, 'insured_amount') else None
+                period_str = coverage.period if hasattr(coverage, 'period') else "12 mēneši"
+                
+                # Convert to Decimal (handle "-" and non-numeric values)
+                def to_decimal(val):
+                    if not val or val == "-":
+                        return None
+                    try:
+                        # Remove currency symbols and spaces
+                        cleaned = val.replace("EUR", "").replace("€", "").replace(" ", "").strip()
+                        return Decimal(cleaned)
+                    except:
+                        return None
+                
+                premium_total_decimal = to_decimal(premium_total_str)
+                insured_amount_decimal = to_decimal(insured_amount_str)
+                
                 offer_record = CascoOfferRecord(
                     insurer_name=insurer,
                     reg_number=reg_number,
                     inquiry_id=inquiry_id,
                     insured_entity=None,
-                    insured_amount=None,
+                    insured_amount=insured_amount_decimal,
                     currency="EUR",
-                    territory=result.coverage.Teritorija if result.coverage.Teritorija and result.coverage.Teritorija != "-" else None,
-                    period_from=None,
-                    period_to=None,
-                    premium_total=None,
+                    territory=coverage.Teritorija if coverage.Teritorija and coverage.Teritorija != "-" else None,
+                    period=period_str,  # "12 mēneši"
+                    premium_total=premium_total_decimal,
                     premium_breakdown=None,
-                    coverage=result.coverage,
+                    coverage=coverage,
                     raw_text=result.raw_text,
                 )
                 

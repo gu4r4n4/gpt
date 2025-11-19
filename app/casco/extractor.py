@@ -162,7 +162,7 @@ IMPORTANT GENERAL RULES
 - If coverage is not present at all, or only in exclusions, return "-".
 - Output MUST be pure JSON, no comments, no explanations, no extra keys.
 
-RETURN EXACTLY THIS JSON SHAPE (19 KEYS)
+RETURN EXACTLY THIS JSON SHAPE (22 KEYS)
 
 Return a single JSON object:
 
@@ -185,12 +185,17 @@ Return a single JSON object:
   "Nelaimes gad. vadīt./pasažieriem": "...",
   "Sadursme ar dzīvnieku": "...",
   "Uguns / dabas stihijas": "...",
-  "Vandālisms": "..."
+  "Vandālisms": "...",
+  "premium_total": "...",
+  "insured_amount": "...",
+  "period": "..."
 }
 
 Allowed values per field:
 - For boolean-type coverage: "v" or "-"
 - For value-type coverage: either a non-empty string with the value / limit / description, OR "v" if coverage exists but no clear numeric/territorial value is extractable, OR "-" if no coverage.
+- For premium_total and insured_amount: numeric string or "-"
+- For period: always "12 mēneši"
 
 DETAILED FIELD RULES
 
@@ -453,16 +458,52 @@ SPECIAL RULE FOR THIS FIELD:
 even if the exact word "vandālisms" does not appear.
 - Only set "-" if damage is not covered at all or vandalism-type damage is clearly excluded.
 
+20. "premium_total"
+Goal: extract the total premium amount.
+
+Search for:
+- "Kopējā prēmija", "Apdrošināšanas prēmija", "1 maksājums",
+  "Pavisam apmaksai", "Prēmija samaksai kopā", "KOPĀ", "Total premium"
+
+Extract the numeric value with currency, e.g.:
+- "450.00 EUR"
+- "1480 €"
+- "320.50"
+
+If found, return the numeric string.
+If not found → "premium_total": "-".
+
+21. "insured_amount"
+Goal: extract the insured sum/vehicle value.
+
+Search for:
+- "Apdrošinājuma summa", "Apdrošināšanas summa", "Transportlīdzekļa vērtība",
+  "Insured sum", "Apdrošinātā summa"
+
+Extract the numeric value, e.g.:
+- "15000 EUR"
+- "20000"
+
+If found, return the numeric string.
+If not found → "insured_amount": "Tirgus vērtība".
+
+22. "period"
+Goal: insurance period/duration.
+
+ALWAYS return: "12 mēneši"
+
+(This is the standard period for CASCO insurance in Latvia.)
+
 OUTPUT FORMAT
 - Output MUST be a single valid JSON object.
-- Use EXACTLY the 19 keys specified.
+- Use EXACTLY the 22 keys specified (19 coverage fields + premium_total + insured_amount + period).
 - Values must be strings.
 - Do NOT include any extra keys, comments, explanations, or trailing commas."""
 
 
 def _build_user_prompt(pdf_text: str, insurer_name: str, pdf_filename: Optional[str]) -> str:
     """
-    User message with PDF text for 19-field extraction.
+    User message with PDF text for 22-field extraction (19 coverage + 3 financial).
     Simple and direct - just provides document text.
     """
     filename_part = f" (file: {pdf_filename})" if pdf_filename else ""
@@ -472,7 +513,7 @@ DOCUMENT TEXT START:
 {pdf_text}
 DOCUMENT TEXT END.
 
-Return the JSON object with exactly 19 coverage fields as specified in the system prompt."""
+Return the JSON object with exactly 22 fields (19 coverage + premium_total + insured_amount + period) as specified in the system prompt."""
 
 
 def _map_json_keys_to_python(raw_json: dict) -> dict:
@@ -523,13 +564,14 @@ def extract_casco_offers_from_text(
     max_retries: int = 2,
 ) -> List[CascoExtractionResult]:
     """
-    Simplified 19-field CASCO extractor using OpenAI Chat Completions API.
+    CASCO extractor using OpenAI Chat Completions API with 22 fields.
     
-    NEW IN THIS VERSION:
-    - Direct 19-field JSON output (no "offers" wrapper)
-    - All fields are strings ("v", "-", or descriptive values)
-    - Python-friendly field name mapping
-    - Single offer per PDF (typical use case)
+    FIELDS:
+    - 19 coverage fields (Bojājumi, Zādzība, Teritorija, etc.)
+    - 3 financial fields (premium_total, insured_amount, period)
+    
+    All fields are strings ("v", "-", or descriptive values).
+    Single offer per PDF (typical use case).
     
     Returns a single-element list for API compatibility.
     """

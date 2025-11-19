@@ -77,8 +77,7 @@ def build_casco_comparison_matrix(
             "insured_amount": raw_offer.get("insured_amount"),
             "currency": raw_offer.get("currency", "EUR"),
             "territory": raw_offer.get("territory"),
-            "period_from": str(raw_offer.get("period_from")) if raw_offer.get("period_from") else None,
-            "period_to": str(raw_offer.get("period_to")) if raw_offer.get("period_to") else None,
+            "period": raw_offer.get("period"),  # "12 mēneši"
             "premium_breakdown": raw_offer.get("premium_breakdown"),
             "created_at": str(raw_offer.get("created_at")) if raw_offer.get("created_at") else None,
         }
@@ -114,20 +113,26 @@ def build_casco_comparison_matrix(
             values[key] = value
 
     # --------------------------------------
-    # 3. Add metadata rows for premium, etc.
+    # 3. Add metadata rows for financial fields
     # --------------------------------------
     metadata_rows = [
         CascoComparisonRow(
             code="premium_total",
-            label="Prēmija kopā EUR",
-            group="pricing",
+            label="Kopējā prēmija",
+            group="financial",
             type="number"
         ),
         CascoComparisonRow(
             code="insured_amount",
-            label="Apdrošināmā summa EUR",
-            group="pricing",
+            label="Apdrošinājuma summa",
+            group="financial",
             type="number"
+        ),
+        CascoComparisonRow(
+            code="period",
+            label="Periods",
+            group="financial",
+            type="text"
         ),
     ]
     
@@ -135,8 +140,9 @@ def build_casco_comparison_matrix(
     for column_id, metadata in column_metadata.items():
         values[f"premium_total::{column_id}"] = metadata.get("premium_total")
         values[f"insured_amount::{column_id}"] = metadata.get("insured_amount")
+        values[f"period::{column_id}"] = metadata.get("period")
     
-    # Combine all rows
+    # Combine all rows (metadata first, then coverage rows)
     all_rows = metadata_rows + CASCO_COMPARISON_ROWS
 
     # --------------------------------------

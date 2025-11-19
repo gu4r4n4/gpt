@@ -14,12 +14,12 @@ from typing import Optional, List, Literal
 
 
 # ---------------------------------------
-# CASCO Coverage Data Model (19 Fields)
+# CASCO Coverage Data Model (22 Fields)
 # ---------------------------------------
 
 class CascoCoverage(BaseModel):
     """
-    Simplified CASCO coverage model with 19 Latvian-named fields.
+    Simplified CASCO coverage model with 22 fields (19 coverage + 3 financial).
     All coverage fields are strings: "v" (covered), "-" (not covered), or descriptive value.
     """
     # Metadata (preserved for compatibility)
@@ -46,6 +46,11 @@ class CascoCoverage(BaseModel):
     Sadursme_ar_dzīvnieku: Optional[str] = None                 # 17. Animal collision
     Uguns_dabas_stihijas: Optional[str] = None                  # 18. Fire / natural perils
     Vandālisms: Optional[str] = None                            # 19. Vandalism
+    
+    # 3 Financial Fields (extracted by GPT)
+    premium_total: Optional[str] = None                         # 20. Total premium
+    insured_amount: Optional[str] = None                        # 21. Insured sum
+    period: Optional[str] = None                                # 22. Period (always "12 mēneši")
 
 
 # ---------------------------------------

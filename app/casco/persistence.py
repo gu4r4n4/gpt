@@ -27,15 +27,14 @@ class CascoOfferRecord:
     insured_amount: Optional[Decimal] = None
     currency: str = "EUR"
     territory: Optional[str] = None
-    period_from: Optional[date] = None
-    period_to: Optional[date] = None
+    period: Optional[str] = None  # Insurance period (e.g., "12 mēneši")
 
     premium_total: Optional[Decimal] = None
     premium_breakdown: Optional[Dict[str, Any]] = None  # e.g. {"kasko": 1480.0, "nelaimes": 4.68}
 
     coverage: CascoCoverage | Dict[str, Any] = None
     raw_text: Optional[str] = None
-    product_line: str = "casco"  # Product type identifier
+    product_line: str = "casco"  # Product line identifier (always 'casco' for CASCO offers)
 
 
 async def save_casco_offers(
@@ -57,8 +56,7 @@ async def save_casco_offers(
         insured_amount,
         currency,
         territory,
-        period_from,
-        period_to,
+        period,
         premium_total,
         premium_breakdown,
         coverage,
@@ -66,8 +64,8 @@ async def save_casco_offers(
         product_line
     ) VALUES (
         $1, $2, $3, $4,
-        $5, $6, $7, $8, $9,
-        $10, $11, $12::jsonb, $13, $14
+        $5, $6, $7, $8,
+        $9, $10, $11::jsonb, $12, $13
     )
     RETURNING id;
     """
@@ -92,13 +90,12 @@ async def save_casco_offers(
             offer.insured_amount,
             offer.currency,
             offer.territory,
-            offer.period_from,
-            offer.period_to,
+            offer.period,  # "12 mēneši"
             offer.premium_total,
             json.dumps(premium_breakdown),
             json.dumps(coverage_payload),
             offer.raw_text,
-            offer.product_line,
+            offer.product_line,  # Always 'casco' via default
         )
         ids.append(row["id"])
 
@@ -132,8 +129,7 @@ async def fetch_casco_offers_by_inquiry(
         insured_amount,
         currency,
         territory,
-        period_from,
-        period_to,
+        period,
         premium_total,
         premium_breakdown,
         coverage,
@@ -168,8 +164,7 @@ async def fetch_casco_offers_by_reg_number(
         insured_amount,
         currency,
         territory,
-        period_from,
-        period_to,
+        period,
         premium_total,
         premium_breakdown,
         coverage,
