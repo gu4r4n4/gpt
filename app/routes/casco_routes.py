@@ -253,6 +253,7 @@ async def upload_casco_offer(
         
         return {
             "success": True,
+            "inquiry_id": inquiry_id,
             "offer_ids": inserted_ids,
             "message": f"Successfully processed {len(inserted_ids)} CASCO offer(s)"
         }
@@ -367,6 +368,7 @@ async def upload_casco_offers_batch(
         
         return {
             "success": True,
+            "inquiry_id": inquiry_id,
             "offer_ids": inserted_ids,
             "total_offers": len(inserted_ids)
         }
@@ -417,17 +419,21 @@ async def casco_compare_by_inquiry(
 
 
 # ---------------------------
-# 4. Compare by vehicle reg number
+# 4. Compare by vehicle reg number (DEPRECATED)
 # ---------------------------
-@router.get("/vehicle/{reg_number}/compare")
+@router.get("/vehicle/{reg_number}/compare", deprecated=True)
 async def casco_compare_by_vehicle(
     reg_number: str,
     conn = Depends(get_db),
 ):
     """
-    Get CASCO comparison matrix for all offers for a specific vehicle.
+    [DEPRECATED] Get CASCO comparison matrix for all offers for a specific vehicle.
     
-    Useful for viewing historical offers across multiple inquiries.
+    ⚠️ DEPRECATED: This endpoint is deprecated and should not be used by frontend.
+    Use GET /casco/inquiry/{inquiry_id}/compare instead.
+    
+    This endpoint fetches offers across multiple inquiries for a vehicle,
+    which is not the intended behavior. Frontend should use inquiry-based comparison.
     """
     try:
         raw_offers = _fetch_casco_offers_by_reg_number_sync(conn, reg_number)
@@ -477,15 +483,18 @@ async def casco_offers_by_inquiry(
 
 
 # ---------------------------
-# 6. Raw offers by vehicle
+# 6. Raw offers by vehicle (DEPRECATED)
 # ---------------------------
-@router.get("/vehicle/{reg_number}/offers")
+@router.get("/vehicle/{reg_number}/offers", deprecated=True)
 async def casco_offers_by_vehicle(
     reg_number: str,
     conn = Depends(get_db),
 ):
     """
-    Get raw CASCO offers for a vehicle without comparison matrix.
+    [DEPRECATED] Get raw CASCO offers for a vehicle without comparison matrix.
+    
+    ⚠️ DEPRECATED: This endpoint is deprecated and should not be used by frontend.
+    Use GET /casco/inquiry/{inquiry_id}/offers instead.
     
     Returns all offer data including metadata, coverage, and raw_text.
     """
