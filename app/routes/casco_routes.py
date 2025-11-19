@@ -1,12 +1,13 @@
 """
 CASCO API Endpoints
 Handles PDF upload, extraction, normalization, persistence, and comparison.
-Integrates seamlessly with existing insurance_inquiries workflow.
+Uses internal job ID system (UUID strings) - NO inquiry_id dependency.
 """
 
 from __future__ import annotations
 
 import os
+import uuid
 from decimal import Decimal
 from typing import Optional, List
 
@@ -36,8 +37,28 @@ def get_db():
 
 
 # ---------------------------
-# Helper: Save to DB (sync adapter for persistence layer)
+# Helper: Job and Offer Management (sync adapters)
 # ---------------------------
+def _create_casco_job_sync(conn, reg_number: str) -> str:
+    """
+    Create a new CASCO job entry with UUID identifier.
+    Returns the new job ID (UUID string).
+    """
+    job_id = str(uuid.uuid4())
+    
+    sql = """
+    INSERT INTO public.casco_jobs (casco_job_id, reg_number, product_line)
+    VALUES (%s, %s, 'casco')
+    RETURNING casco_job_id;
+    """
+    
+    with conn.cursor() as cur:
+        cur.execute(sql, (job_id, reg_number))
+        row = cur.fetchone()
+        conn.commit()
+        return row["casco_job_id"]
+
+
 def _save_casco_offer_sync(
     conn,
     offer: CascoOfferRecord,
@@ -45,6 +66,8 @@ def _save_casco_offer_sync(
     """
     Synchronous adapter for saving CASCO offers.
     Adapts the async persistence layer to work with psycopg2.
+    
+    Requires casco_job_id (UUID string) to be set on the offer.
     """
     import json
     
@@ -53,7 +76,7 @@ def _save_casco_offer_sync(
         insurer_name,
         reg_number,
         insured_entity,
-        inquiry_id,
+        casco_job_id,
         insured_amount,
         currency,
         territory,
@@ -86,7 +109,7 @@ def _save_casco_offer_sync(
                 offer.insurer_name,
                 offer.reg_number,
                 offer.insured_entity,
-                offer.inquiry_id,
+                offer.casco_job_id,  # UUID string
                 offer.insured_amount,
                 offer.currency,
                 offer.territory,
@@ -103,9 +126,9 @@ def _save_casco_offer_sync(
         return row["id"]
 
 
-def _fetch_casco_offers_by_inquiry_sync(conn, inquiry_id: int) -> List[dict]:
+def _fetch_casco_offers_by_job_sync(conn, casco_job_id: str) -> List[dict]:
     """
-    Fetch all CASCO offers for an inquiry.
+    Fetch all CASCO offers for a job (UUID string).
     Filters by product_line='casco' to ensure only CASCO offers are returned.
     """
     sql = """
@@ -114,7 +137,7 @@ def _fetch_casco_offers_by_inquiry_sync(conn, inquiry_id: int) -> List[dict]:
         insurer_name,
         reg_number,
         insured_entity,
-        inquiry_id,
+        casco_job_id,
         insured_amount,
         currency,
         territory,
@@ -126,20 +149,22 @@ def _fetch_casco_offers_by_inquiry_sync(conn, inquiry_id: int) -> List[dict]:
         product_line,
         created_at
     FROM public.offers_casco
-    WHERE inquiry_id = %s
+    WHERE casco_job_id = %s
       AND product_line = 'casco'
     ORDER BY created_at DESC;
     """
     
     with conn.cursor() as cur:
-        cur.execute(sql, (inquiry_id,))
+        cur.execute(sql, (casco_job_id,))
         return cur.fetchall()
 
 
 def _fetch_casco_offers_by_reg_number_sync(conn, reg_number: str) -> List[dict]:
     """
-    Fetch all CASCO offers for a vehicle.
-    Filters by product_line='casco' to ensure only CASCO offers are returned.
+    DEPRECATED: Fetch all CASCO offers for a vehicle.
+    
+    This function is kept for backwards compatibility but should NOT be used.
+    Use _fetch_casco_offers_by_job_sync() instead.
     """
     sql = """
     SELECT 
@@ -147,7 +172,7 @@ def _fetch_casco_offers_by_reg_number_sync(conn, reg_number: str) -> List[dict]:
         insurer_name,
         reg_number,
         insured_entity,
-        inquiry_id,
+        casco_job_id,
         insured_amount,
         currency,
         territory,
@@ -177,24 +202,35 @@ async def upload_casco_offer(
     file: UploadFile,
     insurer_name: str = Form(...),
     reg_number: str = Form(...),
-    inquiry_id: Optional[int] = Form(None),
     conn = Depends(get_db),
 ):
     """
     Upload and process a single CASCO PDF offer.
     
     Steps:
-    1. Extract text from PDF
-    2. Run GPT hybrid extraction (structured + raw_text)
-    3. Normalize coverage
-    4. Persist to public.offers_casco
+    1. Create a new CASCO job (internal tracking with UUID)
+    2. Extract text from PDF
+    3. Run GPT hybrid extraction (structured + raw_text)
+    4. Normalize coverage
+    5. Persist to public.offers_casco with casco_job_id
     
-    Returns inserted offer ID(s).
+    Returns:
+    {
+      "success": true,
+      "casco_job_id": "<uuid-string>",
+      "offer_ids": [<ids>],
+      "total_offers": <int>
+    }
+    
+    NOTE: inquiry_id is NO LONGER USED. Each upload creates a new internal job.
     """
     try:
         # Validate file type
         if not file.filename.lower().endswith('.pdf'):
             raise HTTPException(status_code=400, detail="Only PDF files are supported")
+        
+        # Create CASCO job (internal tracking with UUID)
+        casco_job_id = _create_casco_job_sync(conn, reg_number)
         
         # Read PDF
         pdf_bytes = await file.read()
@@ -231,11 +267,11 @@ async def upload_casco_offer(
             premium_total_decimal = to_decimal(premium_total_str)
             insured_amount_decimal = to_decimal(insured_amount_str)
             
-            # Build record
+            # Build record with casco_job_id (UUID string)
             offer_record = CascoOfferRecord(
                 insurer_name=insurer_name,
                 reg_number=reg_number,
-                inquiry_id=inquiry_id,
+                casco_job_id=casco_job_id,  # UUID string
                 insured_entity=None,
                 insured_amount=insured_amount_decimal,
                 currency="EUR",
@@ -253,9 +289,9 @@ async def upload_casco_offer(
         
         return {
             "success": True,
-            "inquiry_id": inquiry_id,
+            "casco_job_id": casco_job_id,  # UUID string for comparison
             "offer_ids": inserted_ids,
-            "message": f"Successfully processed {len(inserted_ids)} CASCO offer(s)"
+            "total_offers": len(inserted_ids)
         }
     
     except Exception as e:
@@ -269,7 +305,6 @@ async def upload_casco_offer(
 async def upload_casco_offers_batch(
     request: Request,
     reg_number: str = Form(...),
-    inquiry_id: Optional[int] = Form(None),
     conn = Depends(get_db),
 ):
     """
@@ -283,9 +318,23 @@ async def upload_casco_offers_batch(
         insurers=IF
     
     This endpoint properly extracts repeated form fields using .getlist()
+    
+    Returns:
+    {
+      "success": true,
+      "casco_job_id": "<uuid-string>",
+      "offer_ids": [<ids>],
+      "total_offers": <int>
+    }
+    
+    NOTE: inquiry_id is NO LONGER USED. Each batch upload creates a new internal job.
+    All offers in the batch share the same casco_job_id.
     """
     
     try:
+        # Create CASCO job for this batch (UUID - all offers will share this job ID)
+        casco_job_id = _create_casco_job_sync(conn, reg_number)
+        
         # FIX: Properly extract repeated form fields
         form = await request.form()
         insurers_list = form.getlist("insurers")   # Frontend sends multiple "insurers" fields
@@ -351,7 +400,7 @@ async def upload_casco_offers_batch(
                 offer_record = CascoOfferRecord(
                     insurer_name=insurer,
                     reg_number=reg_number,
-                    inquiry_id=inquiry_id,
+                    casco_job_id=casco_job_id,  # All offers in batch share same UUID job
                     insured_entity=None,
                     insured_amount=insured_amount_decimal,
                     currency="EUR",
@@ -368,7 +417,7 @@ async def upload_casco_offers_batch(
         
         return {
             "success": True,
-            "inquiry_id": inquiry_id,
+            "casco_job_id": casco_job_id,  # UUID string for comparison
             "offer_ids": inserted_ids,
             "total_offers": len(inserted_ids)
         }
@@ -380,32 +429,43 @@ async def upload_casco_offers_batch(
 
 
 # ---------------------------
-# 3. Compare by inquiry
+# 3. Compare by CASCO job
 # ---------------------------
-@router.get("/inquiry/{inquiry_id}/compare")
-async def casco_compare_by_inquiry(
-    inquiry_id: int,
+@router.get("/job/{casco_job_id}/compare")
+async def casco_compare_by_job(
+    casco_job_id: str,
     conn = Depends(get_db),
 ):
     """
-    Get CASCO comparison matrix for all offers in an inquiry.
+    Get CASCO comparison matrix for all offers in a job (UUID string).
     
     Returns:
-        - offers: Raw offer data with metadata
-        - comparison: Structured comparison matrix for frontend rendering
+    {
+      "offers": [...],
+      "comparison": {
+        "rows": [...],         // 22 rows (3 financial + 19 features)
+        "columns": [...],      // insurer names
+        "values": {...},       // "field::insurer": value
+        "metadata": {...}      // insurer metadata
+      },
+      "offer_count": <int>
+    }
+    
+    NOTE: This replaces the old inquiry-based comparison.
+    Each upload creates a unique job ID that groups all offers from that batch.
     """
     try:
-        raw_offers = _fetch_casco_offers_by_inquiry_sync(conn, inquiry_id)
+        raw_offers = _fetch_casco_offers_by_job_sync(conn, casco_job_id)
         
         if not raw_offers:
             return {
                 "offers": [],
                 "comparison": None,
-                "message": "No CASCO offers found for this inquiry"
+                "offer_count": 0,
+                "message": "No CASCO offers found for this job"
             }
         
-        # ✅ FIX: Pass raw_offers directly (includes premium_total, etc.)
-        # Build comparison matrix
+        # Build comparison matrix (22 rows: 3 financial + 19 coverage fields)
         comparison = build_casco_comparison_matrix(raw_offers)
         
         return {
@@ -430,10 +490,10 @@ async def casco_compare_by_vehicle(
     [DEPRECATED] Get CASCO comparison matrix for all offers for a specific vehicle.
     
     ⚠️ DEPRECATED: This endpoint is deprecated and should not be used by frontend.
-    Use GET /casco/inquiry/{inquiry_id}/compare instead.
+    Use GET /casco/job/{casco_job_id}/compare instead.
     
-    This endpoint fetches offers across multiple inquiries for a vehicle,
-    which is not the intended behavior. Frontend should use inquiry-based comparison.
+    This endpoint fetches offers across multiple jobs for a vehicle,
+    which is not the intended behavior. Frontend should use job-based comparison.
     """
     try:
         raw_offers = _fetch_casco_offers_by_reg_number_sync(conn, reg_number)
@@ -442,10 +502,10 @@ async def casco_compare_by_vehicle(
             return {
                 "offers": [],
                 "comparison": None,
+                "offer_count": 0,
                 "message": f"No CASCO offers found for vehicle {reg_number}"
             }
         
-        # ✅ FIX: Pass raw_offers directly (includes premium_total, etc.)
         # Build comparison matrix
         comparison = build_casco_comparison_matrix(raw_offers)
         
@@ -460,20 +520,22 @@ async def casco_compare_by_vehicle(
 
 
 # ---------------------------
-# 5. Raw offers by inquiry
+# 5. Raw offers by CASCO job
 # ---------------------------
-@router.get("/inquiry/{inquiry_id}/offers")
-async def casco_offers_by_inquiry(
-    inquiry_id: int,
+@router.get("/job/{casco_job_id}/offers")
+async def casco_offers_by_job(
+    casco_job_id: str,
     conn = Depends(get_db),
 ):
     """
-    Get raw CASCO offers for an inquiry without comparison matrix.
+    Get raw CASCO offers for a job (UUID string) without comparison matrix.
     
     Returns all offer data including metadata, coverage, and raw_text.
+    
+    NOTE: This replaces the old inquiry-based offers endpoint.
     """
     try:
-        offers = _fetch_casco_offers_by_inquiry_sync(conn, inquiry_id)
+        offers = _fetch_casco_offers_by_job_sync(conn, casco_job_id)
         return {
             "offers": offers,
             "count": len(offers)
@@ -494,7 +556,7 @@ async def casco_offers_by_vehicle(
     [DEPRECATED] Get raw CASCO offers for a vehicle without comparison matrix.
     
     ⚠️ DEPRECATED: This endpoint is deprecated and should not be used by frontend.
-    Use GET /casco/inquiry/{inquiry_id}/offers instead.
+    Use GET /casco/job/{casco_job_id}/offers instead.
     
     Returns all offer data including metadata, coverage, and raw_text.
     """
@@ -506,4 +568,3 @@ async def casco_offers_by_vehicle(
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch offers: {str(e)}")
-

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Sequence
+import uuid
 
 import json
 
@@ -17,11 +18,14 @@ class CascoOfferRecord:
     """
     Canonical CASCO offer shape we store in public.offers_casco.
     This is the bridge between extractor/normalizer and the DB.
+    
+    Uses casco_job_id (UUID string) for grouping offers (NOT inquiry_id).
+    Each upload creates a new job, and all offers in that upload share the same casco_job_id.
     """
 
     insurer_name: str
     reg_number: str
-    inquiry_id: Optional[int] = None
+    casco_job_id: str  # Required - UUID string linking to casco_jobs.casco_job_id
     insured_entity: Optional[str] = None
 
     insured_amount: Optional[Decimal] = None
@@ -37,6 +41,28 @@ class CascoOfferRecord:
     product_line: str = "casco"  # Product line identifier (always 'casco' for CASCO offers)
 
 
+async def create_casco_job(
+    conn,
+    reg_number: str,
+) -> str:
+    """
+    Create a new CASCO job entry with UUID identifier.
+    Returns the new job ID (UUID string).
+    
+    This should be called at the start of each upload (single or batch).
+    """
+    job_id = str(uuid.uuid4())
+    
+    sql = """
+    INSERT INTO public.casco_jobs (casco_job_id, reg_number, product_line)
+    VALUES ($1, $2, 'casco')
+    RETURNING casco_job_id;
+    """
+    
+    row = await conn.fetchrow(sql, job_id, reg_number)
+    return row["casco_job_id"]
+
+
 async def save_casco_offers(
     conn,  # asyncpg.Connection or compatible
     offers: Sequence[CascoOfferRecord],
@@ -45,6 +71,8 @@ async def save_casco_offers(
     Persist multiple CASCO offers into public.offers_casco.
 
     Returns list of inserted IDs in the same order as input.
+    
+    All offers MUST have the same casco_job_id (from the same upload batch).
     """
 
     sql = """
@@ -52,7 +80,7 @@ async def save_casco_offers(
         insurer_name,
         reg_number,
         insured_entity,
-        inquiry_id,
+        casco_job_id,
         insured_amount,
         currency,
         territory,
@@ -86,7 +114,7 @@ async def save_casco_offers(
             offer.insurer_name,
             offer.reg_number,
             offer.insured_entity,
-            offer.inquiry_id,
+            offer.casco_job_id,  # UUID string
             offer.insured_amount,
             offer.currency,
             offer.territory,
@@ -110,12 +138,12 @@ async def save_single_casco_offer(conn, offer: CascoOfferRecord) -> int:
     return ids[0]
 
 
-async def fetch_casco_offers_by_inquiry(
+async def fetch_casco_offers_by_job(
     conn,
-    inquiry_id: int,
+    casco_job_id: str,
 ) -> List[Dict[str, Any]]:
     """
-    Fetch all CASCO offers for a given inquiry_id.
+    Fetch all CASCO offers for a given job ID (UUID string).
     Returns list of dicts with all fields.
     Filters by product_line='casco' to ensure only CASCO offers are returned.
     """
@@ -125,7 +153,7 @@ async def fetch_casco_offers_by_inquiry(
         insurer_name,
         reg_number,
         insured_entity,
-        inquiry_id,
+        casco_job_id,
         insured_amount,
         currency,
         territory,
@@ -137,12 +165,12 @@ async def fetch_casco_offers_by_inquiry(
         product_line,
         created_at
     FROM public.offers_casco
-    WHERE inquiry_id = $1
+    WHERE casco_job_id = $1
       AND product_line = 'casco'
     ORDER BY created_at DESC;
     """
     
-    rows = await conn.fetch(sql, inquiry_id)
+    rows = await conn.fetch(sql, casco_job_id)
     return [dict(row) for row in rows]
 
 
@@ -151,8 +179,12 @@ async def fetch_casco_offers_by_reg_number(
     reg_number: str,
 ) -> List[Dict[str, Any]]:
     """
-    Fetch all CASCO offers for a given vehicle registration number.
-    Filters by product_line='casco' to ensure only CASCO offers are returned.
+    DEPRECATED: Fetch all CASCO offers for a given vehicle registration number.
+    
+    This function is kept for backwards compatibility but should NOT be used
+    for new code. Use fetch_casco_offers_by_job() instead.
+    
+    Note: This fetches across multiple jobs, which is not the intended behavior.
     """
     sql = """
     SELECT 
@@ -160,7 +192,7 @@ async def fetch_casco_offers_by_reg_number(
         insurer_name,
         reg_number,
         insured_entity,
-        inquiry_id,
+        casco_job_id,
         insured_amount,
         currency,
         territory,
@@ -179,4 +211,3 @@ async def fetch_casco_offers_by_reg_number(
     
     rows = await conn.fetch(sql, reg_number)
     return [dict(row) for row in rows]
-

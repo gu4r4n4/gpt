@@ -1069,6 +1069,8 @@ class ShareCreateBody(BaseModel):
     insurer_only: Optional[str] = None
     batch_token: Optional[str] = None
     view_prefs: Optional[Dict[str, Any]] = None
+    product_line: Optional[str] = Field(None, description="Product line: 'casco' or 'health' (default)")
+    casco_job_id: Optional[str] = Field(None, description="CASCO job ID (UUID string) for CASCO shares")
 
 def _gen_token() -> str:
     return secrets.token_urlsafe(16)
@@ -1211,6 +1213,8 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
         "insurer_only": body.insurer_only,
         "batch_token": inferred_batch_token,
         "view_prefs": body.view_prefs or {},
+        "product_line": body.product_line or "health",  # Default to health for backwards compatibility
+        "casco_job_id": body.casco_job_id,  # Store CASCO job ID if provided
     }
 
     expires_at = None
@@ -1224,6 +1228,7 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
         "expires_at": expires_at,
         "view_prefs": body.view_prefs or {},
         "org_id": org_id,
+        "product_line": body.product_line or "health",  # Also store at top level for filtering
     }
 
     if _supabase:
@@ -1292,8 +1297,44 @@ def get_share_token_only(token: str, request: Request):
 
     payload = share.get("payload") or {}
     mode = payload.get("mode") or "snapshot"
+    product_line = payload.get("product_line") or share.get("product_line") or "health"
 
-    if mode == "snapshot" and payload.get("results"):
+    # Handle CASCO shares differently
+    if product_line == "casco":
+        casco_job_id = payload.get("casco_job_id")
+        if casco_job_id:
+            try:
+                # Fetch CASCO offers using job ID
+                from app.routes.casco_routes import _fetch_casco_offers_by_job_sync, build_casco_comparison_matrix, get_db
+                conn = None
+                try:
+                    conn = get_db_connection()
+                    raw_offers = _fetch_casco_offers_by_job_sync(conn, casco_job_id)
+                    
+                    if raw_offers:
+                        # Build CASCO comparison matrix
+                        from app.casco.comparator import build_casco_comparison_matrix
+                        comparison = build_casco_comparison_matrix(raw_offers)
+                        
+                        return {
+                            "token": token,
+                            "payload": payload,
+                            "offers": raw_offers,
+                            "comparison": comparison,
+                            "offer_count": len(raw_offers),
+                            "product_line": "casco",
+                            "stats": updated_stats,
+                        }
+                finally:
+                    if conn:
+                        conn.close()
+            except Exception as e:
+                print(f"[warn] Failed to fetch CASCO offers for job {casco_job_id}: {e}")
+                offers = []
+        else:
+            offers = []
+    # Handle HEALTH shares (existing logic)
+    elif mode == "snapshot" and payload.get("results"):
         offers = payload["results"]
     elif mode == "by-documents":
         doc_ids = payload.get("document_ids") or []
