@@ -62,11 +62,12 @@ def _save_casco_offer_sync(
         premium_total,
         premium_breakdown,
         coverage,
-        raw_text
+        raw_text,
+        product_line
     ) VALUES (
         %s, %s, %s, %s,
         %s, %s, %s, %s, %s,
-        %s, %s, %s, %s
+        %s, %s, %s, %s, %s
     )
     RETURNING id;
     """
@@ -96,6 +97,7 @@ def _save_casco_offer_sync(
                 json.dumps(premium_breakdown),
                 json.dumps(coverage_payload),
                 offer.raw_text,
+                offer.product_line,
             )
         )
         row = cur.fetchone()
@@ -104,7 +106,10 @@ def _save_casco_offer_sync(
 
 
 def _fetch_casco_offers_by_inquiry_sync(conn, inquiry_id: int) -> List[dict]:
-    """Fetch all CASCO offers for an inquiry."""
+    """
+    Fetch all CASCO offers for an inquiry.
+    Filters by product_line='casco' to ensure only CASCO offers are returned.
+    """
     sql = """
     SELECT 
         id,
@@ -121,9 +126,11 @@ def _fetch_casco_offers_by_inquiry_sync(conn, inquiry_id: int) -> List[dict]:
         premium_breakdown,
         coverage,
         raw_text,
+        product_line,
         created_at
     FROM public.offers_casco
     WHERE inquiry_id = %s
+      AND product_line = 'casco'
     ORDER BY created_at DESC;
     """
     
@@ -133,7 +140,10 @@ def _fetch_casco_offers_by_inquiry_sync(conn, inquiry_id: int) -> List[dict]:
 
 
 def _fetch_casco_offers_by_reg_number_sync(conn, reg_number: str) -> List[dict]:
-    """Fetch all CASCO offers for a vehicle."""
+    """
+    Fetch all CASCO offers for a vehicle.
+    Filters by product_line='casco' to ensure only CASCO offers are returned.
+    """
     sql = """
     SELECT 
         id,
@@ -150,9 +160,11 @@ def _fetch_casco_offers_by_reg_number_sync(conn, reg_number: str) -> List[dict]:
         premium_breakdown,
         coverage,
         raw_text,
+        product_line,
         created_at
     FROM public.offers_casco
     WHERE reg_number = %s
+      AND product_line = 'casco'
     ORDER BY created_at DESC;
     """
     

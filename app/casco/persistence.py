@@ -35,6 +35,7 @@ class CascoOfferRecord:
 
     coverage: CascoCoverage | Dict[str, Any] = None
     raw_text: Optional[str] = None
+    product_line: str = "casco"  # Product type identifier
 
 
 async def save_casco_offers(
@@ -61,11 +62,12 @@ async def save_casco_offers(
         premium_total,
         premium_breakdown,
         coverage,
-        raw_text
+        raw_text,
+        product_line
     ) VALUES (
         $1, $2, $3, $4,
         $5, $6, $7, $8, $9,
-        $10, $11, $12::jsonb, $13
+        $10, $11, $12::jsonb, $13, $14
     )
     RETURNING id;
     """
@@ -96,6 +98,7 @@ async def save_casco_offers(
             json.dumps(premium_breakdown),
             json.dumps(coverage_payload),
             offer.raw_text,
+            offer.product_line,
         )
         ids.append(row["id"])
 
@@ -117,6 +120,7 @@ async def fetch_casco_offers_by_inquiry(
     """
     Fetch all CASCO offers for a given inquiry_id.
     Returns list of dicts with all fields.
+    Filters by product_line='casco' to ensure only CASCO offers are returned.
     """
     sql = """
     SELECT 
@@ -134,9 +138,11 @@ async def fetch_casco_offers_by_inquiry(
         premium_breakdown,
         coverage,
         raw_text,
+        product_line,
         created_at
     FROM public.offers_casco
     WHERE inquiry_id = $1
+      AND product_line = 'casco'
     ORDER BY created_at DESC;
     """
     
@@ -150,6 +156,7 @@ async def fetch_casco_offers_by_reg_number(
 ) -> List[Dict[str, Any]]:
     """
     Fetch all CASCO offers for a given vehicle registration number.
+    Filters by product_line='casco' to ensure only CASCO offers are returned.
     """
     sql = """
     SELECT 
@@ -167,9 +174,11 @@ async def fetch_casco_offers_by_reg_number(
         premium_breakdown,
         coverage,
         raw_text,
+        product_line,
         created_at
     FROM public.offers_casco
     WHERE reg_number = $1
+      AND product_line = 'casco'
     ORDER BY created_at DESC;
     """
     
