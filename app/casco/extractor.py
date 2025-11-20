@@ -639,6 +639,9 @@ def extract_casco_offers_from_text(
             # Map JSON keys to Python-friendly names
             mapped_payload = _map_json_keys_to_python(payload)
             
+            # Override insured_amount to always be "Tirgus vērtība"
+            mapped_payload["insured_amount"] = "Tirgus vērtība"
+            
             # Add metadata
             mapped_payload["insurer_name"] = insurer_name
             if pdf_filename:
