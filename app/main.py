@@ -1230,16 +1230,38 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
     org_id, user_id = _ctx_ids(request)
     org_id, user_id = _ctx_or_defaults(org_id, user_id)
 
-    # Auto-infer file_ids from document_ids if not provided (bridges comparison table + Q&A)
     file_ids = body.file_ids or []
     if not file_ids and body.document_ids:
         file_ids = _infer_file_ids_from_document_ids(body.document_ids, org_id)
-        print(f"[share] Auto-inferred file_ids: {file_ids}")
 
     inferred_batch_token = body.batch_token
     if not inferred_batch_token and body.document_ids:
-        # org-less inference to avoid crossing into foreign batches
         inferred_batch_token = _infer_batch_token_via_doc_ids(body.document_ids)
+
+    # ------------------------------------------------------------------
+    # 🔥 CASCO SNAPSHOT LOGIC (THE FIX)
+    # ------------------------------------------------------------------
+    cached_offers = None
+    cached_comparison = None
+
+    if body.product_line == "casco" and body.casco_job_id:
+        try:
+            from app.routes.casco_routes import _fetch_casco_offers_by_job_sync
+            from app.casco.comparator import build_casco_comparison_matrix
+
+            conn = get_db_connection()
+            raw_offers = _fetch_casco_offers_by_job_sync(conn, body.casco_job_id)
+            comparison = build_casco_comparison_matrix(raw_offers)
+
+            cached_offers = raw_offers
+            cached_comparison = comparison
+        except Exception as e:
+            print("CASCO preload failed:", e)
+        finally:
+            try:
+                conn.close()
+            except:
+                pass
 
     payload = {
         "mode": mode,
@@ -1247,7 +1269,7 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
         "company_name": derived_company,
         "employees_count": derived_employees,
         "document_ids": body.document_ids or [],
-        "file_ids": file_ids,  # Now auto-populated from document_ids!
+        "file_ids": file_ids,
         "results": body.results if mode == "snapshot" else None,
         "editable": body.editable,
         "role": body.role,
@@ -1255,14 +1277,18 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
         "insurer_only": body.insurer_only,
         "batch_token": inferred_batch_token,
         "view_prefs": body.view_prefs or {},
-        "product_line": body.product_line or "health",  # Default to health for backwards compatibility
-        "casco_job_id": body.casco_job_id,  # Store CASCO job ID if provided
+        "product_line": body.product_line or "health",
+        "casco_job_id": body.casco_job_id,
 
-        # Additional CASCO-specific fields
+        # CASCO meta
         "product_type": body.product_type,
         "type": body.type,
         "reg_number": body.reg_number,
         "broker_profile": body.broker_profile,
+
+        # SNAPSHOT STORAGE FOR CASCO
+        "cached_offers": cached_offers,
+        "cached_comparison": cached_comparison,
     }
 
     expires_at = None
@@ -1276,7 +1302,7 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
         "expires_at": expires_at,
         "view_prefs": body.view_prefs or {},
         "org_id": org_id,
-        "product_line": body.product_line or "health",  # Also store at top level for filtering
+        "product_line": body.product_line or "health",
     }
 
     if _supabase:
@@ -1296,9 +1322,7 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
         except Exception:
             url = f"/shares/{token}"
 
-    # Append "_casco" suffix to URL token for CASCO shares (DB token remains unchanged)
-    product_line = body.product_line or "health"
-    if product_line == "casco":
+    if (body.product_line or "health") == "casco":
         url = url + "_casco"
 
     return {"ok": True, "token": token, "url": url, "title": body.title, "view_prefs": body.view_prefs or {}}
@@ -1322,24 +1346,21 @@ def get_share_token_only(token: str, request: Request):
     if should_count_view:
         try:
             conn = get_db_connection()
-            try:
-                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                    cur.execute(
-                        """
-                        UPDATE share_links
-                        SET views_count = COALESCE(views_count, 0) + 1,
-                            last_viewed_at = now()
-                        WHERE token = %s
-                        RETURNING views_count, edit_count, last_viewed_at, last_edited_at
-                        """,
-                        (token,),
-                    )
-                    row = cur.fetchone()
-                    if row:
-                        updated_stats = dict(row)
-                    conn.commit()
-            finally:
-                conn.close()
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    UPDATE share_links
+                    SET views_count = COALESCE(views_count, 0) + 1,
+                        last_viewed_at = now()
+                    WHERE token = %s
+                    RETURNING views_count, edit_count, last_viewed_at, last_edited_at
+                    """,
+                    (token,),
+                )
+                row = cur.fetchone()
+                if row:
+                    updated_stats = dict(row)
+                conn.commit()
         except Exception as e:
             print(f"[warn] Failed to increment views_count for token {token}: {e}")
             updated_stats = {
@@ -1348,48 +1369,37 @@ def get_share_token_only(token: str, request: Request):
                 "last_viewed_at": share.get("last_viewed_at"),
                 "last_edited_at": share.get("last_edited_at"),
             }
+        finally:
+            try:
+                conn.close()
+            except:
+                pass
 
     payload = share.get("payload") or {}
     mode = payload.get("mode") or "snapshot"
     product_line = payload.get("product_line") or share.get("product_line") or "health"
 
-    # Handle CASCO shares differently
+    # ------------------------------------------------------------------
+    # 🔥 CASCO SNAPSHOT RETURN (NO DB CALLS, NO DELAY)
+    # ------------------------------------------------------------------
     if product_line == "casco":
-        casco_job_id = payload.get("casco_job_id")
-        if casco_job_id:
-            try:
-                # Fetch CASCO offers using job ID
-                from app.routes.casco_routes import _fetch_casco_offers_by_job_sync
-                from app.casco.comparator import build_casco_comparison_matrix
+        offers = payload.get("cached_offers") or []
+        comparison = payload.get("cached_comparison") or []
 
-                conn = None
-                try:
-                    conn = get_db_connection()
-                    raw_offers = _fetch_casco_offers_by_job_sync(conn, casco_job_id)
+        return {
+            "token": token,
+            "payload": payload,
+            "offers": offers,
+            "comparison": comparison,
+            "offer_count": len(offers),
+            "product_line": "casco",
+            "stats": updated_stats,
+        }
 
-                    if raw_offers:
-                        # Build CASCO comparison matrix
-                        comparison = build_casco_comparison_matrix(raw_offers)
-
-                        return {
-                            "token": token,
-                            "payload": payload,  # FULL payload (CASCO fields preserved)
-                            "offers": raw_offers,
-                            "comparison": comparison,
-                            "offer_count": len(raw_offers),
-                            "product_line": "casco",
-                            "stats": updated_stats,
-                        }
-                finally:
-                    if conn:
-                        conn.close()
-            except Exception as e:
-                print(f"[warn] Failed to fetch CASCO offers for job {casco_job_id}: {e}")
-                offers = []
-        else:
-            offers = []
-    # Handle HEALTH shares (existing logic)
-    elif mode == "snapshot" and payload.get("results"):
+    # -------------------------------
+    # HEALTH (existing)
+    # -------------------------------
+    if mode == "snapshot" and payload.get("results"):
         offers = payload["results"]
     elif mode == "by-documents":
         doc_ids = payload.get("document_ids") or []
@@ -1411,7 +1421,6 @@ def get_share_token_only(token: str, request: Request):
                 filtered.append(ng)
         offers = filtered
 
-    # For non-CASCO responses, keep Health behavior but ALSO surface CASCO-related fields
     response_payload = {
         "company_name": payload.get("company_name"),
         "employees_count": payload.get("employees_count"),
@@ -1419,7 +1428,6 @@ def get_share_token_only(token: str, request: Request):
         "role": payload.get("role") or "broker",
         "allow_edit_fields": payload.get("allow_edit_fields") or [],
         "view_prefs": share.get("view_prefs") or payload.get("view_prefs") or {},
-        # extra fields (harmless for health, required for CASCO-awareness on FE)
         "product_line": product_line,
         "casco_job_id": payload.get("casco_job_id"),
         "product_type": payload.get("product_type"),
@@ -1449,25 +1457,6 @@ def get_share_token_only(token: str, request: Request):
         "last_viewed_at": last_viewed_at,
         "last_edited_at": last_edited_at,
     }
-
-# -------------------------------
-# Update share header/meta
-# -------------------------------
-class ShareUpdateBody(BaseModel):
-    company_name: Optional[str] = None
-    employees_count: Optional[int] = Field(None, ge=0)
-    view_prefs: Optional[Dict[str, Any]] = None
-    title: Optional[str] = None
-    broker_profile: Optional[Dict[str, Any]] = None
-
-
-def _share_is_editable(rec: Dict[str, Any], *, field: Optional[str] = None) -> None:
-    payload = (rec or {}).get("payload") or {}
-    if not bool(payload.get("editable")):
-        raise HTTPException(status_code=403, detail="Share is read-only")
-    allowed = set(payload.get("allow_edit_fields") or [])
-    if field and allowed and field not in allowed:
-        raise HTTPException(status_code=403, detail=f"Field '{field}' is not allowed to edit")
 
 
 @app.patch("/shares/{token}")
