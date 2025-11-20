@@ -1247,6 +1247,11 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
             url = str(request.url_for("get_share_token_only", token=token))
         except Exception:
             url = f"/shares/{token}"
+    
+    # Append "_casco" suffix to URL token for CASCO shares (DB token remains unchanged)
+    product_line = body.product_line or "health"
+    if product_line == "casco":
+        url = url + "_casco"
 
     return {"ok": True, "token": token, "url": url, "title": body.title, "view_prefs": body.view_prefs or {}}
 
