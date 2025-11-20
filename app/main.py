@@ -60,6 +60,7 @@ def _coalesce_int(*vals) -> Optional[int]:
             pass
     return None
 
+
 def _ctx_or_defaults(org_id: Optional[int], user_id: Optional[int]) -> tuple[Optional[int], Optional[int]]:
     try_env_org = int(os.getenv("DEFAULT_ORG_ID", "0") or 0)
     try_env_user = int(os.getenv("DEFAULT_USER_ID", "0") or 0)
@@ -68,6 +69,7 @@ def _ctx_or_defaults(org_id: Optional[int], user_id: Optional[int]) -> tuple[Opt
     if user_id is None and try_env_user > 0:
         user_id = try_env_user
     return org_id, user_id
+
 
 async def resolve_request_context(
     request: Request,
@@ -89,12 +91,14 @@ async def resolve_request_context(
         raise HTTPException(status_code=400, detail="Missing org_id or user_id (X-Org-Id/X-User-Id headers or form fields).")
     return org_id, user_id
 
+
 def get_db_connection():
     import psycopg2
     db_url = os.getenv("DATABASE_URL")
     if not db_url:
         raise RuntimeError("DATABASE_URL not set")
     return psycopg2.connect(db_url)
+
 
 def create_offer_batch(org_id: int, user_id: int, title: str = None) -> tuple[str, int]:
     token = f"bt_{uuid.uuid4().hex[:24]}"
@@ -204,6 +208,7 @@ def healthz():
         "workers": EXTRACT_WORKERS,
     }
 
+
 @app.get("/")
 def root():
     return {"ok": True}
@@ -214,6 +219,7 @@ def root():
 # Note: _safe_filename is now imported from backend.api.routes.util to ensure
 # consistent filename normalization across upload and share inference paths.
 # This prevents batch_token inference failures due to filename mismatches.
+
 
 def _make_doc_id(prefix: str, idx: int, filename: str) -> str:
     return f"{prefix}::{idx}::{_safe_filename(filename)}"
@@ -241,16 +247,19 @@ def _num(v: Any) -> Optional[float]:
             return None
     return None
 
+
 def _inject_meta(payload: Dict[str, Any], *, insurer: str, company: str, insured_count: int, inquiry_id: str) -> None:
     payload["insurer_hint"] = insurer or payload.get("insurer_hint") or "-"
     payload["company_name"] = company or payload.get("company_name") or "-"
     payload["employee_count"] = insured_count if isinstance(insured_count, int) else payload.get("employee_count")
     payload["inquiry_id"] = int(inquiry_id) if str(inquiry_id).isdigit() else None
 
+
 def _feature_value(x: Any) -> Any:
     if isinstance(x, dict):
         return x.get("value")
     return x
+
 
 def _disambiguate_duplicate_program_codes(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     groups: Dict[Tuple[str, str, str], List[int]] = {}
@@ -302,6 +311,7 @@ def _disambiguate_duplicate_program_codes(rows: List[Dict[str, Any]]) -> List[Di
             rows[idx]["program_code"] = uniq
 
     return rows
+
 
 def _rows_for_offers_table(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     doc_id = payload.get("document_id") or payload.get("source_file") or "uploaded.pdf"
@@ -363,6 +373,7 @@ def _rows_for_offers_table(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         )
     return rows
 
+
 def _aggregate_offers_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     grouped: Dict[str, Dict[str, Any]] = {}
     for r in rows:
@@ -401,6 +412,7 @@ def _aggregate_offers_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             g["error"] = "no programs"
     return list(grouped.values())
 
+
 def save_to_supabase(payload: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     doc_id = payload.get("document_id") or payload.get("source_file") or "uploaded.pdf"
     _LAST_RESULTS[doc_id] = payload
@@ -427,6 +439,7 @@ def save_to_supabase(payload: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
         print(f"[warn] Supabase insert failed for {doc_id}: {e}")
         return False, str(e)
 
+
 def _rows_from_fallback(doc_ids: List[str]) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for doc_id in doc_ids:
@@ -443,6 +456,7 @@ def _rows_from_fallback(doc_ids: List[str]) -> List[Dict[str, Any]]:
                     k += 1
         rows.extend(rs)
     return rows
+
 
 def _offers_by_document_ids(doc_ids: List[str]) -> List[Dict[str, Any]]:
     if not doc_ids:
@@ -465,6 +479,7 @@ def _offers_by_document_ids(doc_ids: List[str]) -> List[Dict[str, Any]]:
     for obj in agg:
         obj["_source"] = "fallback" if used_fallback else "supabase"
     return agg
+
 
 def _derive_meta_from_offers(offers: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[int]]:
     company: Optional[str] = None
@@ -530,6 +545,7 @@ async def extract_pdf(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
 
+
 async def _parse_upload_form(request: Request) -> Dict[str, Any]:
     form = await request.form()
 
@@ -571,6 +587,7 @@ async def _parse_upload_form(request: Request) -> Dict[str, Any]:
         "insured_count": insured_cnt,
         "inquiry_id": inquiry_id,
     }
+
 
 @app.post("/extract/multiple")
 async def extract_multiple(request: Request):
@@ -624,6 +641,7 @@ async def extract_multiple(request: Request):
             results.append({"document_id": filename, "error": f"Unexpected error: {e}"})
 
     return JSONResponse({"documents": doc_ids, "results": results})
+
 
 @app.post("/extract/multiple-async", status_code=202)
 async def extract_multiple_async(request: Request, background_tasks: BackgroundTasks):
@@ -715,6 +733,7 @@ async def extract_multiple_async(request: Request, background_tasks: BackgroundT
 
     return {"job_id": job_id, "accepted": len(files), "documents": doc_ids}
 
+
 def _process_pdf_bytes(
     data: bytes,
     doc_id: str,
@@ -784,6 +803,7 @@ def _process_pdf_bytes(
             if rec is not None:
                 rec["done"] += 1
 
+
 @app.get("/jobs/{job_id}")
 def job_status(job_id: str):
     with _JOBS_LOCK:
@@ -820,6 +840,7 @@ def create_template(
     res = _supabase.table("offer_templates").insert(row).execute()
     return {"ok": True, "template": (res.data or [row])[0]}
 
+
 @app.get("/templates")
 def list_templates(request: Request, insurer: str = "", employees_bucket: int = 0, limit: int = 20):
     org_id, _ = _ctx_ids(request)
@@ -833,6 +854,7 @@ def list_templates(request: Request, insurer: str = "", employees_bucket: int = 
     q = q.order("usage_count", desc=True).limit(limit)
     res = q.execute()
     return res.data or []
+
 
 @app.post("/templates/{template_id}/instantiate")
 def instantiate_template(template_id: int, request: Request, company: str = Form(""), insured_count: int = Form(0)):
@@ -889,6 +911,7 @@ def offers_by_job(job_id: str):
     doc_ids = job.get("docs") or []
     return _offers_by_document_ids(doc_ids)
 
+
 class OfferUpdateBody(BaseModel):
     premium_eur: Optional[Any] = None
     base_sum_eur: Optional[Any] = None
@@ -917,6 +940,7 @@ def _load_share_record(token: str, attempts: int = 25, delay_s: float = 0.2) -> 
                 time.sleep(delay_s)
     return _SHARES_FALLBACK.get(token)
 
+
 def _parse_to_utc_naive(s: Optional[str]) -> Optional[datetime]:
     if not s:
         return None
@@ -928,6 +952,7 @@ def _parse_to_utc_naive(s: Optional[str]) -> Optional[datetime]:
         return dt
     except Exception:
         return None
+
 
 def _ensure_share_editable(share_token: Optional[str]) -> None:
     if not share_token:
@@ -941,6 +966,7 @@ def _ensure_share_editable(share_token: Optional[str]) -> None:
     payload = rec.get("payload") or {}
     if not bool(payload.get("editable")):
         raise HTTPException(status_code=403, detail="Share is read-only")
+
 
 def _bump_share_edit(token: Optional[str]) -> None:
     if not token:
@@ -969,6 +995,7 @@ def _bump_share_edit(token: Optional[str]) -> None:
     except Exception as e:
         print(f"[warn] Supabase bump share edit failed for token {token}: {e}")
 
+
 @app.delete("/offers/{offer_id}")
 def delete_offer(offer_id: int, x_share_token: Optional[str] = Header(default=None, alias="X-Share-Token")):
     _ensure_share_editable(x_share_token)
@@ -984,6 +1011,7 @@ def delete_offer(offer_id: int, x_share_token: Optional[str] = Header(default=No
         return {"ok": True, "deleted": offer_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"delete failed: {e}")
+
 
 @app.patch("/offers/{offer_id}")
 def update_offer(
@@ -1035,6 +1063,7 @@ def update_offer(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"update failed: {e}")
 
+
 @app.get("/offers/by-inquiry/{inquiry_id}")
 def offers_by_inquiry(inquiry_id: int):
     if _supabase:
@@ -1071,15 +1100,17 @@ class ShareCreateBody(BaseModel):
     view_prefs: Optional[Dict[str, Any]] = None
     product_line: Optional[str] = Field(None, description="Product line: 'casco' or 'health' (default)")
     casco_job_id: Optional[str] = Field(None, description="CASCO job ID (UUID string) for CASCO shares")
-    
+
     # Additional CASCO-specific fields
     product_type: Optional[str] = Field(None, description="Product type (e.g., 'CASCO')")
     type: Optional[str] = Field(None, description="Share type (e.g., 'casco')")
     reg_number: Optional[str] = Field(None, description="Vehicle registration number for CASCO")
     broker_profile: Optional[Dict[str, Any]] = Field(None, description="Broker profile data for CASCO")
 
+
 def _gen_token() -> str:
     return secrets.token_urlsafe(16)
+
 
 def _infer_file_ids_from_document_ids(doc_ids: List[str], org_id: Optional[int] = None) -> List[int]:
     """
@@ -1088,7 +1119,7 @@ def _infer_file_ids_from_document_ids(doc_ids: List[str], org_id: Optional[int] 
     """
     if not doc_ids:
         return []
-    
+
     # Extract sanitized filenames from document_ids (format: "uuid::1::filename.pdf")
     filenames: List[str] = []
     for d in doc_ids:
@@ -1098,23 +1129,26 @@ def _infer_file_ids_from_document_ids(doc_ids: List[str], org_id: Optional[int] 
                 filenames.append(_safe_filename(fn))
         except Exception:
             continue
-    
+
     if not filenames:
         return []
-    
+
     try:
         conn = get_db_connection()
         try:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 # Find file_ids for matching filenames
-                cur.execute("""
+                cur.execute(
+                    """
                     SELECT id 
                     FROM public.offer_files
                     WHERE filename = ANY(%s)
                       AND (%s IS NULL OR org_id = %s)
                     ORDER BY created_at DESC
-                """, (filenames, org_id, org_id))
-                
+                    """,
+                    (filenames, org_id, org_id),
+                )
+
                 file_ids = [row['id'] for row in cur.fetchall()]
                 if file_ids:
                     print(f"[share] Inferred file_ids from document_ids: {file_ids}")
@@ -1124,6 +1158,7 @@ def _infer_file_ids_from_document_ids(doc_ids: List[str], org_id: Optional[int] 
     except Exception as e:
         print(f"[share] Failed to infer file_ids from document_ids: {e}")
         return []
+
 
 def _infer_batch_token_via_doc_ids(doc_ids: list[str]) -> Optional[str]:
     """
@@ -1168,6 +1203,7 @@ def _infer_batch_token_via_doc_ids(doc_ids: list[str]) -> Optional[str]:
             conn.close()
     except Exception:
         return None
+
 
 @app.post("/shares")
 def create_share_token_only(body: ShareCreateBody, request: Request):
@@ -1221,7 +1257,7 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
         "view_prefs": body.view_prefs or {},
         "product_line": body.product_line or "health",  # Default to health for backwards compatibility
         "casco_job_id": body.casco_job_id,  # Store CASCO job ID if provided
-        
+
         # Additional CASCO-specific fields
         "product_type": body.product_type,
         "type": body.type,
@@ -1259,13 +1295,14 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
             url = str(request.url_for("get_share_token_only", token=token))
         except Exception:
             url = f"/shares/{token}"
-    
+
     # Append "_casco" suffix to URL token for CASCO shares (DB token remains unchanged)
     product_line = body.product_line or "health"
     if product_line == "casco":
         url = url + "_casco"
 
     return {"ok": True, "token": token, "url": url, "title": body.title, "view_prefs": body.view_prefs or {}}
+
 
 @app.get("/shares/{token}", name="get_share_token_only")
 def get_share_token_only(token: str, request: Request):
@@ -1322,20 +1359,21 @@ def get_share_token_only(token: str, request: Request):
         if casco_job_id:
             try:
                 # Fetch CASCO offers using job ID
-                from app.routes.casco_routes import _fetch_casco_offers_by_job_sync, build_casco_comparison_matrix, get_db
+                from app.routes.casco_routes import _fetch_casco_offers_by_job_sync
+                from app.casco.comparator import build_casco_comparison_matrix
+
                 conn = None
                 try:
                     conn = get_db_connection()
                     raw_offers = _fetch_casco_offers_by_job_sync(conn, casco_job_id)
-                    
+
                     if raw_offers:
                         # Build CASCO comparison matrix
-                        from app.casco.comparator import build_casco_comparison_matrix
                         comparison = build_casco_comparison_matrix(raw_offers)
-                        
+
                         return {
                             "token": token,
-                            "payload": payload,
+                            "payload": payload,  # FULL payload (CASCO fields preserved)
                             "offers": raw_offers,
                             "comparison": comparison,
                             "offer_count": len(raw_offers),
@@ -1373,6 +1411,7 @@ def get_share_token_only(token: str, request: Request):
                 filtered.append(ng)
         offers = filtered
 
+    # For non-CASCO responses, keep Health behavior but ALSO surface CASCO-related fields
     response_payload = {
         "company_name": payload.get("company_name"),
         "employees_count": payload.get("employees_count"),
@@ -1380,6 +1419,13 @@ def get_share_token_only(token: str, request: Request):
         "role": payload.get("role") or "broker",
         "allow_edit_fields": payload.get("allow_edit_fields") or [],
         "view_prefs": share.get("view_prefs") or payload.get("view_prefs") or {},
+        # extra fields (harmless for health, required for CASCO-awareness on FE)
+        "product_line": product_line,
+        "casco_job_id": payload.get("casco_job_id"),
+        "product_type": payload.get("product_type"),
+        "type": payload.get("type"),
+        "reg_number": payload.get("reg_number"),
+        "broker_profile": payload.get("broker_profile"),
     }
 
     views_count = (updated_stats or share).get("views_count", 0)
@@ -1414,6 +1460,7 @@ class ShareUpdateBody(BaseModel):
     title: Optional[str] = None
     broker_profile: Optional[Dict[str, Any]] = None
 
+
 def _share_is_editable(rec: Dict[str, Any], *, field: Optional[str] = None) -> None:
     payload = (rec or {}).get("payload") or {}
     if not bool(payload.get("editable")):
@@ -1421,6 +1468,7 @@ def _share_is_editable(rec: Dict[str, Any], *, field: Optional[str] = None) -> N
     allowed = set(payload.get("allow_edit_fields") or [])
     if field and allowed and field not in allowed:
         raise HTTPException(status_code=403, detail=f"Field '{field}' is not allowed to edit")
+
 
 @app.patch("/shares/{token}")
 def update_share_token_only(token: str, body: ShareUpdateBody, request: Request):
@@ -1534,6 +1582,13 @@ def update_share_token_only(token: str, body: ShareUpdateBody, request: Request)
         "role": payload.get("role") or "broker",
         "allow_edit_fields": payload.get("allow_edit_fields") or [],
         "view_prefs": rec.get("view_prefs") or payload.get("view_prefs") or {},
+        # keep product_line and CASCO fields in updates too (no harm for health)
+        "product_line": payload.get("product_line") or rec.get("product_line") or "health",
+        "casco_job_id": payload.get("casco_job_id"),
+        "product_type": payload.get("product_type"),
+        "type": payload.get("type"),
+        "reg_number": payload.get("reg_number"),
+        "broker_profile": payload.get("broker_profile"),
     }
 
     views_count = (updated_stats or rec).get("views_count", 0) or 0
@@ -1553,9 +1608,11 @@ def update_share_token_only(token: str, body: ShareUpdateBody, request: Request)
         },
     }
 
+
 @app.post("/shares/{token}")
 def post_update_share_token_only(token: str, body: ShareUpdateBody, request: Request):
     return update_share_token_only(token, body, request)
+
 
 @app.get("/shares/{token}/qa")
 async def list_share_qa_public(token: str, limit: int = 200, offset: int = 0):
@@ -1609,6 +1666,7 @@ def debug_last_results():
         )
     return out
 
+
 @app.get("/debug/doc/{doc_id}")
 def debug_doc(doc_id: str):
     p = _LAST_RESULTS.get(doc_id)
@@ -1628,6 +1686,7 @@ async def print_routes():
             methods = ",".join(route.methods)
             print(f"[route] {route.path:50s} {methods}")
     print("=================================\n")
+
 
 # Request logging middleware
 @app.middleware("http")
