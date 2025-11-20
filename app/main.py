@@ -1108,6 +1108,26 @@ class ShareCreateBody(BaseModel):
     broker_profile: Optional[Dict[str, Any]] = Field(None, description="Broker profile data for CASCO")
 
 
+class ShareUpdateBody(BaseModel):
+    """Request body for updating share metadata."""
+    company_name: Optional[str] = None
+    employees_count: Optional[int] = Field(None, ge=0)
+    view_prefs: Optional[Dict[str, Any]] = None
+    title: Optional[str] = None
+    broker_profile: Optional[Dict[str, Any]] = None
+    reg_number: Optional[str] = None  # CASCO registration number
+
+
+def _share_is_editable(rec: Dict[str, Any], *, field: Optional[str] = None) -> None:
+    """Check if share is editable and field is allowed."""
+    payload = (rec or {}).get("payload") or {}
+    if not bool(payload.get("editable")):
+        raise HTTPException(status_code=403, detail="Share is read-only")
+    allowed = set(payload.get("allow_edit_fields") or [])
+    if field and allowed and field not in allowed:
+        raise HTTPException(status_code=403, detail=f"Field '{field}' is not allowed to edit")
+
+
 def _gen_token() -> str:
     return secrets.token_urlsafe(16)
 
@@ -1490,6 +1510,10 @@ def update_share_token_only(token: str, body: ShareUpdateBody, request: Request)
 
     if body.broker_profile is not None:
         payload["broker_profile"] = body.broker_profile
+
+    if body.reg_number is not None:
+        _share_is_editable(rec, field="reg_number")
+        payload["reg_number"] = body.reg_number
 
     updated_stats = None
     try:
