@@ -126,7 +126,7 @@ def build_casco_comparison_matrix(
             code="insured_amount",
             label="Apdrošinājuma summa",
             group="financial",
-            type="number"
+            type="text"  # Always "Tirgus vērtība"
         ),
         CascoComparisonRow(
             code="period",

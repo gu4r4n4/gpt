@@ -67,7 +67,7 @@ async def process_and_persist_casco_pdf(
     reg_number: str,
     inquiry_id: Optional[int] = None,
     pdf_filename: Optional[str] = None,
-    insured_amount: Optional[Decimal] = None,
+    insured_amount: Optional[str] = None,  # Always "Tirgus vērtība" for CASCO
     period_from: Optional[str] = None,
     period_to: Optional[str] = None,
     premium_total: Optional[Decimal] = None,
@@ -97,11 +97,11 @@ async def process_and_persist_casco_pdf(
     for result in extraction_results:
         coverage = result.coverage
         
-        # Extract territory from new 19-field model (Teritorija field)
+        # Extract territory from new 21-field model (Teritorija field)
         territory_val = coverage.Teritorija if coverage.Teritorija and coverage.Teritorija != "-" else None
         
-        # In new model, there's no insured_value_eur - use provided value or None
-        insured_amt = insured_amount or None
+        # insured_amount is always "Tirgus vērtība" (from extractor)
+        insured_amt = coverage.insured_amount if hasattr(coverage, 'insured_amount') else "Tirgus vērtība"
         
         # Parse dates if provided as strings
         period_from_date = None

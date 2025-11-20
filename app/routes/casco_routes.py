@@ -250,7 +250,7 @@ async def upload_casco_offer(
             
             # Extract financial fields from GPT result
             premium_total_str = coverage.premium_total if hasattr(coverage, 'premium_total') else None
-            insured_amount_str = coverage.insured_amount if hasattr(coverage, 'insured_amount') else None
+            insured_amount_str = coverage.insured_amount if hasattr(coverage, 'insured_amount') else "Tirgus vērtība"
             period_str = coverage.period if hasattr(coverage, 'period') else "12 mēneši"
             
             # Convert to Decimal (handle "-" and non-numeric values)
@@ -265,7 +265,7 @@ async def upload_casco_offer(
                     return None
             
             premium_total_decimal = to_decimal(premium_total_str)
-            insured_amount_decimal = to_decimal(insured_amount_str)
+            # insured_amount is always "Tirgus vērtība" (text, not converted to Decimal)
             
             # Build record with casco_job_id (UUID string)
             offer_record = CascoOfferRecord(
@@ -273,7 +273,7 @@ async def upload_casco_offer(
                 reg_number=reg_number,
                 casco_job_id=casco_job_id,  # UUID string
                 insured_entity=None,
-                insured_amount=insured_amount_decimal,
+                insured_amount=insured_amount_str,  # Always "Tirgus vērtība"
                 currency="EUR",
                 territory=coverage.Teritorija if coverage.Teritorija and coverage.Teritorija != "-" else None,
                 period=period_str,  # "12 mēneši"
@@ -380,7 +380,7 @@ async def upload_casco_offers_batch(
                 
                 # Extract financial fields from GPT result
                 premium_total_str = coverage.premium_total if hasattr(coverage, 'premium_total') else None
-                insured_amount_str = coverage.insured_amount if hasattr(coverage, 'insured_amount') else None
+                insured_amount_str = coverage.insured_amount if hasattr(coverage, 'insured_amount') else "Tirgus vērtība"
                 period_str = coverage.period if hasattr(coverage, 'period') else "12 mēneši"
                 
                 # Convert to Decimal (handle "-" and non-numeric values)
@@ -395,14 +395,14 @@ async def upload_casco_offers_batch(
                         return None
                 
                 premium_total_decimal = to_decimal(premium_total_str)
-                insured_amount_decimal = to_decimal(insured_amount_str)
+                # insured_amount is always "Tirgus vērtība" (text, not converted to Decimal)
                 
                 offer_record = CascoOfferRecord(
                     insurer_name=insurer,
                     reg_number=reg_number,
                     casco_job_id=casco_job_id,  # All offers in batch share same UUID job
                     insured_entity=None,
-                    insured_amount=insured_amount_decimal,
+                    insured_amount=insured_amount_str,  # Always "Tirgus vērtība"
                     currency="EUR",
                     territory=coverage.Teritorija if coverage.Teritorija and coverage.Teritorija != "-" else None,
                     period=period_str,  # "12 mēneši"

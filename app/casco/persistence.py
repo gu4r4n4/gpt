@@ -28,7 +28,7 @@ class CascoOfferRecord:
     casco_job_id: str  # Required - UUID string linking to casco_jobs.casco_job_id
     insured_entity: Optional[str] = None
 
-    insured_amount: Optional[Decimal] = None
+    insured_amount: Optional[str] = None  # Always "Tirgus vērtība" for CASCO
     currency: str = "EUR"
     territory: Optional[str] = None
     period: Optional[str] = None  # Insurance period (e.g., "12 mēneši")
