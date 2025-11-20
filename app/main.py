@@ -1071,6 +1071,12 @@ class ShareCreateBody(BaseModel):
     view_prefs: Optional[Dict[str, Any]] = None
     product_line: Optional[str] = Field(None, description="Product line: 'casco' or 'health' (default)")
     casco_job_id: Optional[str] = Field(None, description="CASCO job ID (UUID string) for CASCO shares")
+    
+    # Additional CASCO-specific fields
+    product_type: Optional[str] = Field(None, description="Product type (e.g., 'CASCO')")
+    type: Optional[str] = Field(None, description="Share type (e.g., 'casco')")
+    reg_number: Optional[str] = Field(None, description="Vehicle registration number for CASCO")
+    broker_profile: Optional[Dict[str, Any]] = Field(None, description="Broker profile data for CASCO")
 
 def _gen_token() -> str:
     return secrets.token_urlsafe(16)
@@ -1215,6 +1221,12 @@ def create_share_token_only(body: ShareCreateBody, request: Request):
         "view_prefs": body.view_prefs or {},
         "product_line": body.product_line or "health",  # Default to health for backwards compatibility
         "casco_job_id": body.casco_job_id,  # Store CASCO job ID if provided
+        
+        # Additional CASCO-specific fields
+        "product_type": body.product_type,
+        "type": body.type,
+        "reg_number": body.reg_number,
+        "broker_profile": body.broker_profile,
     }
 
     expires_at = None
