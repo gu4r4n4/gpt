@@ -1,5 +1,5 @@
 """
-CASCO Schema - Simplified 19-Field Model
+CASCO Schema - Simplified 21-Field Model
 
 This schema defines the CASCO coverage structure using Latvian field names
 and a simple string-based value system:
@@ -14,19 +14,19 @@ from typing import Optional, List, Literal
 
 
 # ---------------------------------------
-# CASCO Coverage Data Model (22 Fields)
+# CASCO Coverage Data Model (24 Fields)
 # ---------------------------------------
 
 class CascoCoverage(BaseModel):
     """
-    Simplified CASCO coverage model with 22 fields (19 coverage + 3 financial).
+    Simplified CASCO coverage model with 24 fields (21 coverage + 3 financial).
     All coverage fields are strings: "v" (covered), "-" (not covered), or descriptive value.
     """
     # Metadata (preserved for compatibility)
     insurer_name: str
     pdf_filename: Optional[str] = None
 
-    # 19 Coverage Fields (Latvian names, all strings)
+    # 21 Coverage Fields (Latvian names, all strings)
     Bojājumi: Optional[str] = None                              # 1. Damage coverage
     Bojāeja: Optional[str] = None                               # 2. Total loss
     Zādzība: Optional[str] = None                               # 3. Theft
@@ -46,11 +46,13 @@ class CascoCoverage(BaseModel):
     Sadursme_ar_dzīvnieku: Optional[str] = None                 # 17. Animal collision
     Uguns_dabas_stihijas: Optional[str] = None                  # 18. Fire / natural perils
     Vandālisms: Optional[str] = None                            # 19. Vandalism
+    Remonts_klienta_servisā: Optional[str] = None               # 20. Repair at customer's chosen service
+    Remonts_pie_dīlera: Optional[str] = None                    # 21. Repair at dealer service
     
     # 3 Financial Fields (extracted by GPT)
-    premium_total: Optional[str] = None                         # 20. Total premium
-    insured_amount: Optional[str] = None                        # 21. Insured sum
-    period: Optional[str] = None                                # 22. Period (always "12 mēneši")
+    premium_total: Optional[str] = None                         # 22. Total premium
+    insured_amount: Optional[str] = None                        # 23. Insured sum
+    period: Optional[str] = None                                # 24. Period (always "12 mēneši")
 
 
 # ---------------------------------------
@@ -94,6 +96,10 @@ CASCO_COMPARISON_ROWS: List[CascoComparisonRow] = [
     CascoComparisonRow(code="Degvielas_sajaukšana_tīrīšana", label="Degvielas sajaukšana/tīrīšana", group="special", type="text"),
     CascoComparisonRow(code="Riepas_diski", label="Riepas / diski", group="special", type="text"),
     CascoComparisonRow(code="Numurzīmes", label="Numurzīmes", group="special", type="text"),
+    
+    # Repair Services
+    CascoComparisonRow(code="Remonts_klienta_servisā", label="Remonts klienta servisā", group="services", type="text"),
+    CascoComparisonRow(code="Remonts_pie_dīlera", label="Remonts pie dīlera", group="services", type="text"),
     
     # Personal Accident
     CascoComparisonRow(code="Nelaimes_gad_vadīt_pasažieriem", label="Nelaimes gad. vadīt./pasažieriem", group="pa", type="text"),

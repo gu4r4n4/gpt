@@ -140,16 +140,16 @@ def _safe_parse_casco_json(raw: str) -> dict:
 
 def _build_system_prompt() -> str:
     """
-    SIMPLIFIED 19-FIELD SYSTEM PROMPT for CASCO extraction.
+    SIMPLIFIED 21-FIELD SYSTEM PROMPT for CASCO extraction.
     
     Returns the exact prompt provided by the user, implementing:
-    - 19 Latvian-named fields
+    - 21 Latvian-named fields
     - "v" (covered), "-" (not covered), or descriptive values
     - Special rules for Vandālisms, Stiklojums, etc.
     """
     return """You are a strict CASCO insurance PDF parser.
 
-You receive the FULL TEXT of one CASCO insurance offer (for one insurer). Your task is to read the whole document and return a SINGLE JSON object with exactly 19 fields describing coverage.
+You receive the FULL TEXT of one CASCO insurance offer (for one insurer). Your task is to read the whole document and return a SINGLE JSON object with exactly 21 fields describing coverage.
 
 IMPORTANT GENERAL RULES
 - Work ONLY from the provided document text.
@@ -162,7 +162,7 @@ IMPORTANT GENERAL RULES
 - If coverage is not present at all, or only in exclusions, return "-".
 - Output MUST be pure JSON, no comments, no explanations, no extra keys.
 
-RETURN EXACTLY THIS JSON SHAPE (22 KEYS)
+RETURN EXACTLY THIS JSON SHAPE (24 KEYS)
 
 Return a single JSON object:
 
@@ -186,6 +186,8 @@ Return a single JSON object:
   "Sadursme ar dzīvnieku": "...",
   "Uguns / dabas stihijas": "...",
   "Vandālisms": "...",
+  "Remonts klienta servisā": "...",
+  "Remonts pie dīlera": "...",
   "premium_total": "...",
   "insured_amount": "...",
   "period": "..."
@@ -494,16 +496,42 @@ ALWAYS return: "12 mēneši"
 
 (This is the standard period for CASCO insurance in Latvia.)
 
+23. "Remonts klienta servisā"
+Goal: repair at customer's chosen service center.
+
+Search for:
+- "Remonts klienta izvēlētā servisā"
+- "Remonts brīvas izvēles servisā"
+- "Klienta serviss"
+- "Brīvas izvēles serviss"
+
+If this coverage option is included → return "v".
+If not mentioned → return "-".
+
+24. "Remonts pie dīlera"
+Goal: repair at authorized dealer service center.
+
+Search for:
+- "Remonts dīlera servisā"
+- "autorizēta dīlera serviss"
+- "Remonts pie dīlera"
+- "Remonts dīlerservisā"
+- "Remonts dīlerī ar jaunām, oriģinālām rezerves daļām"
+- "Remonts pie dīlera pēc garantijas laika beigām"
+
+If this coverage option is included → return "v".
+If not mentioned → return "-".
+
 OUTPUT FORMAT
 - Output MUST be a single valid JSON object.
-- Use EXACTLY the 22 keys specified (19 coverage fields + premium_total + insured_amount + period).
+- Use EXACTLY the 24 keys specified (21 coverage fields + premium_total + insured_amount + period).
 - Values must be strings.
 - Do NOT include any extra keys, comments, explanations, or trailing commas."""
 
 
 def _build_user_prompt(pdf_text: str, insurer_name: str, pdf_filename: Optional[str]) -> str:
     """
-    User message with PDF text for 22-field extraction (19 coverage + 3 financial).
+    User message with PDF text for 24-field extraction (21 coverage + 3 financial).
     Simple and direct - just provides document text.
     """
     filename_part = f" (file: {pdf_filename})" if pdf_filename else ""
@@ -513,7 +541,7 @@ DOCUMENT TEXT START:
 {pdf_text}
 DOCUMENT TEXT END.
 
-Return the JSON object with exactly 22 fields (19 coverage + premium_total + insured_amount + period) as specified in the system prompt."""
+Return the JSON object with exactly 24 fields (21 coverage + premium_total + insured_amount + period) as specified in the system prompt."""
 
 
 def _map_json_keys_to_python(raw_json: dict) -> dict:
@@ -532,6 +560,8 @@ def _map_json_keys_to_python(raw_json: dict) -> dict:
     - "Nelaimes gad. vadīt./pasažieriem" → "Nelaimes_gad_vadīt_pasažieriem"
     - "Sadursme ar dzīvnieku" → "Sadursme_ar_dzīvnieku"
     - "Uguns / dabas stihijas" → "Uguns_dabas_stihijas"
+    - "Remonts klienta servisā" → "Remonts_klienta_servisā"
+    - "Remonts pie dīlera" → "Remonts_pie_dīlera"
     """
     key_mapping = {
         "Pašrisks – bojājumi": "Pašrisks_bojājumi",
@@ -545,6 +575,8 @@ def _map_json_keys_to_python(raw_json: dict) -> dict:
         "Nelaimes gad. vadīt./pasažieriem": "Nelaimes_gad_vadīt_pasažieriem",
         "Sadursme ar dzīvnieku": "Sadursme_ar_dzīvnieku",
         "Uguns / dabas stihijas": "Uguns_dabas_stihijas",
+        "Remonts klienta servisā": "Remonts_klienta_servisā",
+        "Remonts pie dīlera": "Remonts_pie_dīlera",
     }
     
     mapped = {}
