@@ -507,6 +507,15 @@ async def casco_compare_by_job(
         # Build comparison matrix (22 rows: 3 financial + 19 coverage fields)
         comparison = build_casco_comparison_matrix(raw_offers)
         
+        # Inject row_id for each insurer into comparison.values
+        # This enables the frontend to know which DB row to PATCH when editing
+        if comparison and "values" in comparison:
+            for offer in raw_offers:
+                insurer_name = offer.get("insurer_name")
+                row_id = offer.get("id")
+                if insurer_name and row_id is not None:
+                    comparison["values"][f"row_id::{insurer_name}"] = row_id
+        
         return {
             "offers": raw_offers,
             "comparison": comparison,
@@ -547,6 +556,15 @@ async def casco_compare_by_vehicle(
         
         # Build comparison matrix
         comparison = build_casco_comparison_matrix(raw_offers)
+        
+        # Inject row_id for each insurer into comparison.values
+        # This enables the frontend to know which DB row to PATCH when editing
+        if comparison and "values" in comparison:
+            for offer in raw_offers:
+                insurer_name = offer.get("insurer_name")
+                row_id = offer.get("id")
+                if insurer_name and row_id is not None:
+                    comparison["values"][f"row_id::{insurer_name}"] = row_id
         
         return {
             "offers": raw_offers,
