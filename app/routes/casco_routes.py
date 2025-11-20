@@ -673,8 +673,14 @@ async def update_casco_offer(
     if body.premium_breakdown is not None:
         updates["premium_breakdown"] = json.dumps(body.premium_breakdown)
 
+    # Coverage - merge with existing instead of replacing
     if body.coverage is not None:
-        updates["coverage"] = json.dumps(body.coverage)
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT coverage FROM public.offers_casco WHERE id = %s", (offer_id,))
+            current = cur.fetchone()
+            original = current["coverage"] if current and current["coverage"] else {}
+            merged = {**original, **body.coverage}
+            updates["coverage"] = json.dumps(merged)
 
     if body.raw_text is not None:
         updates["raw_text"] = body.raw_text
