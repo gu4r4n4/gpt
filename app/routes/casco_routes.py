@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import os
 import uuid
+import json
 from decimal import Decimal
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from fastapi import APIRouter, UploadFile, Form, HTTPException, Depends, Request
+from fastapi import APIRouter, UploadFile, Form, HTTPException, Depends, Request, Body
+from pydantic import BaseModel
 
 from app.casco.service import process_casco_pdf
 from app.casco.comparator import build_casco_comparison_matrix
@@ -34,6 +36,22 @@ def get_db():
         yield conn
     finally:
         conn.close()
+
+
+# ---------------------------
+# Update Model
+# ---------------------------
+class CascoOfferUpdateBody(BaseModel):
+    """Request body for updating CASCO offer fields."""
+    reg_number: Optional[str] = None
+    insured_entity: Optional[str] = None
+    insured_amount: Optional[str] = None
+    currency: Optional[str] = None
+    territory: Optional[str] = None
+    period: Optional[str] = None
+    premium_total: Optional[Decimal] = None
+    premium_breakdown: Optional[Dict[str, Any]] = None
+    coverage: Optional[Dict[str, Any]] = None
 
 
 # ---------------------------
@@ -568,3 +586,77 @@ async def casco_offers_by_vehicle(
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch offers: {str(e)}")
+
+
+# ---------------------------
+# 7. Update CASCO offer
+# ---------------------------
+@router.patch("/offers/{offer_id}")
+async def update_casco_offer(
+    offer_id: int,
+    body: CascoOfferUpdateBody = Body(...),
+    conn = Depends(get_db),
+):
+    """
+    Update a single CASCO offer row in public.offers_casco by ID.
+    Only fields provided in the body are changed.
+    """
+
+    updates: Dict[str, Any] = {}
+
+    if body.reg_number is not None:
+        updates["reg_number"] = body.reg_number
+
+    if body.insured_entity is not None:
+        updates["insured_entity"] = body.insured_entity
+
+    if body.insured_amount is not None:
+        updates["insured_amount"] = body.insured_amount
+
+    if body.currency is not None:
+        updates["currency"] = body.currency
+
+    if body.territory is not None:
+        updates["territory"] = body.territory
+
+    if body.period is not None:
+        updates["period"] = body.period
+
+    if body.premium_total is not None:
+        updates["premium_total"] = body.premium_total
+
+    if body.premium_breakdown is not None:
+        updates["premium_breakdown"] = json.dumps(body.premium_breakdown)
+
+    if body.coverage is not None:
+        updates["coverage"] = json.dumps(body.coverage)
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    # Build dynamic UPDATE statement
+    set_clauses = []
+    values: List[Any] = []
+
+    for col, val in updates.items():
+        set_clauses.append(f"{col} = %s")
+        values.append(val)
+
+    values.append(offer_id)
+
+    sql = f"""
+        UPDATE public.offers_casco
+        SET {", ".join(set_clauses)}
+        WHERE id = %s
+        RETURNING *;
+    """
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(sql, values)
+        row = cur.fetchone()
+        conn.commit()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="CASCO offer not found")
+
+    return {"ok": True, "offer": row}
