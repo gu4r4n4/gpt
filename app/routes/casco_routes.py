@@ -43,15 +43,36 @@ def get_db():
 # ---------------------------
 class CascoOfferUpdateBody(BaseModel):
     """Request body for updating CASCO offer fields."""
+    insurer_name: Optional[str] = None
     reg_number: Optional[str] = None
     insured_entity: Optional[str] = None
     insured_amount: Optional[str] = None
     currency: Optional[str] = None
     territory: Optional[str] = None
     period: Optional[str] = None
-    premium_total: Optional[Decimal] = None
+    premium_total: Optional[Any] = None
     premium_breakdown: Optional[Dict[str, Any]] = None
     coverage: Optional[Dict[str, Any]] = None
+    raw_text: Optional[str] = None
+
+
+# ---------------------------
+# Helper: Decimal Normalizer
+# ---------------------------
+def to_decimal(val):
+    """
+    Normalize any value to Decimal, handling empty strings, dashes, and currency symbols.
+    Returns None if conversion fails or value is empty.
+    """
+    if val in (None, "", "-", "–", "—"):
+        return None
+    try:
+        if isinstance(val, (int, float, Decimal)):
+            return Decimal(str(val))
+        s = str(val).replace("EUR", "").replace("€", "").replace(" ", "").strip()
+        return Decimal(s)
+    except Exception:
+        return None
 
 
 # ---------------------------
@@ -598,11 +619,15 @@ async def update_casco_offer(
     conn = Depends(get_db),
 ):
     """
-    Update a single CASCO offer row in public.offers_casco by ID.
-    Only fields provided in the body are changed.
+    Fully working CASCO edit endpoint.
+    Mirrors Health editing logic.
     """
 
-    updates: Dict[str, Any] = {}
+    updates = {}
+    
+    # Simple fields
+    if body.insurer_name is not None:
+        updates["insurer_name"] = body.insurer_name
 
     if body.reg_number is not None:
         updates["reg_number"] = body.reg_number
@@ -622,33 +647,36 @@ async def update_casco_offer(
     if body.period is not None:
         updates["period"] = body.period
 
+    # Premium — normalize to Decimal
     if body.premium_total is not None:
-        updates["premium_total"] = body.premium_total
+        updates["premium_total"] = to_decimal(body.premium_total)
 
+    # JSON fields
     if body.premium_breakdown is not None:
         updates["premium_breakdown"] = json.dumps(body.premium_breakdown)
 
     if body.coverage is not None:
         updates["coverage"] = json.dumps(body.coverage)
 
+    if body.raw_text is not None:
+        updates["raw_text"] = body.raw_text
+
     if not updates:
         raise HTTPException(status_code=400, detail="No fields to update")
 
-    # Build dynamic UPDATE statement
-    set_clauses = []
-    values: List[Any] = []
-
-    for col, val in updates.items():
-        set_clauses.append(f"{col} = %s")
-        values.append(val)
-
-    values.append(offer_id)
+    # Build dynamic SQL
+    set_clause = ", ".join(f"{k} = %s" for k in updates.keys())
+    values = list(updates.values()) + [offer_id]
 
     sql = f"""
         UPDATE public.offers_casco
-        SET {", ".join(set_clauses)}
+        SET {set_clause}
         WHERE id = %s
-        RETURNING *;
+        RETURNING
+            id, insurer_name, reg_number, insured_entity, casco_job_id,
+            insured_amount, currency, territory, period,
+            premium_total, premium_breakdown, coverage, raw_text,
+            product_line, created_at;
     """
 
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
