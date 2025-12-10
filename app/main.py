@@ -155,16 +155,54 @@ app.add_middleware(
 # Supabase
 # -------------------------------
 _SUPABASE_URL = os.getenv("SUPABASE_URL")
-_SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+_SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
+_SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 _OFFERS_TABLE = os.getenv("SUPABASE_TABLE", "offers")
 _SHARE_TABLE = os.getenv("SUPABASE_SHARE_TABLE", "share_links")
 
+# Use service role key for admin operations, anon key for regular operations
 _supabase: Optional[Client] = None
-if _SUPABASE_URL and _SUPABASE_KEY and create_client is not None:
+_supabase_admin: Optional[Client] = None  # Admin client for auth operations
+
+if _SUPABASE_URL and _SUPABASE_SERVICE_ROLE_KEY and create_client is not None:
     try:
-        _supabase = create_client(_SUPABASE_URL, _SUPABASE_KEY)
+        _supabase_admin = create_client(_SUPABASE_URL, _SUPABASE_SERVICE_ROLE_KEY)
+        # Use service role for main client if anon key not available
+        _supabase = create_client(_SUPABASE_URL, _SUPABASE_ANON_KEY or _SUPABASE_SERVICE_ROLE_KEY)
     except Exception:
         _supabase = None
+        _supabase_admin = None
+
+
+# -------------------------------
+# User Invitation Helper
+# -------------------------------
+def invite_user_by_email(email: str, redirect_url: Optional[str] = None) -> dict:
+    """
+    Invite a user by email using Supabase Admin API.
+    Requires SUPABASE_SERVICE_ROLE_KEY.
+    The Supabase Python client automatically includes the required headers
+    (apikey and Authorization: Bearer) when using the admin client.
+    """
+    if not _supabase_admin:
+        raise HTTPException(
+            status_code=503, 
+            detail="Supabase admin client not configured. Set SUPABASE_SERVICE_ROLE_KEY."
+        )
+    
+    try:
+        # Use the admin auth client - this automatically includes the required headers
+        response = _supabase_admin.auth.admin.invite_user_by_email(
+            email=email,
+            options={"redirect_to": redirect_url} if redirect_url else None
+        )
+        return response
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to invite user: {str(e)}"
+        )
+
 
 # -------------------------------
 # In-memory
@@ -1657,6 +1695,27 @@ async def list_share_qa_public(token: str, limit: int = 200, offset: int = 0):
             }
         )
     return {"items": items}
+
+
+# -------------------------------
+# User Invitation Endpoint
+# -------------------------------
+@app.post("/api/users/invite")
+async def invite_user_endpoint(
+    email: str = Body(..., embed=True),
+    redirect_url: Optional[str] = Body(None, embed=True),
+):
+    """
+    Invite a user by email using Supabase Admin API.
+    Uses the service role key which automatically includes the required headers:
+    - apikey: <service_role_key>
+    - Authorization: Bearer <service_role_key>
+    
+    Requires SUPABASE_SERVICE_ROLE_KEY environment variable to be set.
+    """
+    result = invite_user_by_email(email, redirect_url)
+    return {"ok": True, "user": result}
+
 
 # -------------------------------
 # Debug
