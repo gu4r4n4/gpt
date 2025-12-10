@@ -26,6 +26,7 @@ except Exception:  # pragma: no cover
 
 import psycopg2.extras
 from psycopg2.extras import RealDictCursor
+import requests
 
 from app.gpt_extractor import extract_offer_from_pdf_bytes, ExtractionError
 from app.routes.offers_by_documents import router as offers_by_documents_router
@@ -179,29 +180,30 @@ if _SUPABASE_URL and _SUPABASE_SERVICE_ROLE_KEY and create_client is not None:
 # -------------------------------
 def invite_user_by_email(email: str, redirect_url: Optional[str] = None) -> dict:
     """
-    Invite a user by email using Supabase Admin API.
-    Requires SUPABASE_SERVICE_ROLE_KEY.
-    The Supabase Python client automatically includes the required headers
-    (apikey and Authorization: Bearer) when using the admin client.
+    Manual Supabase Auth invite — avoids supabase-py admin client bug.
+    Explicitly includes required service-role headers.
     """
-    if not _supabase_admin:
-        raise HTTPException(
-            status_code=503, 
-            detail="Supabase admin client not configured. Set SUPABASE_SERVICE_ROLE_KEY."
-        )
-    
-    try:
-        # Use the admin auth client - this automatically includes the required headers
-        response = _supabase_admin.auth.admin.invite_user_by_email(
-            email=email,
-            options={"redirect_to": redirect_url} if redirect_url else None
-        )
-        return response
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to invite user: {str(e)}"
-        )
+    if not (_SUPABASE_URL and _SUPABASE_SERVICE_ROLE_KEY):
+        raise HTTPException(503, "Supabase admin client not configured")
+
+    url = f"{_SUPABASE_URL}/auth/v1/invite"
+
+    payload = {"email": email}
+    if redirect_url:
+        payload["data"] = {"redirect_to": redirect_url}
+
+    headers = {
+        "apikey": _SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {_SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    r = requests.post(url, headers=headers, json=payload)
+
+    if r.status_code >= 300:
+        raise HTTPException(500, f"Supabase invite failed: {r.text}")
+
+    return r.json()
 
 
 # -------------------------------
