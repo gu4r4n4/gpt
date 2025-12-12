@@ -38,6 +38,7 @@ from backend.api.routes.qa import router as qa_router
 from backend.api.routes.tc import router as tc_router
 from app.routes.admin_insurers import router as admin_insurers_router
 from app.routes.admin_tc import router as admin_tc_router
+from app.routes.admin_chat import router as admin_chat_router
 from app.routes.translate import router as translate_router  # translation endpoints
 from app.routes.casco_routes import router as casco_router  # CASCO insurance routes
 from app.extensions.pas_sidecar import run_batch_ingest_sidecar, infer_batch_token_for_docs
@@ -137,6 +138,7 @@ app.include_router(tc_router, prefix="/api/tc")  # T&C and law document manageme
 app.include_router(translate_router)  # translation endpoints
 app.include_router(admin_insurers_router)
 app.include_router(admin_tc_router)
+app.include_router(admin_chat_router)
 app.include_router(casco_router)  # CASCO insurance routes
 
 # -------------------------------
