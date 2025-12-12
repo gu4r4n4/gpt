@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import json
+import traceback
 from typing import Optional, Dict, Any
 
 import psycopg2
@@ -19,7 +20,7 @@ router = APIRouter(prefix="/api/admin/chat", tags=["admin-chat"])
 
 
 def get_db():
-    """Database connection dependency."""
+    """Database connection dependency. Never swallows errors."""
     db_url = os.getenv("DATABASE_URL")
     if not db_url:
         raise HTTPException(
@@ -33,14 +34,18 @@ def get_db():
         finally:
             conn.close()
     except psycopg2.Error as e:
+        error_msg = str(e)
+        traceback.print_exc()
         raise HTTPException(
             status_code=503,
-            detail="Database connection failed"
+            detail=f"Database error: {error_msg}"
         )
     except Exception as e:
+        error_msg = str(e)
+        traceback.print_exc()
         raise HTTPException(
             status_code=500,
-            detail="Database error"
+            detail=f"Database connection error: {error_msg}"
         )
 
 
@@ -57,18 +62,28 @@ class ChatResponse(BaseModel):
 
 def _get_user_from_db(conn, user_id: int) -> Optional[Dict[str, Any]]:
     """Fetch user from app_users table."""
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT id, org_id, email, full_name, role
-            FROM public.app_users
-            WHERE id = %s
-            LIMIT 1
-            """,
-            (user_id,)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, org_id, email, full_name, role
+                FROM public.app_users
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (int(user_id),)
+            )
+            row = cur.fetchone()
+            if row:
+                return dict(row)
+            return None
+    except psycopg2.Error as e:
+        error_msg = str(e)
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Database query error (get_user): {error_msg}"
         )
-        row = cur.fetchone()
-        return dict(row) if row else None
 
 
 def _check_user_role(user: Dict[str, Any]) -> None:
@@ -83,155 +98,158 @@ def _check_user_role(user: Dict[str, Any]) -> None:
 
 def _get_or_create_session(conn, org_id: int, user_id: int) -> int:
     """Get existing session or create a new one for the user."""
-    with conn.cursor() as cur:
-        # Try to find existing session
-        cur.execute(
-            """
-            SELECT id
-            FROM public.admin_chat_sessions
-            WHERE org_id = %s AND created_by_user_id = %s AND source = 'admin_ui'
-            ORDER BY last_activity_at DESC
-            LIMIT 1
-            """,
-            (org_id, user_id)
-        )
-        row = cur.fetchone()
+    try:
+        org_id_int = int(org_id)
+        user_id_int = int(user_id)
         
-        if row:
-            session_id = row["id"]
-            # Update last_activity_at
+        with conn.cursor() as cur:
+            # Try to find existing session
             cur.execute(
                 """
-                UPDATE public.admin_chat_sessions
-                SET last_activity_at = NOW()
-                WHERE id = %s
+                SELECT id
+                FROM public.admin_chat_sessions
+                WHERE org_id = %s AND created_by_user_id = %s AND source = 'admin_ui'
+                ORDER BY last_activity_at DESC
+                LIMIT 1
                 """,
-                (session_id,)
+                (org_id_int, user_id_int)
             )
-            conn.commit()
-            return session_id
-        else:
-            # Create new session
-            cur.execute(
-                """
-                INSERT INTO public.admin_chat_sessions (org_id, created_by_user_id, source, last_activity_at)
-                VALUES (%s, %s, 'admin_ui', NOW())
-                RETURNING id
-                """,
-                (org_id, user_id)
-            )
-            session_id = cur.fetchone()["id"]
-            conn.commit()
-            return session_id
+            row = cur.fetchone()
+            
+            if row:
+                session_id = int(row["id"])
+                # Update last_activity_at
+                cur.execute(
+                    """
+                    UPDATE public.admin_chat_sessions
+                    SET last_activity_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (session_id,)
+                )
+                conn.commit()
+                return session_id
+            else:
+                # Create new session
+                cur.execute(
+                    """
+                    INSERT INTO public.admin_chat_sessions (org_id, created_by_user_id, source, last_activity_at)
+                    VALUES (%s, %s, 'admin_ui', NOW())
+                    RETURNING id
+                    """,
+                    (org_id_int, user_id_int)
+                )
+                result = cur.fetchone()
+                if not result:
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Failed to create chat session: no ID returned"
+                    )
+                session_id = int(result["id"])
+                conn.commit()
+                return session_id
+    except HTTPException:
+        raise
+    except psycopg2.Error as e:
+        error_msg = str(e)
+        traceback.print_exc()
+        conn.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Database error (session): {error_msg}"
+        )
+    except Exception as e:
+        error_msg = str(e)
+        traceback.print_exc()
+        conn.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error managing session: {error_msg}"
+        )
 
 
 def _save_message(conn, session_id: int, role: str, content: str, metadata: Optional[Dict[str, Any]] = None) -> None:
-    """Save a chat message to the database."""
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO public.admin_chat_messages (session_id, role, content, metadata)
-            VALUES (%s, %s, %s, %s)
-            """,
-            (session_id, role, content, json.dumps(metadata or {}))
-        )
-        conn.commit()
-
-
-def _call_n8n_webhook(payload: Dict[str, Any]) -> str:
-    """Call n8n webhook and extract assistant response."""
-    webhook_url = os.getenv("N8N_ADMIN_CHAT_WEBHOOK_URL")
-    if not webhook_url:
-        raise HTTPException(
-            status_code=500,
-            detail="N8N webhook URL not configured"
-        )
-    
+    """Save a chat message to the database. Never fails silently."""
     try:
-        response = requests.post(
-            webhook_url,
-            json=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=30
-        )
-        response.raise_for_status()
+        session_id_int = int(session_id)
+        metadata_json = json.dumps(metadata or {})
         
-        # Try to extract response from various possible locations
-        data = response.json() if response.content else {}
-        
-        # Check common response patterns
-        assistant_text = (
-            data.get("output") or
-            data.get("text") or
-            data.get("message") or
-            data.get("response") or
-            ""
-        )
-        
-        # If response is a dict, try to get text from it
-        if isinstance(assistant_text, dict):
-            assistant_text = (
-                assistant_text.get("text") or
-                assistant_text.get("content") or
-                assistant_text.get("message") or
-                ""
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO public.admin_chat_messages (session_id, role, content, metadata)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (session_id_int, str(role), str(content), metadata_json)
             )
-        
-        if not assistant_text or not str(assistant_text).strip():
-            raise HTTPException(
-                status_code=502,
-                detail="Empty response from n8n workflow"
-            )
-        
-        return str(assistant_text).strip()
-        
-    except requests.exceptions.RequestException as e:
+            conn.commit()
+    except psycopg2.Error as e:
+        error_msg = str(e)
+        traceback.print_exc()
+        conn.rollback()
         raise HTTPException(
             status_code=500,
-            detail="Failed to reach n8n webhook"
+            detail=f"Database error (save_message): {error_msg}"
         )
     except Exception as e:
+        error_msg = str(e)
+        traceback.print_exc()
+        conn.rollback()
         raise HTTPException(
             status_code=500,
-            detail="Error processing n8n response"
+            detail=f"Error saving message: {error_msg}"
         )
 
 
 @router.post("", response_model=ChatResponse)
 async def chat(
     request: ChatRequest,
-    x_org_id: Optional[int] = Header(None, alias="X-Org-Id"),
-    x_user_id: Optional[int] = Header(None, alias="X-User-Id"),
+    x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
     conn = Depends(get_db)
 ):
     """
     Admin chat endpoint - secure bridge to n8n AI workflow.
     
     Requires:
-    - X-Org-Id header
-    - X-User-Id header
+    - X-Org-Id header (integer)
+    - X-User-Id header (integer)
     - User must have role 'admin' or 'owner'
     """
     try:
-        # Extract user context from headers
-        org_id = x_org_id
-        user_id = x_user_id
-        
-        if not org_id or not user_id:
+        # Explicitly cast headers to int, reject with 400 if cast fails
+        if not x_org_id:
             raise HTTPException(
-                status_code=401,
-                detail="Missing X-Org-Id or X-User-Id headers"
+                status_code=400,
+                detail="Missing X-Org-Id header"
             )
+        if not x_user_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Missing X-User-Id header"
+            )
+        
+        try:
+            org_id = int(x_org_id)
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid X-Org-Id header: must be integer, got '{x_org_id}'"
+            )
+        
+        try:
+            user_id = int(x_user_id)
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid X-User-Id header: must be integer, got '{x_user_id}'"
+            )
+        
+        # Debug log before session lookup
+        print(f"[admin_chat] DEBUG: org_id={org_id}, user_id={user_id}, type(org_id)={type(org_id)}, type(user_id)={type(user_id)}")
         
         # Fetch user from database
-        try:
-            user = _get_user_from_db(conn, user_id)
-        except Exception as e:
-            raise HTTPException(
-                status_code=500,
-                detail="Database error while fetching user"
-            )
-        
+        user = _get_user_from_db(conn, user_id)
         if not user:
             raise HTTPException(
                 status_code=401,
@@ -239,7 +257,8 @@ async def chat(
             )
         
         # Verify user belongs to the org
-        if user.get("org_id") != org_id:
+        user_org_id = int(user.get("org_id")) if user.get("org_id") is not None else None
+        if user_org_id != org_id:
             raise HTTPException(
                 status_code=403,
                 detail="User does not belong to the specified organization"
@@ -249,50 +268,16 @@ async def chat(
         _check_user_role(user)
         
         # Get or create chat session
-        try:
-            session_id = _get_or_create_session(conn, org_id, user_id)
-        except Exception as e:
-            raise HTTPException(
-                status_code=500,
-                detail="Database error while managing chat session"
-            )
+        session_id = _get_or_create_session(conn, org_id, user_id)
         
         # Save user message
-        try:
-            _save_message(conn, session_id, "user", request.message)
-        except Exception as e:
-            raise HTTPException(
-                status_code=500,
-                detail="Database error while saving message"
-            )
+        _save_message(conn, session_id, "user", request.message)
         
-        # Build n8n-compatible payload
-        n8n_payload = {
-            "text": request.message,
-            "sessionId": f"admin_{user_id}",
-            "user_id": user_id,
-            "username": user.get("email") or "",
-            "first_name": user.get("full_name") or "",
-            "source": "admin_ui"
-        }
-        
-        # Call n8n webhook
-        try:
-            assistant_response = _call_n8n_webhook(n8n_payload)
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(
-                status_code=500,
-                detail="Failed to get response from AI workflow"
-            )
+        # Return dummy response (DO NOT CALL n8n yet)
+        assistant_response = "OK"
         
         # Save assistant response
-        try:
-            _save_message(conn, session_id, "assistant", assistant_response)
-        except Exception as e:
-            # Log error but don't fail the request - response was already generated
-            pass
+        _save_message(conn, session_id, "assistant", assistant_response)
         
         # Return response to frontend
         return ChatResponse(
@@ -301,14 +286,11 @@ async def chat(
         )
     
     except HTTPException:
-        # Re-raise HTTPExceptions (they already have proper status codes)
         raise
     except Exception as e:
-        # Catch any other unexpected errors
-        import traceback
+        error_msg = str(e)
         traceback.print_exc()
         raise HTTPException(
             status_code=500,
-            detail="Internal server error"
+            detail=f"Internal server error: {error_msg}"
         )
-
