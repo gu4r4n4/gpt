@@ -22,12 +22,26 @@ def get_db():
     """Database connection dependency."""
     db_url = os.getenv("DATABASE_URL")
     if not db_url:
-        raise RuntimeError("DATABASE_URL not set")
-    conn = psycopg2.connect(db_url, cursor_factory=RealDictCursor)
+        raise HTTPException(
+            status_code=503,
+            detail="Database not configured"
+        )
     try:
-        yield conn
-    finally:
-        conn.close()
+        conn = psycopg2.connect(db_url, cursor_factory=RealDictCursor)
+        try:
+            yield conn
+        finally:
+            conn.close()
+    except psycopg2.Error as e:
+        raise HTTPException(
+            status_code=503,
+            detail="Database connection failed"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail="Database error"
+        )
 
 
 class ChatRequest(BaseModel):
@@ -184,7 +198,7 @@ def _call_n8n_webhook(payload: Dict[str, Any]) -> str:
 
 
 @router.post("", response_model=ChatResponse)
-def chat(
+async def chat(
     request: ChatRequest,
     x_org_id: Optional[int] = Header(None, alias="X-Org-Id"),
     x_user_id: Optional[int] = Header(None, alias="X-User-Id"),
@@ -198,67 +212,103 @@ def chat(
     - X-User-Id header
     - User must have role 'admin' or 'owner'
     """
-    # Extract user context from headers
-    org_id = x_org_id
-    user_id = x_user_id
-    
-    if not org_id or not user_id:
-        raise HTTPException(
-            status_code=401,
-            detail="Missing X-Org-Id or X-User-Id headers"
-        )
-    
-    # Fetch user from database
-    user = _get_user_from_db(conn, user_id)
-    if not user:
-        raise HTTPException(
-            status_code=401,
-            detail="User not found"
-        )
-    
-    # Verify user belongs to the org
-    if user.get("org_id") != org_id:
-        raise HTTPException(
-            status_code=403,
-            detail="User does not belong to the specified organization"
-        )
-    
-    # Check role (admin or owner)
-    _check_user_role(user)
-    
-    # Get or create chat session
-    session_id = _get_or_create_session(conn, org_id, user_id)
-    
-    # Save user message
-    _save_message(conn, session_id, "user", request.message)
-    
-    # Build n8n-compatible payload
-    n8n_payload = {
-        "text": request.message,
-        "sessionId": f"admin_{user_id}",
-        "user_id": user_id,
-        "username": user.get("email") or "",
-        "first_name": user.get("full_name") or "",
-        "source": "admin_ui"
-    }
-    
-    # Call n8n webhook
     try:
-        assistant_response = _call_n8n_webhook(n8n_payload)
+        # Extract user context from headers
+        org_id = x_org_id
+        user_id = x_user_id
+        
+        if not org_id or not user_id:
+            raise HTTPException(
+                status_code=401,
+                detail="Missing X-Org-Id or X-User-Id headers"
+            )
+        
+        # Fetch user from database
+        try:
+            user = _get_user_from_db(conn, user_id)
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail="Database error while fetching user"
+            )
+        
+        if not user:
+            raise HTTPException(
+                status_code=401,
+                detail="User not found"
+            )
+        
+        # Verify user belongs to the org
+        if user.get("org_id") != org_id:
+            raise HTTPException(
+                status_code=403,
+                detail="User does not belong to the specified organization"
+            )
+        
+        # Check role (admin or owner)
+        _check_user_role(user)
+        
+        # Get or create chat session
+        try:
+            session_id = _get_or_create_session(conn, org_id, user_id)
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail="Database error while managing chat session"
+            )
+        
+        # Save user message
+        try:
+            _save_message(conn, session_id, "user", request.message)
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail="Database error while saving message"
+            )
+        
+        # Build n8n-compatible payload
+        n8n_payload = {
+            "text": request.message,
+            "sessionId": f"admin_{user_id}",
+            "user_id": user_id,
+            "username": user.get("email") or "",
+            "first_name": user.get("full_name") or "",
+            "source": "admin_ui"
+        }
+        
+        # Call n8n webhook
+        try:
+            assistant_response = _call_n8n_webhook(n8n_payload)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to get response from AI workflow"
+            )
+        
+        # Save assistant response
+        try:
+            _save_message(conn, session_id, "assistant", assistant_response)
+        except Exception as e:
+            # Log error but don't fail the request - response was already generated
+            pass
+        
+        # Return response to frontend
+        return ChatResponse(
+            role="assistant",
+            content=assistant_response
+        )
+    
     except HTTPException:
+        # Re-raise HTTPExceptions (they already have proper status codes)
         raise
     except Exception as e:
+        # Catch any other unexpected errors
+        import traceback
+        traceback.print_exc()
         raise HTTPException(
             status_code=500,
-            detail="Failed to get response from AI workflow"
+            detail="Internal server error"
         )
-    
-    # Save assistant response
-    _save_message(conn, session_id, "assistant", assistant_response)
-    
-    # Return response to frontend
-    return ChatResponse(
-        role="assistant",
-        content=assistant_response
-    )
 

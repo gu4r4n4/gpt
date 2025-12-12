@@ -13,9 +13,11 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Dict, Any, Tuple
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Request, Body, Header, BackgroundTasks
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Request, Body, Header, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from pydantic import BaseModel, Field
 
 try:
@@ -144,9 +146,11 @@ app.include_router(casco_router)  # CASCO insurance routes
 # -------------------------------
 # CORS
 # -------------------------------
+# Use wildcard for backward compatibility with all frontends/share links
+# Exception handlers below ensure CORS headers are present on error responses
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In prod, list your exact FE origins
+    allow_origins=["*"],  # Keep wildcard for backward compatibility
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*", "X-Org-Id", "X-User-Id", "X-Share-Token", "X-Count-View"],
@@ -175,6 +179,58 @@ if _SUPABASE_URL and _SUPABASE_SERVICE_ROLE_KEY and create_client is not None:
     except Exception:
         _supabase = None
         _supabase_admin = None
+
+
+# -------------------------------
+# Global Exception Handlers (ensure CORS headers on errors)
+# -------------------------------
+# These handlers ensure CORS headers are present even when exceptions occur
+# before CORS middleware can process the response
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Ensure CORS headers are present on all error responses."""
+    import traceback
+    traceback.print_exc()  # Log the error
+    
+    # Get origin from request header, fallback to wildcard for compatibility
+    origin = request.headers.get("origin", "*")
+    
+    # Determine status code
+    if isinstance(exc, HTTPException):
+        status_code = exc.status_code
+        detail = exc.detail
+    elif isinstance(exc, StarletteHTTPException):
+        status_code = exc.status_code
+        detail = exc.detail
+    else:
+        status_code = 500
+        detail = "Internal server error"
+    
+    return JSONResponse(
+        status_code=status_code,
+        content={"detail": detail},
+        headers={
+            "Access-Control-Allow-Origin": origin if origin != "*" else "*",
+            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Allow-Methods": "POST, GET, OPTIONS, PUT, DELETE, PATCH",
+            "Access-Control-Allow-Headers": "Content-Type, X-User-Id, X-Org-Id, Authorization",
+        }
+    )
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Handle validation errors with CORS headers."""
+    origin = request.headers.get("origin", "*")
+    return JSONResponse(
+        status_code=422,
+        content={"detail": exc.errors()},
+        headers={
+            "Access-Control-Allow-Origin": origin if origin != "*" else "*",
+            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Allow-Methods": "POST, GET, OPTIONS, PUT, DELETE, PATCH",
+            "Access-Control-Allow-Headers": "Content-Type, X-User-Id, X-Org-Id, Authorization",
+        }
+    )
 
 
 # -------------------------------
