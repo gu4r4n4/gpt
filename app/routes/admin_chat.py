@@ -201,6 +201,93 @@ def _save_message(conn, session_id: int, role: str, content: str, metadata: Opti
         )
 
 
+def _call_n8n_webhook(payload: Dict[str, Any]) -> str:
+    """Call n8n webhook and extract assistant response."""
+    webhook_url = os.getenv("N8N_ADMIN_CHAT_WEBHOOK_URL")
+    if not webhook_url:
+        raise HTTPException(
+            status_code=500,
+            detail="N8N webhook URL not configured"
+        )
+    
+    print(f"[admin_chat] Calling n8n webhook: {webhook_url}")
+    print(f"[admin_chat] n8n payload: {json.dumps(payload)}")
+    
+    try:
+        response = requests.post(
+            webhook_url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=30
+        )
+        response.raise_for_status()
+        
+        print(f"[admin_chat] n8n response status: {response.status_code}")
+        
+        if not response.content:
+            raise HTTPException(
+                status_code=502,
+                detail="Empty response body from n8n workflow"
+            )
+        
+        try:
+            data = response.json()
+        except ValueError:
+            raise HTTPException(
+                status_code=502,
+                detail="Invalid JSON response from n8n workflow"
+            )
+        
+        print(f"[admin_chat] n8n response data: {json.dumps(data)}")
+        
+        assistant_text = (
+            data.get("text") or
+            data.get("output") or
+            data.get("message") or
+            ""
+        )
+        
+        if isinstance(assistant_text, dict):
+            assistant_text = (
+                assistant_text.get("text") or
+                assistant_text.get("content") or
+                assistant_text.get("message") or
+                ""
+            )
+        
+        if not assistant_text or not str(assistant_text).strip():
+            raise HTTPException(
+                status_code=502,
+                detail="Empty response from n8n workflow: no text/output/message field found"
+            )
+        
+        return str(assistant_text).strip()
+        
+    except HTTPException:
+        raise
+    except requests.exceptions.Timeout:
+        error_msg = "n8n webhook timeout after 30 seconds"
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=504,
+            detail=error_msg
+        )
+    except requests.exceptions.RequestException as e:
+        error_msg = f"Failed to reach n8n webhook: {str(e)}"
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=error_msg
+        )
+    except Exception as e:
+        error_msg = f"Error processing n8n response: {str(e)}"
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=error_msg
+        )
+
+
 @router.post("", response_model=ChatResponse)
 async def chat(
     request: ChatRequest,
@@ -273,8 +360,17 @@ async def chat(
         # Save user message
         _save_message(conn, session_id, "user", request.message)
         
-        # Return dummy response (DO NOT CALL n8n yet)
-        assistant_response = "OK"
+        # Build n8n-compatible payload
+        n8n_payload = {
+            "text": request.message,
+            "sessionId": f"admin_{user_id}",
+            "user_id": user_id,
+            "username": user.get("email") or "",
+            "source": "admin_ui"
+        }
+        
+        # Call n8n webhook
+        assistant_response = _call_n8n_webhook(n8n_payload)
         
         # Save assistant response
         _save_message(conn, session_id, "assistant", assistant_response)
