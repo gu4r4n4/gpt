@@ -201,16 +201,49 @@ def _save_message(conn, session_id: int, role: str, content: str, metadata: Opti
         )
 
 
-def _call_n8n_webhook(payload: Dict[str, Any]) -> str:
-    """Call n8n webhook and extract assistant response."""
-    webhook_url = os.getenv("N8N_ADMIN_CHAT_WEBHOOK_URL")
-    if not webhook_url:
+def _get_n8n_webhook_url() -> str:
+    """Get n8n webhook URL, supporting both test and production modes."""
+    base_url = os.getenv("N8N_ADMIN_CHAT_WEBHOOK_URL", "").rstrip("/")
+    if not base_url:
         raise HTTPException(
             status_code=500,
-            detail="N8N webhook URL not configured"
+            detail="N8N_ADMIN_CHAT_WEBHOOK_URL environment variable not configured"
         )
     
-    print(f"[admin_chat] Calling n8n webhook: {webhook_url}")
+    use_test = os.getenv("N8N_USE_TEST_WEBHOOK", "false").lower() in ("true", "1", "yes")
+    webhook_path = "admin-chat"
+    
+    if "/webhook-test/" in base_url or "/webhook-test" in base_url:
+        if not base_url.endswith(webhook_path):
+            if not base_url.endswith("/"):
+                base_url += "/"
+            base_url += webhook_path
+        return base_url
+    elif "/webhook/" in base_url or "/webhook" in base_url:
+        if not base_url.endswith(webhook_path):
+            if not base_url.endswith("/"):
+                base_url += "/"
+            base_url += webhook_path
+        return base_url
+    else:
+        if use_test:
+            webhook_type = "webhook-test"
+        else:
+            webhook_type = "webhook"
+        
+        if not base_url.endswith("/"):
+            base_url += "/"
+        return f"{base_url}{webhook_type}/{webhook_path}"
+
+
+def _call_n8n_webhook(payload: Dict[str, Any]) -> str:
+    """Call n8n webhook and extract assistant response."""
+    try:
+        webhook_url = _get_n8n_webhook_url()
+    except HTTPException:
+        raise
+    
+    print(f"[admin_chat] n8n webhook URL: {webhook_url}")
     print(f"[admin_chat] n8n payload: {json.dumps(payload)}")
     
     try:
@@ -220,22 +253,44 @@ def _call_n8n_webhook(payload: Dict[str, Any]) -> str:
             headers={"Content-Type": "application/json"},
             timeout=30
         )
-        response.raise_for_status()
         
         print(f"[admin_chat] n8n response status: {response.status_code}")
+        print(f"[admin_chat] n8n response headers: {dict(response.headers)}")
         
-        if not response.content:
+        if response.status_code == 404:
+            error_msg = f"n8n webhook not found (404): {webhook_url}. Check if workflow is active and webhook path is 'admin-chat'"
+            traceback.print_exc()
             raise HTTPException(
                 status_code=502,
-                detail="Empty response body from n8n workflow"
+                detail=error_msg
+            )
+        
+        if response.status_code >= 500:
+            error_msg = f"n8n webhook server error ({response.status_code}): {response.text[:200]}"
+            traceback.print_exc()
+            raise HTTPException(
+                status_code=502,
+                detail=error_msg
+            )
+        
+        response.raise_for_status()
+        
+        if not response.content:
+            error_msg = "Empty response body from n8n workflow"
+            print(f"[admin_chat] ERROR: {error_msg}")
+            raise HTTPException(
+                status_code=502,
+                detail=error_msg
             )
         
         try:
             data = response.json()
-        except ValueError:
+        except ValueError as e:
+            error_msg = f"Invalid JSON response from n8n workflow: {str(e)}. Response body: {response.text[:200]}"
+            print(f"[admin_chat] ERROR: {error_msg}")
             raise HTTPException(
                 status_code=502,
-                detail="Invalid JSON response from n8n workflow"
+                detail=error_msg
             )
         
         print(f"[admin_chat] n8n response data: {json.dumps(data)}")
@@ -256,9 +311,11 @@ def _call_n8n_webhook(payload: Dict[str, Any]) -> str:
             )
         
         if not assistant_text or not str(assistant_text).strip():
+            error_msg = "Empty response from n8n workflow: no text/output/message field found in response"
+            print(f"[admin_chat] ERROR: {error_msg}. Full response: {json.dumps(data)}")
             raise HTTPException(
                 status_code=502,
-                detail="Empty response from n8n workflow: no text/output/message field found"
+                detail=error_msg
             )
         
         return str(assistant_text).strip()
@@ -266,14 +323,32 @@ def _call_n8n_webhook(payload: Dict[str, Any]) -> str:
     except HTTPException:
         raise
     except requests.exceptions.Timeout:
-        error_msg = "n8n webhook timeout after 30 seconds"
+        error_msg = f"n8n webhook timeout after 30 seconds: {webhook_url}"
+        print(f"[admin_chat] ERROR: {error_msg}")
         traceback.print_exc()
         raise HTTPException(
             status_code=504,
             detail=error_msg
         )
+    except requests.exceptions.ConnectionError as e:
+        error_msg = f"Cannot connect to n8n webhook: {webhook_url}. Error: {str(e)}"
+        print(f"[admin_chat] ERROR: {error_msg}")
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=502,
+            detail=error_msg
+        )
+    except requests.exceptions.HTTPError as e:
+        error_msg = f"n8n webhook HTTP error: {e.response.status_code} - {e.response.text[:200] if hasattr(e, 'response') else str(e)}"
+        print(f"[admin_chat] ERROR: {error_msg}")
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=502,
+            detail=error_msg
+        )
     except requests.exceptions.RequestException as e:
-        error_msg = f"Failed to reach n8n webhook: {str(e)}"
+        error_msg = f"Failed to reach n8n webhook {webhook_url}: {str(e)}"
+        print(f"[admin_chat] ERROR: {error_msg}")
         traceback.print_exc()
         raise HTTPException(
             status_code=500,
@@ -281,6 +356,7 @@ def _call_n8n_webhook(payload: Dict[str, Any]) -> str:
         )
     except Exception as e:
         error_msg = f"Error processing n8n response: {str(e)}"
+        print(f"[admin_chat] ERROR: {error_msg}")
         traceback.print_exc()
         raise HTTPException(
             status_code=500,
